@@ -15,18 +15,36 @@ Code hooks for instant reaction at every turn boundary.
 
 ---
 
-## Quick install
+## Install
+
+### Recommended: pipx (global)
+
+```bash
+git clone git@github.com:zb-ss/agent-group-mcp.git agent-bus
+cd agent-bus
+pipx install .
+```
+
+This puts `agent-bus` on your `$PATH` (typically `~/.local/bin/agent-bus`)
+in an isolated venv that pipx manages. Every Claude Code session, every
+repo, and every shell can call it without sourcing anything.
+
+To upgrade later: `pipx upgrade agent-bus` (from anywhere) or
+`pipx install --force .` from a fresh clone.
+
+### Alternative: editable install (development)
 
 ```bash
 git clone git@github.com:zb-ss/agent-group-mcp.git agent-bus
 cd agent-bus
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e ".[dev]"
 ```
 
-This installs the `agent-bus` console script and registers the MCP
-entrypoint at `python -m agent_bus.server`.
+Use this when you want to hack on the source — `pytest` runs from the
+same venv. **Don't** wire this venv's paths into your `.mcp.json` /
+hooks; use the pipx install for that. The two installs coexist fine.
 
 ---
 
@@ -154,14 +172,15 @@ plain text         send to current default target (default '*')
 
 ### 1. `.mcp.json` (one per repo)
 
-Each repo gets its own MCP server with its own identity:
+Each repo gets its own MCP server with its own identity. Assuming the
+pipx install above, `agent-bus serve` is on `$PATH`:
 
 ```jsonc
 {
   "mcpServers": {
     "agent-bus": {
-      "command": "python",
-      "args": ["-m", "agent_bus.server"],
+      "command": "agent-bus",
+      "args": ["serve"],
       "env": {
         "AGENT_BUS_NAME": "alpha",
         "AGENT_BUS_REPO": "/path/to/repo-a"
@@ -170,6 +189,10 @@ Each repo gets its own MCP server with its own identity:
   }
 }
 ```
+
+If Claude Code's subprocess environment doesn't inherit `~/.local/bin`,
+use the absolute pipx path instead, e.g.
+`"command": "/home/<you>/.local/bin/agent-bus"`.
 
 In repo B, the same file uses `"AGENT_BUS_NAME": "beta"` and the
 repo B path. Same `~/.claude-agent-bus/bus.db` is shared automatically.
