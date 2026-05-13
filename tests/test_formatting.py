@@ -121,6 +121,33 @@ def test_fragments_for_audit_row_has_op_first():
 
 def test_style_map_includes_target_broadcast():
     style = fmt.style_map(["alpha", "beta"])
-    assert "target-*" in style
+    assert "target-broadcast" in style
     assert "agent-alpha" in style
     assert "agent-beta" in style
+
+
+def test_style_map_keys_are_prompt_toolkit_safe():
+    """prompt_toolkit's Style.from_dict requires `[A-Za-z0-9_-]+` keys."""
+    import re
+
+    style = fmt.style_map(["alpha", "beta", "servonaut-web-backend", "weird.name", "*"])
+    pattern = re.compile(r"^[A-Za-z0-9_-]+$")
+    for key in style:
+        assert pattern.match(key), f"unsafe class name: {key!r}"
+
+
+def test_safe_class_normalises_special_chars():
+    assert fmt.safe_class("*") == "broadcast"
+    assert fmt.safe_class("alpha") == "alpha"
+    assert fmt.safe_class("servonaut-web-backend") == "servonaut-web-backend"
+    assert fmt.safe_class("weird.name") == "weird_name"
+    assert fmt.safe_class("a/b c") == "a_b_c"
+    assert fmt.safe_class("") == "anon"
+
+
+def test_style_loads_into_prompt_toolkit():
+    """Regression: prompt_toolkit.Style.from_dict() must accept the result."""
+    from prompt_toolkit.styles import Style
+
+    style_dict = fmt.style_map(["alpha", "beta", "servonaut-web-backend", "*"])
+    Style.from_dict(style_dict)  # would AssertionError on a bad key

@@ -50,6 +50,24 @@ _ANSI_BOLD = "\033[1m"
 THREAD_ID_LEN = 8
 SUBJECT_LIMIT = 72
 
+# prompt_toolkit's Style class requires class names to match
+# `[a-zA-Z0-9_-]+`. Agent names can include any printable character, and
+# we use the literal `*` for broadcast. `safe_class()` normalises both
+# kinds of input into something the style engine accepts while keeping
+# distinct names distinct.
+_BROADCAST_CLASS = "broadcast"
+import re as _re
+
+_CLASS_SAFE_RE = _re.compile(r"[^A-Za-z0-9_-]")
+
+
+def safe_class(name: str) -> str:
+    if name == "*":
+        return _BROADCAST_CLASS
+    if not name:
+        return "anon"
+    return _CLASS_SAFE_RE.sub("_", name)
+
 
 def color_for(name: str) -> str:
     """Deterministic palette pick for an agent name.
@@ -152,9 +170,9 @@ def fragments_for_message(
     """
     out: list[Fragment] = []
     out.append(("class:ts", f"{humanize_clock(sent_at)}  "))
-    out.append((f"class:agent-{from_agent}", from_agent.ljust(name_col)))
+    out.append((f"class:agent-{safe_class(from_agent)}", from_agent.ljust(name_col)))
     out.append(("class:arrow", " → "))
-    out.append((f"class:target-{to_agent}", to_agent.ljust(target_col)))
+    out.append((f"class:target-{safe_class(to_agent)}", to_agent.ljust(target_col)))
     out.append(("", "  "))
     out.append(("", truncate(body, SUBJECT_LIMIT)))
     if show_thread and thread_id:
@@ -180,9 +198,9 @@ def fragments_for_audit_row(row: dict, *, name_col: int = 18) -> list[Fragment]:
     out: list[Fragment] = []
     out.append(("class:ts", f"{humanize_clock(sent_at)}  "))
     out.append((op_class, f"{op:<7}"))
-    out.append((f"class:agent-{src}", src.ljust(name_col)))
+    out.append((f"class:agent-{safe_class(src)}", src.ljust(name_col)))
     out.append(("class:arrow", " → "))
-    out.append((f"class:target-{dst}", dst.ljust(name_col)))
+    out.append((f"class:target-{safe_class(dst)}", dst.ljust(name_col)))
     out.append(("", "  "))
     out.append(("class:body", truncate(body, SUBJECT_LIMIT)))
     if thread_id:
@@ -212,10 +230,11 @@ def style_map(names: Iterable[str]) -> dict[str, str]:
             continue
         seen.add(n)
         color = color_for(n)
-        style[f"agent-{n}"] = f"{color} bold"
-        style[f"target-{n}"] = color
+        cls = safe_class(n)
+        style[f"agent-{cls}"] = f"{color} bold"
+        style[f"target-{cls}"] = color
     # broadcast target gets a neutral hue
-    style["target-*"] = "ansibrightmagenta bold"
+    style[f"target-{_BROADCAST_CLASS}"] = "ansibrightmagenta bold"
     return style
 
 
@@ -242,14 +261,17 @@ def render_plain(
             continue
         # very small style→ANSI mapper. Mirrors what style_map() emits.
         if style_class.startswith("class:agent-"):
-            name = style_class[len("class:agent-"):]
-            out.append(f"{_ANSI_FALLBACK[color_for(name)]}{_ANSI_BOLD}{text}{_ANSI_RESET}")
+            # the class is already sanitized; recover a color from it.
+            # color_for is stable for any string so the safe class still
+            # maps to the same color as the original name.
+            cls = style_class[len("class:agent-"):]
+            out.append(f"{_ANSI_FALLBACK[color_for(cls)]}{_ANSI_BOLD}{text}{_ANSI_RESET}")
         elif style_class.startswith("class:target-"):
-            name = style_class[len("class:target-"):]
-            if name == "*":
+            cls = style_class[len("class:target-"):]
+            if cls == _BROADCAST_CLASS:
                 out.append(f"{_ANSI_FALLBACK['ansibrightmagenta']}{_ANSI_BOLD}{text}{_ANSI_RESET}")
             else:
-                out.append(f"{_ANSI_FALLBACK[color_for(name)]}{text}{_ANSI_RESET}")
+                out.append(f"{_ANSI_FALLBACK[color_for(cls)]}{text}{_ANSI_RESET}")
         elif style_class in ("class:ts", "class:thread", "class:arrow"):
             out.append(f"{_ANSI_DIM}{text}{_ANSI_RESET}")
         elif style_class == "class:op-send":
