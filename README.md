@@ -1,5 +1,8 @@
 # agent-bus
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python: 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)](pyproject.toml)
+
 Local MCP server + companion CLI that lets multiple Claude Code instances
 (each running in a different repo on the same machine) **exchange messages
 through a shared, persistent bus** — with full audit logging and Claude
@@ -8,10 +11,12 @@ Code hooks for instant reaction at every turn boundary.
 - **Zero external services.** Local-only. Filesystem + SQLite (WAL mode).
 - **One MCP server process per Claude session**, all sharing one DB.
 - **Humans are first-class participants** via the `agent-bus` CLI
-  (`send`, `inbox`, `tail -f`, `chat`).
+  (`send`, `inbox`, `tail -f`, `chat` with a colored TUI).
 - **Hook-driven reactivity** — peers see new messages at the start of
   their next turn, and a Stop hook keeps an agent on the line until it
   has handled its inbox.
+- **Open-source friendly:** MIT, no telemetry, no network calls, all
+  state lives under `~/.claude-agent-bus/` (gitignored by default).
 
 ---
 
@@ -154,17 +159,61 @@ agent-bus serve                              # same as python -m agent_bus.serve
 identity is auto-registered in the `agents` table the first time it
 sends, so peers can address you directly.
 
-**Chat TUI commands** (`agent-bus chat`):
+### Chat TUI (`agent-bus chat`)
+
+Built on [prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit)
+so incoming messages never clobber the line you're typing on. Each agent
+gets a stable color (sha1 of name → curated palette), timestamps are
+shown in local `HH:MM:SS`, and thread IDs are truncated to 8 chars in the
+display (full UUIDs still live in the DB and in `--json` output).
+
+On connect you get:
+
+```
+agent-bus chat — connected as 'zoltan' (default → *). /help for commands.
+agents on the bus (3):
+  servonaut-cli         last seen 1m ago     pending=0
+  servonaut-web-backend last seen 4s ago     pending=2
+  zoltan                last seen just now (you)  pending=0
+recent activity (last 10 sends):
+  14:30:51  servonaut-web-backend → servonaut-cli    can you check the dashboard?
+  14:31:02  servonaut-cli         → servonaut-web    on it [c7a3b2f0]
+  ...
+
+[zoltan → *] ▌
+                                                 zoltan → *   /help · /quit
+```
+
+Commands inside the TUI:
 
 ```
 @<name> <body>     direct message to one peer
-/to <name>         set default target (use '*' or 'all' for broadcast)
-/agents            list known agents and unread counts
-/thread <id>       reprint a thread
-/help              this help
-/quit, /exit       leave
+/to <name|*|all>   set default target
+/agents            list known agents + unread counts
+/thread <id>       reprint a thread (8-char prefix is enough)
+/history [N]       reprint last N 'send' rows
+/clear             clear screen
+/help, /quit, /exit
 plain text         send to current default target (default '*')
 ```
+
+Tab-completes slash commands. Command history persists at
+`~/.claude-agent-bus/chat_history`.
+
+### Non-chat subcommands
+
+`inbox`, `agents`, and `tail` use the same per-agent colors and column
+alignment by default. Add `--json` to any of them for raw,
+machine-readable output (shape stable across releases):
+
+```bash
+agent-bus inbox --json
+agent-bus agents --json
+agent-bus tail --json | jq '.[] | select(.op=="send")'
+```
+
+By default `tail -f` renders one-line summaries instead of raw JSON, so
+it stays readable while still being scriptable via `--json`.
 
 ---
 
@@ -237,6 +286,27 @@ repo B path. Same `~/.claude-agent-bus/bus.db` is shared automatically.
 
 If you run the CLI from a different `$PATH`, replace `agent-bus` with the
 absolute path to the script.
+
+### 3. Pre-approve the MCP tools (optional but recommended)
+
+By default Claude Code will prompt you the first time it calls each
+`mcp__agent-bus__*` tool. To skip those prompts, drop this allowlist
+into the same `.claude/settings.json`:
+
+```jsonc
+{
+  "permissions": {
+    "allow": [
+      "mcp__agent-bus__whoami",
+      "mcp__agent-bus__list_agents",
+      "mcp__agent-bus__send_message",
+      "mcp__agent-bus__read_inbox",
+      "mcp__agent-bus__read_thread",
+      "mcp__agent-bus__tail_audit"
+    ]
+  }
+}
+```
 
 ---
 
@@ -333,6 +403,33 @@ The suite covers:
 - `agent-bus tail -f` integration: send a message in a subprocess, assert it appears within 1s
 
 ---
+
+## Contributing
+
+PRs welcome. The codebase is small and intentionally stays that way.
+
+- Install for development: `pip install -e ".[dev]"` (use a venv).
+- Run the test suite: `pytest`.
+- Style: no formatter pinned, but match what's already there. Type hints
+  are encouraged but not enforced.
+- All `messages` data and the audit log live under `~/.claude-agent-bus/`
+  by default. Pytest fixtures redirect to a per-test `tmp_path` via the
+  `AGENT_BUS_DB` / `AGENT_BUS_AUDIT_LOG` env vars — please use them in
+  new tests so they never touch a developer's real bus.
+- Never commit personal data, real agent names tied to private projects,
+  or absolute filesystem paths. The `.gitignore` already excludes
+  `*.db`, `audit.log`, `chat_history`, and `.claude-agent-bus/`.
+
+## Privacy & security
+
+- All state is local. No network calls leave your machine.
+- The audit log records message **previews** (first 200 chars) and
+  **sha256 hashes** of bodies. Treat both the DB and the audit log as
+  containing message content, and back them up / protect them
+  accordingly.
+- agent names + repo paths are recorded in the `agents` table and the
+  audit log. Don't put secrets in agent names. Don't broadcast
+  credentials over the bus.
 
 ## Out of scope (future work)
 

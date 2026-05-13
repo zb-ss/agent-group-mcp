@@ -1,13 +1,23 @@
-"""Line-buffered chat TUI for a human participant.
+"""Chat TUI for a human participant on the bus.
 
-Default identity is `human` (override via AGENT_BUS_NAME or --name). The
-human is registered just like any other agent so peers can send_message
-to them directly.
+Uses prompt_toolkit's PromptSession + patch_stdout() so the reader
+thread can print incoming messages without ever clobbering the input
+line you're typing on. A bottom toolbar always shows your identity,
+the default target, and the number of unread messages in case the
+reader thread is paused.
 
-Reader thread polls the inbox every POLL_SECONDS and prints arrivals.
-Writer is the foreground thread reading stdin. Lines starting with
-`@<name> ` are direct sends; `/...` is a small command set; everything
-else is a broadcast.
+Default identity is `human` (override via AGENT_BUS_NAME or --name).
+The human is registered just like any other agent so peers can address
+them with `send_message(to="human", ...)`.
+
+Commands inside the TUI:
+  @<name> <body>     direct message to one peer
+  /to <name>         set default target ('*' or 'all' for broadcast)
+  /agents            list known agents + unread counts
+  /thread <id>       reprint a thread (full or 8-char prefix)
+  /history [N]       reprint last N audit `send` rows
+  /help, /quit, /exit
+  plain text         send to current default target
 """
 
 from __future__ import annotations
@@ -19,24 +29,35 @@ import threading
 import time
 from pathlib import Path
 
-from .storage import BROADCAST, Storage
+from prompt_toolkit import HTML, PromptSession, print_formatted_text
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.styles import Style
 
-POLL_SECONDS = 0.5
-HELP = """\
-agent-bus chat — commands:
-  @<name> <body>     direct message to one peer
-  /to <name>         set default target (use '*' or 'all' for broadcast)
-  /agents            list known agents and unread counts
-  /thread <id>       reprint a thread
-  /help              this help
-  /quit, /exit       leave
-plain text         send to current default target (broadcast by default)
-"""
+from . import audit
+from . import formatting as fmt
+from .paths import audit_path
+from .storage import BROADCAST, Message, Storage
 
+POLL_SECONDS = 0.4
+DEFAULT_HISTORY_TAIL = 10
+NAME_COL = 18
+TARGET_COL = 18
 
-def _print(line: str) -> None:
-    sys.stdout.write(line.rstrip("\n") + "\n")
-    sys.stdout.flush()
+HELP_LINES = (
+    "agent-bus chat — commands:",
+    "  @<name> <body>     direct message to one peer",
+    "  /to <name|*|all>   set default target",
+    "  /agents            list known agents and unread counts",
+    "  /thread <id>       reprint a thread by 8-char id (or full)",
+    "  /history [N]       reprint last N audit 'send' rows (default 10)",
+    "  /clear             clear screen",
+    "  /help              this help",
+    "  /quit, /exit       leave",
+    "  plain text         send to current default target",
+)
 
 
 class ChatTUI:
@@ -54,6 +75,58 @@ class ChatTUI:
         self.poll_seconds = poll_seconds
         self.default_target = BROADCAST
         self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._unread = 0  # only used for the bottom toolbar display
+
+    # --------------------------- rendering helpers -------------------------
+
+    def _style(self) -> Style:
+        agents = {a.name for a in self.store.list_agents()}
+        agents.add(self.name)
+        return Style.from_dict(fmt.style_map(agents))
+
+    def _emit(self, fragments: list[fmt.Fragment]) -> None:
+        print_formatted_text(FormattedText(fragments), style=self._style())
+
+    def _system(self, text: str) -> None:
+        print_formatted_text(FormattedText([("class:system", text)]), style=self._style())
+
+    # --------------------------- on-connect view ---------------------------
+
+    def _print_connect_banner(self) -> None:
+        print_formatted_text(
+            FormattedText([
+                ("class:prompt", "agent-bus chat "),
+                ("class:system",
+                 f"— connected as {self.name!r} "
+                 f"(default → {self.default_target}). /help for commands."),
+            ]),
+            style=self._style(),
+        )
+
+    def _print_agent_roster(self) -> None:
+        rows = self.store.list_agents_with_counts()
+        if not rows:
+            self._system("(no other agents registered yet)")
+            return
+        self._system(f"agents on the bus ({len(rows)}):")
+        for agent, count in rows:
+            tag = " (you)" if agent.name == self.name else ""
+            seen = fmt.humanize_relative(agent.last_seen)
+            self._emit([
+                ("", "  "),
+                (f"class:agent-{agent.name}", agent.name.ljust(NAME_COL)),
+                ("class:system", f"  last seen {seen}{tag}"),
+                ("class:thread", f"  pending={count}"),
+            ])
+
+    def _print_recent_audit(self, n: int = DEFAULT_HISTORY_TAIL) -> None:
+        rows = [r for r in audit.tail(limit=n * 4) if r.get("op") == "send"][-n:]
+        if not rows:
+            return
+        self._system(f"recent activity (last {len(rows)} sends):")
+        for r in rows:
+            self._emit(fmt.fragments_for_audit_row(r, name_col=NAME_COL))
 
     # --------------------------- reader thread -----------------------------
 
@@ -67,91 +140,147 @@ class ChatTUI:
                     also_deliver=True,
                 )
             except Exception as e:
-                _print(f"[chat] reader error: {e}")
+                self._system(f"[reader] {e}")
                 self._stop.wait(self.poll_seconds)
                 continue
             for m in msgs:
-                _print(
-                    f"\n<{m.from_agent} → {m.to_agent}> "
-                    f"[thread {m.thread_id}] {m.body}"
-                )
-                self._reprint_prompt()
+                self._print_incoming(m)
+            with self._lock:
+                self._unread = self.store.pending_count(agent=self.name)
             self._stop.wait(self.poll_seconds)
 
-    def _reprint_prompt(self) -> None:
-        sys.stdout.write(self._prompt())
-        sys.stdout.flush()
-
-    def _prompt(self) -> str:
-        target = self.default_target
-        return f"[{self.name} → {target}] "
+    def _print_incoming(self, m: Message) -> None:
+        self._emit(
+            fmt.fragments_for_message(
+                sent_at=m.sent_at,
+                from_agent=m.from_agent,
+                to_agent=m.to_agent,
+                body=m.body,
+                thread_id=m.thread_id,
+                name_col=NAME_COL,
+                target_col=TARGET_COL,
+                show_thread=True,
+            )
+        )
 
     # --------------------------- send helpers ------------------------------
 
     def _send(self, to: str, body: str) -> None:
         if not body.strip():
             return
-        result = self.store.send_message(
-            from_agent=self.name,
-            to=to,
-            body=body,
-            actor=self.name,
-        )
+        try:
+            result = self.store.send_message(
+                from_agent=self.name,
+                to=to,
+                body=body,
+                actor=self.name,
+            )
+        except Exception as e:
+            self._system(f"[send] {e}")
+            return
+        ts = result.get("sent_at", "")
+        thread = result.get("thread_id")
         if "message_ids" in result:
-            mids = result["message_ids"]
             recipients = result.get("recipients", [])
             if not recipients:
-                _print("[chat] (no peers connected — message dropped)")
-            else:
-                _print(
-                    f"[chat] broadcast → {', '.join(recipients)} "
-                    f"({len(mids)} msg)"
-                )
+                self._system("(no peers connected — message dropped)")
+                return
+            target_label = f"all ({len(recipients)})"
         else:
-            _print(f"[chat] sent → {to} (id {result['message_id'][:8]})")
+            target_label = to
+        self._emit(
+            fmt.fragments_for_message(
+                sent_at=ts,
+                from_agent=self.name,
+                to_agent=target_label,
+                body=body,
+                thread_id=thread,
+                name_col=NAME_COL,
+                target_col=TARGET_COL,
+                show_thread=False,
+            )
+        )
 
-    # --------------------------- command parser ----------------------------
+    # --------------------------- command parser ---------------------------
+
+    def _resolve_thread(self, prefix: str) -> str | None:
+        """Allow `/thread abcd1234` (short form) by scanning audit log."""
+        if len(prefix) == 36:  # full UUID
+            return prefix
+        for row in reversed(audit.tail(limit=1000)):
+            tid = row.get("thread_id") or ""
+            if tid.startswith(prefix):
+                return tid
+        return None
 
     def _handle_command(self, line: str) -> bool:
-        """Return True if the chat should keep running."""
-        parts = shlex.split(line)
+        try:
+            parts = shlex.split(line)
+        except ValueError as e:
+            self._system(f"(unbalanced quoting: {e})")
+            return True
         if not parts:
             return True
         cmd = parts[0].lower()
         if cmd in ("/quit", "/exit"):
             return False
         if cmd == "/help":
-            _print(HELP)
+            for line in HELP_LINES:
+                self._system(line)
+            return True
+        if cmd == "/clear":
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+            self._print_connect_banner()
             return True
         if cmd == "/agents":
-            for agent, count in self.store.list_agents_with_counts():
-                _print(
-                    f"  {agent.name:<20} repo={agent.repo_path} "
-                    f"last_seen={agent.last_seen} pending={count}"
-                )
+            self._print_agent_roster()
             return True
         if cmd == "/to":
             if len(parts) < 2:
-                _print("[chat] usage: /to <name|*|all>")
+                self._system("usage: /to <name|*|all>")
                 return True
             target = parts[1]
             if target.lower() in ("all", "*"):
                 target = BROADCAST
             self.default_target = target
-            _print(f"[chat] default target set to {target}")
+            self._system(f"default target set to {target}")
             return True
         if cmd == "/thread":
             if len(parts) < 2:
-                _print("[chat] usage: /thread <thread_id>")
+                self._system("usage: /thread <id> (8-char prefix is enough)")
                 return True
-            for m in self.store.read_thread(thread_id=parts[1]):
-                _print(f"  [{m.sent_at}] {m.from_agent} → {m.to_agent}: {m.body}")
+            tid = self._resolve_thread(parts[1])
+            if tid is None:
+                self._system(f"(no thread matching {parts[1]!r})")
+                return True
+            msgs = self.store.read_thread(thread_id=tid)
+            if not msgs:
+                self._system(f"(thread {fmt.short_thread(tid)} has no messages)")
+                return True
+            self._system(f"thread {fmt.short_thread(tid)} — {len(msgs)} message(s):")
+            for m in msgs:
+                self._emit(
+                    fmt.fragments_for_message(
+                        sent_at=m.sent_at,
+                        from_agent=m.from_agent,
+                        to_agent=m.to_agent,
+                        body=m.body,
+                        thread_id=m.thread_id,
+                        name_col=NAME_COL,
+                        target_col=TARGET_COL,
+                        show_thread=False,
+                    )
+                )
             return True
-        _print(f"[chat] unknown command {cmd!r}; try /help")
+        if cmd == "/history":
+            n = int(parts[1]) if len(parts) >= 2 else DEFAULT_HISTORY_TAIL
+            self._print_recent_audit(n)
+            return True
+        self._system(f"unknown command {cmd!r}; try /help")
         return True
 
     def _handle_line(self, line: str) -> bool:
-        line = line.rstrip("\n")
         if not line.strip():
             return True
         if line.startswith("/"):
@@ -160,7 +289,7 @@ class ChatTUI:
             head, _, body = line.partition(" ")
             target = head[1:]
             if not target or not body:
-                _print("[chat] usage: @<name> <body>")
+                self._system("usage: @<name> <body>")
                 return True
             self._send(target, body)
             return True
@@ -169,28 +298,71 @@ class ChatTUI:
 
     # --------------------------- run loop ---------------------------------
 
+    def _bottom_toolbar(self):
+        with self._lock:
+            unread = self._unread
+        unread_part = f" <ansired>unread:{unread}</ansired>" if unread else ""
+        return HTML(
+            f" <b>{self.name}</b>"
+            f" → <ansicyan>{self.default_target}</ansicyan>"
+            f"{unread_part}"
+            f"  <ansigray>/help · /quit</ansigray>"
+        )
+
+    def _prompt_html(self):
+        return HTML(
+            f"<ansicyan>[</ansicyan>"
+            f"<b>{self.name}</b>"
+            f" → <ansicyan>{self.default_target}</ansicyan>"
+            f"<ansicyan>]</ansicyan> "
+        )
+
+    def _history_path(self) -> Path:
+        # Stored alongside the bus.db, NOT inside any project repo. Stays
+        # user-local even if the repo is published.
+        from .paths import db_path
+
+        return db_path().parent / "chat_history"
+
     def run(self) -> int:
         self.store.upsert_agent(self.name, self.repo_path)
-        _print(
-            f"agent-bus chat: connected as {self.name!r} "
-            f"(default target {self.default_target}). /help for commands."
+
+        history_path = self._history_path()
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+
+        completer = WordCompleter(
+            ["/agents", "/to", "/thread", "/history", "/help", "/clear", "/quit", "/exit"],
+            ignore_case=True,
         )
-        reader = threading.Thread(target=self._reader_loop, daemon=True)
-        reader.start()
-        try:
-            while True:
-                self._reprint_prompt()
-                try:
-                    line = input()
-                except EOFError:
-                    break
-                except KeyboardInterrupt:
-                    _print("")
-                    break
-                if not self._handle_line(line):
-                    break
-        finally:
-            self._stop.set()
+        session: PromptSession = PromptSession(
+            history=FileHistory(str(history_path)),
+            completer=completer,
+            complete_while_typing=False,
+        )
+
+        with patch_stdout():
+            self._print_connect_banner()
+            self._print_agent_roster()
+            self._print_recent_audit()
+            self._system("")  # blank line before live messages
+
+            reader = threading.Thread(target=self._reader_loop, daemon=True)
+            reader.start()
+
+            try:
+                while True:
+                    try:
+                        line = session.prompt(
+                            self._prompt_html(),
+                            bottom_toolbar=self._bottom_toolbar,
+                            refresh_interval=1.0,
+                        )
+                    except (EOFError, KeyboardInterrupt):
+                        break
+                    if not self._handle_line(line):
+                        break
+            finally:
+                self._stop.set()
         return 0
 
 

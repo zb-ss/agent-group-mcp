@@ -36,10 +36,14 @@ def test_cli_send_then_inbox(bus_paths):
     s = Storage()
     s.upsert_agent("beta", "/repo/beta")
 
-    r = _run_cli(["send", "--name", "human", "--to", "beta", "hello from cli"],
+    # use --json so the assertion is independent of cosmetic formatting
+    r = _run_cli(["send", "--name", "human", "--to", "beta",
+                  "hello from cli", "--json"],
                  env_extra=env)
     assert r.returncode == 0, r.stderr
-    assert "sent → beta" in r.stdout
+    sent = json.loads(r.stdout)
+    assert sent["recipients"] == ["beta"]
+    assert sent["message_id"]
 
     r = _run_cli(["inbox", "--name", "beta", "--json"], env_extra=env)
     assert r.returncode == 0, r.stderr
@@ -66,7 +70,7 @@ def test_cli_agents_lists_registered(bus_paths):
     assert names == ["alpha", "beta"]
 
 
-def test_cli_tail_static(bus_paths):
+def test_cli_tail_static_json(bus_paths):
     env = {
         "AGENT_BUS_DB": str(bus_paths["db"]),
         "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
@@ -77,10 +81,37 @@ def test_cli_tail_static(bus_paths):
     s.upsert_agent("b", "/repo/b")
     s.send_message(from_agent="a", to="b", body="audit-this")
 
-    r = _run_cli(["tail", "--limit", "10"], env_extra=env)
+    r = _run_cli(["tail", "--limit", "10", "--json"], env_extra=env)
     assert r.returncode == 0
     rows = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
     assert any(row["op"] == "send" and row["from"] == "a" for row in rows)
+
+
+def test_cli_tail_static_plain(bus_paths):
+    """Default tail output is a one-line human summary, not JSON."""
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+    from agent_bus.storage import Storage
+    s = Storage()
+    s.upsert_agent("a", "/repo/a")
+    s.upsert_agent("b", "/repo/b")
+    s.send_message(from_agent="a", to="b", body="audit-plain-line")
+
+    r = _run_cli(["tail", "--limit", "10"], env_extra=env)
+    assert r.returncode == 0
+    # the body preview and agent names should be in the rendered line,
+    # but the line should NOT be parseable as JSON (it's human output)
+    assert "audit-plain-line" in r.stdout
+    assert "send" in r.stdout
+    for line in r.stdout.splitlines():
+        if line.strip():
+            try:
+                json.loads(line)
+                raise AssertionError(f"non-json line parsed as JSON: {line!r}")
+            except json.JSONDecodeError:
+                pass
 
 
 def test_cli_tail_follow_picks_up_new_send(bus_paths):
