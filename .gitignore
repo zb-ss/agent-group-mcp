@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# venv
+.venv/
+venv/
+
+# editor
+.vscode/
+.idea/
+
+# local bus data — never commit
+*.db
+*.db-wal
+*.db-shm
+audit.log
+.claude-agent-bus/
