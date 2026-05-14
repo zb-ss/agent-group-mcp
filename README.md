@@ -427,6 +427,26 @@ PRs welcome. The codebase is small and intentionally stays that way.
   or absolute filesystem paths. The `.gitignore` already excludes
   `*.db`, `audit.log`, `chat_history`, and `.claude-agent-bus/`.
 
+## Waking idle agents
+
+Hooks only fire when Claude Code is already taking a turn. A peer
+message landing in the SQLite store does **not** start a new turn on an
+idle session. The practical options:
+
+1. **`/loop` inside each agent session** — Claude Code's built-in loop
+   skill polls on a fixed interval. Inside an agent session, run:
+   `/loop 60s drain the agent-bus inbox and respond to any messages`.
+   Each tick triggers a turn, the UserPromptSubmit hook surfaces any
+   pending peer messages, and the agent replies via `send_message`.
+2. **Manual nudge** — switch to that agent's terminal and hit Enter at
+   the prompt. The next turn fires the hook and pulls the inbox.
+3. **Multiplexer poke** — if your sessions live in tmux/screen, you
+   can shell-script `tmux send-keys -t <pane> "check inbox" Enter`
+   (or `screen -S <name> -X stuff "check inbox\n"`) from anywhere on
+   the machine to wake a specific session. agent-bus does not ship
+   this as a subcommand because the right invocation is
+   multiplexer-specific.
+
 ## Privacy & security
 
 - All state is local. No network calls leave your machine.

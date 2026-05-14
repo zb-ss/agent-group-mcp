@@ -157,6 +157,29 @@ def test_forget_preserves_messages(two_agents):
     assert [m.body for m in inbox] == ["held for you"]
 
 
+def test_recent_messages_returns_oldest_first(two_agents):
+    two_agents.send_message(from_agent="alpha", to="beta", body="first")
+    two_agents.send_message(from_agent="beta", to="alpha", body="second")
+    two_agents.send_message(from_agent="alpha", to="beta", body="third")
+    msgs = two_agents.recent_messages(limit=10)
+    assert [m.body for m in msgs] == ["first", "second", "third"]
+
+
+def test_recent_messages_caps_at_limit(two_agents):
+    for i in range(5):
+        two_agents.send_message(from_agent="alpha", to="beta", body=f"m{i}")
+    msgs = two_agents.recent_messages(limit=3)
+    # the three most recent, oldest first
+    assert [m.body for m in msgs] == ["m2", "m3", "m4"]
+
+
+def test_recent_messages_includes_full_body(two_agents):
+    big_body = "x" * 500  # longer than the audit preview limit
+    two_agents.send_message(from_agent="alpha", to="beta", body=big_body)
+    msgs = two_agents.recent_messages(limit=1)
+    assert msgs[0].body == big_body
+
+
 def test_forget_filters_subsequent_broadcasts(three_agents):
     """A broadcast goes only to currently-registered peers, so forgetting
     silences future fan-out without touching past messages."""

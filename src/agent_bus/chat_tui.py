@@ -52,11 +52,17 @@ HELP_LINES = (
     "  /to <name|*|all>   set default target",
     "  /agents            list known agents and unread counts",
     "  /thread <id>       reprint a thread by 8-char id (or full)",
-    "  /history [N]       reprint last N audit 'send' rows (default 10)",
+    "  /history [N]       reprint last N messages (default 10)",
     "  /clear             clear screen",
     "  /help              this help",
     "  /quit, /exit       leave",
     "  plain text         send to current default target",
+    "",
+    "  Note: Claude Code sessions can't be externally woken while idle.",
+    "  Have each agent run `/loop 60s drain the agent-bus inbox` so peer",
+    "  messages get reacted to within one poll cycle even when nobody is",
+    "  typing. Alternatively: switch to the agent's terminal and press",
+    "  Enter — the UserPromptSubmit hook will surface pending messages.",
 )
 
 
@@ -120,13 +126,22 @@ class ChatTUI:
                 ("class:thread", f"  pending={count}"),
             ])
 
-    def _print_recent_audit(self, n: int = DEFAULT_HISTORY_TAIL) -> None:
-        rows = [r for r in audit.tail(limit=n * 4) if r.get("op") == "send"][-n:]
-        if not rows:
+    def _print_recent_activity(self, n: int = DEFAULT_HISTORY_TAIL) -> None:
+        msgs = self.store.recent_messages(limit=n)
+        if not msgs:
             return
-        self._system(f"recent activity (last {len(rows)} sends):")
-        for r in rows:
-            self._emit(fmt.fragments_for_audit_row(r, name_col=NAME_COL))
+        self._system(f"recent activity (last {len(msgs)} message(s)):")
+        width = fmt.terminal_width()
+        for m in msgs:
+            for line in fmt.fragments_for_message_block(
+                sent_at=m.sent_at,
+                from_agent=m.from_agent,
+                to_agent=m.to_agent,
+                body=m.body,
+                thread_id=m.thread_id,
+                width=width,
+            ):
+                self._emit(line)
 
     # --------------------------- reader thread -----------------------------
 
@@ -150,18 +165,15 @@ class ChatTUI:
             self._stop.wait(self.poll_seconds)
 
     def _print_incoming(self, m: Message) -> None:
-        self._emit(
-            fmt.fragments_for_message(
-                sent_at=m.sent_at,
-                from_agent=m.from_agent,
-                to_agent=m.to_agent,
-                body=m.body,
-                thread_id=m.thread_id,
-                name_col=NAME_COL,
-                target_col=TARGET_COL,
-                show_thread=True,
-            )
-        )
+        for line in fmt.fragments_for_message_block(
+            sent_at=m.sent_at,
+            from_agent=m.from_agent,
+            to_agent=m.to_agent,
+            body=m.body,
+            thread_id=m.thread_id,
+            width=fmt.terminal_width(),
+        ):
+            self._emit(line)
 
     # --------------------------- send helpers ------------------------------
 
@@ -180,26 +192,28 @@ class ChatTUI:
             return
         ts = result.get("sent_at", "")
         thread = result.get("thread_id")
-        if "message_ids" in result:
+        is_broadcast = "message_ids" in result
+        if is_broadcast:
             recipients = result.get("recipients", [])
             if not recipients:
                 self._system("(no peers connected — message dropped)")
                 return
             target_label = f"all ({len(recipients)})"
+            target_class = "broadcast"
         else:
             target_label = to
-        self._emit(
-            fmt.fragments_for_message(
-                sent_at=ts,
-                from_agent=self.name,
-                to_agent=target_label,
-                body=body,
-                thread_id=thread,
-                name_col=NAME_COL,
-                target_col=TARGET_COL,
-                show_thread=False,
-            )
-        )
+            target_class = None  # use default (safe_class(to))
+
+        for line in fmt.fragments_for_message_block(
+            sent_at=ts,
+            from_agent=self.name,
+            to_agent=target_label,
+            body=body,
+            thread_id=thread,
+            width=fmt.terminal_width(),
+            target_class=target_class,
+        ):
+            self._emit(line)
 
     # --------------------------- command parser ---------------------------
 
@@ -259,23 +273,21 @@ class ChatTUI:
                 self._system(f"(thread {fmt.short_thread(tid)} has no messages)")
                 return True
             self._system(f"thread {fmt.short_thread(tid)} — {len(msgs)} message(s):")
+            width = fmt.terminal_width()
             for m in msgs:
-                self._emit(
-                    fmt.fragments_for_message(
-                        sent_at=m.sent_at,
-                        from_agent=m.from_agent,
-                        to_agent=m.to_agent,
-                        body=m.body,
-                        thread_id=m.thread_id,
-                        name_col=NAME_COL,
-                        target_col=TARGET_COL,
-                        show_thread=False,
-                    )
-                )
+                for line in fmt.fragments_for_message_block(
+                    sent_at=m.sent_at,
+                    from_agent=m.from_agent,
+                    to_agent=m.to_agent,
+                    body=m.body,
+                    thread_id=None,  # already grouped by thread header
+                    width=width,
+                ):
+                    self._emit(line)
             return True
         if cmd == "/history":
             n = int(parts[1]) if len(parts) >= 2 else DEFAULT_HISTORY_TAIL
-            self._print_recent_audit(n)
+            self._print_recent_activity(n)
             return True
         self._system(f"unknown command {cmd!r}; try /help")
         return True
@@ -343,7 +355,7 @@ class ChatTUI:
         with patch_stdout():
             self._print_connect_banner()
             self._print_agent_roster()
-            self._print_recent_audit()
+            self._print_recent_activity()
             self._system("")  # blank line before live messages
 
             reader = threading.Thread(target=self._reader_loop, daemon=True)

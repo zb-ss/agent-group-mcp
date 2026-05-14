@@ -462,6 +462,43 @@ class Storage:
             for r in rows
         ]
 
+    def recent_messages(self, *, limit: int = 10) -> list[Message]:
+        """Return the N most-recent messages across the bus, oldest first.
+
+        Used by the chat TUI to print connect-time context. Goes through
+        the `messages` table (not the audit log) so the full body is
+        available — audit rows only store the 200-char preview.
+        """
+        if limit <= 0:
+            return []
+        self.init_schema()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT message_id, from_agent, to_agent, body, thread_id,
+                       sent_at, read_at, delivered_at
+                FROM messages
+                ORDER BY sent_at DESC, message_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        msgs = [
+            Message(
+                message_id=r["message_id"],
+                from_agent=r["from_agent"],
+                to_agent=r["to_agent"],
+                body=r["body"],
+                thread_id=r["thread_id"],
+                sent_at=r["sent_at"],
+                read_at=r["read_at"],
+                delivered_at=r["delivered_at"],
+            )
+            for r in rows
+        ]
+        msgs.reverse()  # oldest first for display
+        return msgs
+
     def pending_count(self, *, agent: str) -> int:
         self.init_schema()
         with self.connect() as conn:

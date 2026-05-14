@@ -151,3 +151,62 @@ def test_style_loads_into_prompt_toolkit():
 
     style_dict = fmt.style_map(["alpha", "beta", "servonaut-web-backend", "*"])
     Style.from_dict(style_dict)  # would AssertionError on a bad key
+
+
+def test_wrap_body_short_input_one_line():
+    out = fmt.wrap_body("hi there", width=80)
+    assert out == ["    hi there"]
+
+
+def test_wrap_body_long_input_wraps_multiple_lines():
+    body = "word " * 40  # ~200 chars
+    out = fmt.wrap_body(body, width=40, indent="  ")
+    assert len(out) >= 4
+    for line in out:
+        assert line.startswith("  ")
+        assert len(line) <= 40 + 2  # indent overhead is allowed
+
+
+def test_wrap_body_preserves_explicit_newlines():
+    body = "line one\n\nline three"
+    out = fmt.wrap_body(body, width=80, indent="")
+    assert "line one" in out[0]
+    assert out[1] == ""  # blank line preserved
+    assert "line three" in out[2]
+
+
+def test_wrap_body_keeps_long_unbreakable_token():
+    """URLs, code-ish tokens shouldn't get broken mid-word."""
+    body = "see https://example.com/very/long/path/here?qs=1&other=2"
+    out = fmt.wrap_body(body, width=30, indent="")
+    assert any("https://example.com" in line for line in out)
+
+
+def test_fragments_for_message_block_includes_header_then_body():
+    block = fmt.fragments_for_message_block(
+        sent_at="2026-05-13T19:00:00.000000Z",
+        from_agent="alpha",
+        to_agent="beta",
+        body="this is a sufficiently long message that probably wraps on a 40-char terminal",
+        thread_id="abcd1234-0000-0000-0000-000000000000",
+        width=40,
+    )
+    assert len(block) >= 2  # header + at least one body line
+    header = fmt.render_plain(block[0], use_color=False)
+    assert "alpha" in header and "beta" in header
+    body_text = " ".join(fmt.render_plain(b, use_color=False) for b in block[1:])
+    assert "wraps" in body_text
+
+
+def test_target_class_override_picks_broadcast_color():
+    """Passing target_class='broadcast' uses the magenta hue regardless of label."""
+    frags = fmt.fragments_for_message(
+        sent_at="2026-05-13T19:00:00.000000Z",
+        from_agent="alpha",
+        to_agent="all (3)",
+        body="hi",
+        thread_id=None,
+        target_class="broadcast",
+    )
+    classes = [c for c, _ in frags if c]
+    assert "class:target-broadcast" in classes

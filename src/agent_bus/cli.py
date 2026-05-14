@@ -106,19 +106,32 @@ def cmd_inbox(args: argparse.Namespace) -> int:
     if not msgs:
         sys.stdout.write(f"(no messages for {name})\n")
         return 0
-    for m in msgs:
-        _emit(
-            fmt.fragments_for_message(
-                sent_at=m.sent_at,
-                from_agent=m.from_agent,
-                to_agent=m.to_agent,
-                body=m.body,
-                thread_id=m.thread_id,
-                name_col=NAME_COL,
-                target_col=TARGET_COL,
-                show_thread=True,
+    width = fmt.terminal_width()
+    if args.short:
+        for m in msgs:
+            _emit(
+                fmt.fragments_for_message(
+                    sent_at=m.sent_at,
+                    from_agent=m.from_agent,
+                    to_agent=m.to_agent,
+                    body=m.body,
+                    thread_id=m.thread_id,
+                    name_col=NAME_COL,
+                    target_col=TARGET_COL,
+                    show_thread=True,
+                )
             )
-        )
+        return 0
+    for m in msgs:
+        for line in fmt.fragments_for_message_block(
+            sent_at=m.sent_at,
+            from_agent=m.from_agent,
+            to_agent=m.to_agent,
+            body=m.body,
+            thread_id=m.thread_id,
+            width=width,
+        ):
+            _emit(line)
     return 0
 
 
@@ -154,6 +167,24 @@ def _audit_render_line(row: dict) -> str:
     return fmt.render_plain(fmt.fragments_for_audit_row(row, name_col=NAME_COL))
 
 
+def _audit_render_block(row: dict) -> str:
+    """Multi-line render of an audit row including the full body preview."""
+    body = row.get("body_preview") or ""
+    thread_id = row.get("thread_id")
+    from_agent = row.get("from") or row.get("actor") or "?"
+    to_agent = row.get("to") or "*"
+    sent_at = row.get("ts") or ""
+    op = row.get("op", "?")
+    width = fmt.terminal_width()
+    out: list[str] = []
+    # header is the same one-liner, minus the body
+    header_frags = fmt.fragments_for_audit_row({**row, "body_preview": ""}, name_col=NAME_COL)
+    out.append(fmt.render_plain(header_frags).rstrip())
+    for body_line in fmt.wrap_body(body, width=width):
+        out.append(body_line)
+    return "\n".join(out)
+
+
 def cmd_tail(args: argparse.Namespace) -> int:
     log = audit_path()
     if not args.follow:
@@ -161,6 +192,9 @@ def cmd_tail(args: argparse.Namespace) -> int:
         if args.json:
             for r in rows:
                 sys.stdout.write(json.dumps(r) + "\n")
+        elif args.full:
+            for r in rows:
+                sys.stdout.write(_audit_render_block(r) + "\n")
         else:
             for r in rows:
                 sys.stdout.write(_audit_render_line(r) + "\n")
@@ -179,7 +213,10 @@ def cmd_tail(args: argparse.Namespace) -> int:
         except json.JSONDecodeError:
             sys.stdout.write(raw + "\n")
             return
-        sys.stdout.write(_audit_render_line(row) + "\n")
+        if args.full:
+            sys.stdout.write(_audit_render_block(row) + "\n")
+        else:
+            sys.stdout.write(_audit_render_line(row) + "\n")
 
     if log.exists():
         with log.open("r", encoding="utf-8", errors="replace") as f:
@@ -286,6 +323,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--name", help="Whose inbox to read. Default env or 'human'.")
     s.add_argument("--limit", type=int, default=50)
     s.add_argument("--peek", action="store_true", help="Don't mark messages read.")
+    s.add_argument(
+        "--short",
+        action="store_true",
+        help="One-line summaries (truncates long bodies) instead of full text.",
+    )
     s.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     s.set_defaults(func=cmd_inbox)
 
@@ -306,6 +348,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("tail", help="Tail the audit log (one-line summaries).")
     s.add_argument("-f", "--follow", action="store_true", help="Stream new rows live.")
     s.add_argument("--limit", type=int, default=50)
+    s.add_argument(
+        "--full",
+        action="store_true",
+        help="Wrap full body preview on multiple lines under each header.",
+    )
     s.add_argument("--json", action="store_true", help="Emit raw JSON rows.")
     s.set_defaults(func=cmd_tail)
 

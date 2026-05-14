@@ -9,7 +9,9 @@ them to ANSI escapes for stdout.
 from __future__ import annotations
 
 import hashlib
+import shutil
 import sys
+import textwrap
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -162,22 +164,97 @@ def fragments_for_message(
     name_col: int = 18,
     target_col: int = 18,
     show_thread: bool = True,
+    target_class: str | None = None,
 ) -> list[Fragment]:
     """Build a one-line FormattedText representation of a message.
 
     name_col and target_col pad the columns so multi-message output
     aligns regardless of name length.
+
+    `target_class` overrides the class used to colorise the target —
+    e.g. when displaying a broadcast as 'all (3)' the caller wants the
+    broadcast hue regardless of what label is shown.
     """
+    tcls = target_class if target_class is not None else safe_class(to_agent)
     out: list[Fragment] = []
     out.append(("class:ts", f"{humanize_clock(sent_at)}  "))
     out.append((f"class:agent-{safe_class(from_agent)}", from_agent.ljust(name_col)))
     out.append(("class:arrow", " → "))
-    out.append((f"class:target-{safe_class(to_agent)}", to_agent.ljust(target_col)))
+    out.append((f"class:target-{tcls}", to_agent.ljust(target_col)))
     out.append(("", "  "))
     out.append(("", truncate(body, SUBJECT_LIMIT)))
     if show_thread and thread_id:
         out.append(("class:thread", f"  [{short_thread(thread_id)}]"))
     return out
+
+
+def wrap_body(body: str, *, width: int, indent: str = "    ") -> list[str]:
+    """Wrap a message body to `width` columns with an indent prefix.
+
+    Preserves explicit newlines (each becomes its own wrapped block).
+    Long unbroken tokens are left intact rather than mid-word-split,
+    matching how chat clients render URLs and code-ish strings.
+    """
+    available = max(20, width - len(indent))
+    out: list[str] = []
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    for raw_line in body.split("\n"):
+        if not raw_line.strip():
+            out.append(indent.rstrip())
+            continue
+        wrapped = textwrap.wrap(
+            raw_line,
+            width=available,
+            break_long_words=False,
+            break_on_hyphens=False,
+            replace_whitespace=False,
+            drop_whitespace=False,
+        )
+        if not wrapped:
+            out.append(indent + raw_line)
+        else:
+            for line in wrapped:
+                out.append(indent + line.rstrip())
+    return out
+
+
+def terminal_width(default: int = 100) -> int:
+    try:
+        return shutil.get_terminal_size((default, 20)).columns
+    except OSError:
+        return default
+
+
+def fragments_for_message_block(
+    *,
+    sent_at: str,
+    from_agent: str,
+    to_agent: str,
+    body: str,
+    thread_id: str | None,
+    width: int,
+    indent: str = "    ",
+    target_class: str | None = None,
+) -> list[list[Fragment]]:
+    """Multi-line layout: header on its own line, body wrapped underneath.
+
+    Returns a list-of-lines where each line is a fragment list. Callers
+    iterate and emit one prompt_toolkit print per inner list.
+    """
+    tcls = target_class if target_class is not None else safe_class(to_agent)
+    header: list[Fragment] = [
+        ("class:ts", f"{humanize_clock(sent_at)}  "),
+        (f"class:agent-{safe_class(from_agent)}", from_agent),
+        ("class:arrow", " → "),
+        (f"class:target-{tcls}", to_agent),
+    ]
+    if thread_id:
+        header.append(("class:thread", f"  [{short_thread(thread_id)}]"))
+
+    lines: list[list[Fragment]] = [header]
+    for body_line in wrap_body(body, width=width, indent=indent):
+        lines.append([("class:body", body_line)])
+    return lines
 
 
 def fragments_for_audit_row(row: dict, *, name_col: int = 18) -> list[Fragment]:
@@ -197,7 +274,8 @@ def fragments_for_audit_row(row: dict, *, name_col: int = 18) -> list[Fragment]:
 
     out: list[Fragment] = []
     out.append(("class:ts", f"{humanize_clock(sent_at)}  "))
-    out.append((op_class, f"{op:<7}"))
+    # pad to 8 so 'deliver' (7 chars) still has a separator before the next column
+    out.append((op_class, f"{op:<8}"))
     out.append((f"class:agent-{safe_class(src)}", src.ljust(name_col)))
     out.append(("class:arrow", " → "))
     out.append((f"class:target-{safe_class(dst)}", dst.ljust(name_col)))
