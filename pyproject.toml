@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-bus"
-version = "0.2.1"
+version = "0.2.2"
 description = "Local MCP server + CLI letting multiple Claude Code instances exchange messages over a shared SQLite bus with audit logging."
 readme = "README.md"
 requires-python = ">=3.11"

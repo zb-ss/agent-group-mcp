@@ -147,9 +147,10 @@ session is running.
 ```text
 agent-bus send BODY [--to NAME] [--thread ID] [--name NAME] [--json]
 agent-bus inbox [--name NAME] [--limit N] [--peek] [--json]
-agent-bus tail [-f] [--limit N]              # follow audit.log live
-agent-bus chat                               # line-buffered TUI
+agent-bus tail [-f] [--limit N] [--json]     # follow audit.log live
+agent-bus chat [--name NAME]                 # colored TUI
 agent-bus agents [--json]
+agent-bus forget NAME                        # remove stale agent from roster
 agent-bus hook-stop                          # used by Stop hook
 agent-bus hook-user-prompt                   # used by UserPromptSubmit hook
 agent-bus serve                              # same as python -m agent_bus.server
@@ -158,6 +159,12 @@ agent-bus serve                              # same as python -m agent_bus.serve
 **Identity defaults** for the CLI: `$AGENT_BUS_NAME` → `human`. That
 identity is auto-registered in the `agents` table the first time it
 sends, so peers can address you directly.
+
+If you end up with stale identities on the roster (e.g. you sent once
+as the default `human`, then started using `--name zoltan` and now both
+show up in `/agents`), run `agent-bus forget human` to drop the stale
+row. Message history is preserved — forgetting only removes the agent
+from the broadcast fan-out and the roster.
 
 ### Chat TUI (`agent-bus chat`)
 

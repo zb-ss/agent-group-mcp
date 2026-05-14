@@ -215,6 +215,25 @@ def cmd_tail(args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_forget(args: argparse.Namespace) -> int:
+    store = Storage()
+    name = args.name
+    pending = store.pending_count(agent=name)
+    ok = store.forget_agent(name)
+    if not ok:
+        sys.stdout.write(f"(no agent named {name!r} on the roster)\n")
+        return 0
+    sys.stdout.write(f"forgot agent {name!r}. ")
+    if pending > 0:
+        sys.stdout.write(
+            f"{pending} undelivered message(s) remain in the DB; "
+            f"they will be delivered if {name!r} reconnects.\n"
+        )
+    else:
+        sys.stdout.write("no undelivered messages.\n")
+    return 0
+
+
 def cmd_chat(args: argparse.Namespace) -> int:
     from .chat_tui import main as chat_main
 
@@ -274,6 +293,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("agents", help="List registered agents.")
     s.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     s.set_defaults(func=cmd_agents)
+
+    # forget
+    s = sub.add_parser(
+        "forget",
+        help="Remove an agent from the roster. Message history is preserved.",
+    )
+    s.add_argument("name", help="Agent name to remove from the roster.")
+    s.set_defaults(func=cmd_forget)
 
     # tail
     s = sub.add_parser("tail", help="Tail the audit log (one-line summaries).")

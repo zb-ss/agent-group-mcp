@@ -214,6 +214,21 @@ class Storage:
                 (_utc_now_iso(), name),
             )
 
+    def forget_agent(self, name: str) -> bool:
+        """Remove an agent from the roster. Returns True if a row was deleted.
+
+        Does NOT touch the `messages` table: history is preserved, and if
+        the agent ever reconnects (e.g. `agent-bus chat --name <same>`)
+        the upsert recreates the row and any unread messages still
+        surface in the next `read_inbox`. Forgetting is therefore
+        reversible — it just means "stop showing this name on the
+        roster and stop fanning broadcasts out to it for now".
+        """
+        self.init_schema()
+        with self.connect() as conn:
+            cur = conn.execute("DELETE FROM agents WHERE name = ?", (name,))
+            return cur.rowcount > 0
+
     # ----------------------------- messages ---------------------------------
 
     def _expand_recipients(self, from_agent: str, to: str) -> list[str]:

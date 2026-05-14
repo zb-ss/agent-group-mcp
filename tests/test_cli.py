@@ -53,6 +53,35 @@ def test_cli_send_then_inbox(bus_paths):
     assert msgs[0]["from"] == "human"
 
 
+def test_cli_forget_removes_from_roster(bus_paths):
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+    from agent_bus.storage import Storage
+    s = Storage()
+    s.upsert_agent("alpha", "/repo/a")
+    s.upsert_agent("ghost", "/repo/g")
+
+    r = _run_cli(["forget", "ghost"], env_extra=env)
+    assert r.returncode == 0
+    assert "forgot agent 'ghost'" in r.stdout
+
+    r = _run_cli(["agents", "--json"], env_extra=env)
+    names = sorted(row["name"] for row in json.loads(r.stdout))
+    assert names == ["alpha"]
+
+
+def test_cli_forget_unknown_is_noop(bus_paths):
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+    r = _run_cli(["forget", "nobody"], env_extra=env)
+    assert r.returncode == 0
+    assert "no agent named 'nobody'" in r.stdout
+
+
 def test_cli_agents_lists_registered(bus_paths):
     env = {
         "AGENT_BUS_DB": str(bus_paths["db"]),

@@ -135,6 +135,39 @@ def test_list_agents_with_counts(two_agents):
     assert rows == {"alpha": 0, "beta": 2}
 
 
+def test_forget_agent_removes_from_roster(two_agents):
+    assert two_agents.forget_agent("alpha") is True
+    names = [a.name for a in two_agents.list_agents()]
+    assert names == ["beta"]
+
+
+def test_forget_agent_noop_on_unknown(two_agents):
+    assert two_agents.forget_agent("nobody") is False
+
+
+def test_forget_preserves_messages(two_agents):
+    """Forgetting is reversible: when the agent reconnects, their unread
+    messages still surface."""
+    two_agents.send_message(from_agent="alpha", to="beta", body="held for you")
+    assert two_agents.forget_agent("beta") is True
+    assert "beta" not in {a.name for a in two_agents.list_agents()}
+
+    two_agents.upsert_agent("beta", "/repo/b")
+    inbox = two_agents.read_inbox(agent="beta")
+    assert [m.body for m in inbox] == ["held for you"]
+
+
+def test_forget_filters_subsequent_broadcasts(three_agents):
+    """A broadcast goes only to currently-registered peers, so forgetting
+    silences future fan-out without touching past messages."""
+    three_agents.forget_agent("gamma")
+    result = three_agents.send_message(
+        from_agent="alpha", to="*", body="post-forget"
+    )
+    assert result["recipients"] == ["beta"]
+    assert three_agents.pending_count(agent="gamma") == 0
+
+
 # --------- concurrent writers --------------------------------------------
 
 def _writer(db_path: str, audit_log: str, name: str, peer: str, n: int) -> None:
