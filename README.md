@@ -145,6 +145,7 @@ trip — so a human can drive the bus from any shell even when no Claude
 session is running.
 
 ```text
+agent-bus init [PATHS...] [--scan] [--apply] [--force] [--prefix STR] [--name NAME]
 agent-bus send BODY [--to NAME] [--thread ID] [--name NAME] [--json]
 agent-bus inbox [--name NAME] [--limit N] [--peek] [--json]
 agent-bus tail [-f] [--limit N] [--full] [--json]    # follow audit.log live
@@ -225,7 +226,66 @@ it stays readable while still being scriptable via `--json`.
 
 ---
 
-## Wiring it up in a repo
+## Bulk wiring with `agent-bus init`
+
+If you have more than a handful of repos, hand-editing every
+`.mcp.json` is a chore. `agent-bus init` does it for you:
+
+```bash
+# preview every git repo under these roots (default: dry-run)
+agent-bus init --scan ~/websites ~/projects
+
+# review the plan, then commit it
+agent-bus init --scan ~/websites ~/projects --apply
+
+# init just the current directory (writes immediately)
+agent-bus init
+
+# init one named repo
+agent-bus init ~/projects/foo --name myname
+```
+
+Each managed repo gets:
+
+1. `.mcp.json` — only the `mcpServers.agent-bus` entry is added/refreshed;
+   other MCP servers in the file are preserved.
+2. `.claude/settings.json` — `UserPromptSubmit` + `Stop` hooks are merged
+   in, and the six `mcp__agent-bus__*` permission entries are added to
+   `permissions.allow` (deduped if already present).
+
+**Name derivation.** Default = slug of the repo's basename:
+`~/websites/servonaut.dev` → `servonaut-dev`, `~/projects/my_thing` →
+`my-thing`. Collisions across directories are resolved by prefixing the
+parent dir (`projects-foo` vs `websites-foo`).
+
+**Per-repo overrides.**
+
+- Drop a `.agent-bus-name` file in any repo containing a single line
+  with the desired agent name. `agent-bus init` will use that name
+  instead of the slug. Useful for keeping legacy names during migration.
+- Drop a `.agent-bus-ignore` file (empty) in any repo to opt it out of
+  bulk init entirely.
+
+**Idempotency.** Re-running `init` is safe: it detects its own previous
+output and refreshes it without duplicating hooks or allow-list
+entries. Hand-written `agent-bus` entries are left alone unless you
+pass `--force`.
+
+**Useful flags.**
+
+```
+--scan          treat paths as roots; walk for git repos
+--apply         actually write (required for --scan; single-repo is implicit)
+--force         overwrite hand-written agent-bus entries
+--prefix STR    prepend a slug to every derived name (e.g. `--prefix work-`)
+--name NAME     explicit override (single-repo init only)
+--bin-path PATH override the agent-bus binary path written into the configs
+--json          emit the plan as JSON without applying
+```
+
+---
+
+## Wiring it up manually (single repo, no bulk tool)
 
 ### 1. `.mcp.json` (one per repo)
 

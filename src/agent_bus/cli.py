@@ -25,6 +25,7 @@ from pathlib import Path
 
 from . import audit
 from . import formatting as fmt
+from . import init_cmd
 from . import wake
 from .paths import audit_path
 from .storage import BROADCAST, Storage
@@ -272,6 +273,99 @@ def cmd_forget(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_init(args: argparse.Namespace) -> int:
+    """Wire `.mcp.json` + `.claude/settings.json` for one or many repos."""
+    paths = [Path(p) for p in (args.paths or [Path.cwd()])]
+    bin_path = init_cmd.detect_agent_bus_bin(args.bin_path)
+
+    if args.name and (args.scan or len(paths) != 1):
+        sys.stderr.write(
+            "--name only applies to single-repo init "
+            "(omit --scan and pass exactly one path)\n"
+        )
+        return 2
+
+    plans = init_cmd.plan_for_paths(
+        paths,
+        scan=args.scan,
+        prefix=args.prefix,
+        override=args.name,
+        force=args.force,
+        bin_path=bin_path,
+    )
+
+    if args.json:
+        out = [
+            {
+                "repo": str(p.repo),
+                "name": p.name,
+                "action": p.action.value,
+                "previous_name": p.previous_name,
+                "notes": p.notes,
+            }
+            for p in plans
+        ]
+        sys.stdout.write(json.dumps(out, indent=2) + "\n")
+        return 0
+
+    # Render the plan table.
+    if not plans:
+        sys.stdout.write("(no repos found)\n")
+        return 0
+
+    width_name = max((len(p.name) for p in plans if p.name), default=8)
+    width_name = max(width_name, 8)
+    width_action = max(len(a.value) for a in init_cmd.Action)
+
+    for p in plans:
+        repo_short = str(p.repo)
+        try:
+            repo_short = "~/" + str(p.repo.relative_to(Path.home()))
+        except ValueError:
+            pass
+        line = (
+            f"  {p.action.value:<{width_action}}  "
+            f"{p.name:<{width_name}}  {repo_short}"
+        )
+        if p.notes:
+            line += f"   ({'; '.join(p.notes)})"
+        sys.stdout.write(line + "\n")
+
+    counts = init_cmd.summarise(plans)
+    changes = [p for p in plans if p.is_change]
+    sys.stdout.write(
+        f"\n{len(plans)} repo(s) scanned · "
+        f"write={counts['write']} refresh={counts['refresh']} "
+        f"renamed={counts['rename']} "
+        f"handwritten-skip={counts['skip-handwritten']} "
+        f"ignored={counts['skip-ignored']} "
+        f"not-repo={counts['skip-not-repo']}\n"
+    )
+
+    # Single-repo init writes immediately; --scan needs --apply.
+    is_bulk = args.scan or len(paths) != 1
+    will_apply = args.apply or not is_bulk
+
+    if not changes:
+        sys.stdout.write("nothing to do.\n")
+        return 0
+
+    if not will_apply:
+        sys.stdout.write(
+            f"\nDRY RUN. Re-run with --apply to write changes "
+            f"({len(changes)} repo(s) will be modified).\n"
+        )
+        return 0
+
+    written = 0
+    for p in plans:
+        if p.is_change:
+            init_cmd.apply_plan(p, bin_path=bin_path)
+            written += 1
+    sys.stdout.write(f"\nApplied to {written} repo(s).\n")
+    return 0
+
+
 def cmd_wake_config(args: argparse.Namespace) -> int:
     action = args.action
     cfg_path = wake.wake_config_path()
@@ -417,6 +511,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--json", action="store_true", help="Emit raw JSON rows.")
     s.set_defaults(func=cmd_tail)
+
+    # init
+    s = sub.add_parser(
+        "init",
+        help="Wire .mcp.json and .claude/settings.json into one or many repos.",
+        description=(
+            "Single-repo (no --scan): writes immediately. "
+            "Bulk (--scan): dry-run by default; pass --apply to commit. "
+            "Per-repo overrides: drop a `.agent-bus-name` file with the "
+            "desired name, or `.agent-bus-ignore` to opt the repo out."
+        ),
+    )
+    s.add_argument(
+        "paths",
+        nargs="*",
+        help="Repo paths (or roots to scan with --scan). Default: current directory.",
+    )
+    s.add_argument(
+        "--scan",
+        action="store_true",
+        help="Treat paths as parents; walk them for git repos and init each.",
+    )
+    s.add_argument(
+        "--apply",
+        action="store_true",
+        help="Required to actually write when scanning. Single-repo writes immediately.",
+    )
+    s.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite hand-written `mcpServers.agent-bus` entries (default: skip).",
+    )
+    s.add_argument(
+        "--prefix",
+        help="Slug prefix prepended to every derived name.",
+    )
+    s.add_argument(
+        "--name",
+        help="Explicit agent name (single-repo init only).",
+    )
+    s.add_argument(
+        "--bin-path",
+        help="Absolute path to the `agent-bus` binary written into the configs. "
+             "Default: $AGENT_BUS_BIN, or `which agent-bus`, or 'agent-bus'.",
+    )
+    s.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the plan as JSON (no apply).",
+    )
+    s.set_defaults(func=cmd_init)
 
     # wake-config
     s = sub.add_parser(
