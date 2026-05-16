@@ -25,6 +25,7 @@ from pathlib import Path
 
 from . import audit
 from . import formatting as fmt
+from . import wake
 from .paths import audit_path
 from .storage import BROADCAST, Storage
 
@@ -271,6 +272,67 @@ def cmd_forget(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wake_config(args: argparse.Namespace) -> int:
+    action = args.action
+    cfg_path = wake.wake_config_path()
+
+    if action == "show":
+        cfg = wake.load_wake_config()
+        if args.json:
+            sys.stdout.write(json.dumps(cfg, indent=2) + "\n")
+            return 0
+        if not cfg:
+            sys.stdout.write(f"(no wake commands configured — {cfg_path} does not exist)\n")
+            return 0
+        sys.stdout.write(f"# {cfg_path}\n")
+        for name, entry in cfg.items():
+            cmd = entry if isinstance(entry, str) else (entry.get("command") if isinstance(entry, dict) else None)
+            cmd_repr = cmd if cmd else "(disabled)"
+            sys.stdout.write(f"{name:<24} {cmd_repr}\n")
+        return 0
+
+    if action == "set":
+        if not args.name or not args.command:
+            sys.stdout.write("usage: agent-bus wake-config set NAME COMMAND\n")
+            return 2
+        cfg = wake.load_wake_config()
+        cfg[args.name] = args.command
+        wake.save_wake_config(cfg)
+        sys.stdout.write(f"wake command set for {args.name!r} → {args.command}\n")
+        return 0
+
+    if action == "clear":
+        if not args.name:
+            sys.stdout.write("usage: agent-bus wake-config clear NAME\n")
+            return 2
+        cfg = wake.load_wake_config()
+        if args.name not in cfg:
+            sys.stdout.write(f"(no wake command for {args.name!r})\n")
+            return 0
+        del cfg[args.name]
+        wake.save_wake_config(cfg)
+        sys.stdout.write(f"cleared wake command for {args.name!r}\n")
+        return 0
+
+    if action == "test":
+        if not args.name:
+            sys.stdout.write("usage: agent-bus wake-config test NAME\n")
+            return 2
+        fired, status = wake.fire_wake(
+            args.name,
+            from_agent="wake-config-test",
+            to_agent=args.name,
+            body="agent-bus wake test — if you see something happen, the wake command worked.",
+            thread_id="test-thread",
+            message_id="test-message",
+        )
+        sys.stdout.write(f"{args.name}: fired={fired}, status={status}\n")
+        return 0 if fired else 1
+
+    sys.stdout.write(f"unknown wake-config action: {action!r}\n")
+    return 2
+
+
 def cmd_chat(args: argparse.Namespace) -> int:
     from .chat_tui import main as chat_main
 
@@ -355,6 +417,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--json", action="store_true", help="Emit raw JSON rows.")
     s.set_defaults(func=cmd_tail)
+
+    # wake-config
+    s = sub.add_parser(
+        "wake-config",
+        help="View or edit per-agent wake commands fired on new mail.",
+    )
+    s.add_argument(
+        "action",
+        choices=("show", "set", "clear", "test"),
+        help="show: list; set: assign a command; clear: remove; test: fire it now.",
+    )
+    s.add_argument("name", nargs="?", help="Agent name (required for set/clear/test).")
+    s.add_argument("command", nargs="?", help="Shell command (required for set).")
+    s.add_argument("--json", action="store_true", help="Emit JSON (show only).")
+    s.set_defaults(func=cmd_wake_config)
 
     # chat
     s = sub.add_parser("chat", help="Colored chat TUI for a human participant.")

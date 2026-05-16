@@ -147,10 +147,11 @@ session is running.
 ```text
 agent-bus send BODY [--to NAME] [--thread ID] [--name NAME] [--json]
 agent-bus inbox [--name NAME] [--limit N] [--peek] [--json]
-agent-bus tail [-f] [--limit N] [--json]     # follow audit.log live
+agent-bus tail [-f] [--limit N] [--full] [--json]    # follow audit.log live
 agent-bus chat [--name NAME]                 # colored TUI
 agent-bus agents [--json]
 agent-bus forget NAME                        # remove stale agent from roster
+agent-bus wake-config {show,set,clear,test} [NAME] [COMMAND]   # push-style alerts
 agent-bus hook-stop                          # used by Stop hook
 agent-bus hook-user-prompt                   # used by UserPromptSubmit hook
 agent-bus serve                              # same as python -m agent_bus.server
@@ -429,23 +430,93 @@ PRs welcome. The codebase is small and intentionally stays that way.
 
 ## Waking idle agents
 
-Hooks only fire when Claude Code is already taking a turn. A peer
-message landing in the SQLite store does **not** start a new turn on an
-idle session. The practical options:
+Agent CLIs (Claude Code, OpenCode, Gemini CLI) block on stdin when
+idle, so a peer message landing in SQLite does **not** start a new
+turn on its own. There is no MCP transport — stdio, SSE, or
+Streamable HTTP — that fixes this, because the constraint is in the
+client REPL, not the wire protocol.
 
-1. **`/loop` inside each agent session** — Claude Code's built-in loop
-   skill polls on a fixed interval. Inside an agent session, run:
-   `/loop 60s drain the agent-bus inbox and respond to any messages`.
-   Each tick triggers a turn, the UserPromptSubmit hook surfaces any
-   pending peer messages, and the agent replies via `send_message`.
-2. **Manual nudge** — switch to that agent's terminal and hit Enter at
-   the prompt. The next turn fires the hook and pulls the inbox.
-3. **Multiplexer poke** — if your sessions live in tmux/screen, you
-   can shell-script `tmux send-keys -t <pane> "check inbox" Enter`
-   (or `screen -S <name> -X stuff "check inbox\n"`) from anywhere on
-   the machine to wake a specific session. agent-bus does not ship
-   this as a subcommand because the right invocation is
-   multiplexer-specific.
+agent-bus's answer is **wake-on-send**: a per-agent shell command runs
+the instant a message arrives for that agent. The command is whatever
+your environment makes feasible — drive emacs/vterm, drive a tmux
+pane, fire a desktop notification, hit a webhook, ring a bell.
+
+### How it works
+
+1. You drop a `wake.json` next to `bus.db` (default:
+   `~/.claude-agent-bus/wake.json`) mapping `agent_name → shell command`.
+2. On every `send_message` (MCP tool *or* CLI), agent-bus looks up the
+   recipient's entry and fires the command as a detached
+   fire-and-forget subprocess. Broadcast = one fire per recipient.
+3. Every fire writes an `op="wake"` audit row alongside the `send`
+   row, with the launch status (`fired:OK`, `fired:ERR:…`, `disabled`,
+   `no-config`) so the bus log shows what happened.
+4. The command receives routing info on **env vars**:
+   `AGENT_BUS_FROM`, `AGENT_BUS_TO`, `AGENT_BUS_THREAD_ID`,
+   `AGENT_BUS_MESSAGE_ID`, `AGENT_BUS_BODY_PREVIEW` (≤ 200 chars).
+   The full message body is piped to **stdin as JSON**.
+5. **Always quote env-var expansions in your wake command** — bodies
+   are user-controlled. `notify-send "$AGENT_BUS_BODY_PREVIEW"` is
+   safe; `notify-send $AGENT_BUS_BODY_PREVIEW` is shell-injection-prone.
+
+### Managing wake.json
+
+Edit it directly, or use the CLI helpers:
+
+```bash
+agent-bus wake-config show
+agent-bus wake-config set servonaut-cli \
+  'emacsclient -e "(with-current-buffer (get-buffer \"*vterm: servonaut-cli*\") (vterm-send-string \"check inbox\") (vterm-send-return))"'
+agent-bus wake-config test servonaut-cli   # fire a synthetic wake to verify
+agent-bus wake-config clear servonaut-cli
+```
+
+### Example wake commands
+
+**emacs / vterm.** Requires `emacs --daemon` (or `M-x server-start`)
+and a vterm buffer named per agent, e.g. `*vterm: servonaut-cli*`.
+The command types into that buffer and submits, which fires
+UserPromptSubmit in Claude Code (or the equivalent in OpenCode /
+Gemini CLI), which lets the hook drain the inbox.
+
+```bash
+agent-bus wake-config set servonaut-cli \
+  'emacsclient -e "(with-current-buffer (get-buffer \"*vterm: servonaut-cli*\") (vterm-send-string \"check inbox\") (vterm-send-return))"'
+```
+
+**Plain terminals (desktop notification).** When no multiplexer is in
+the picture and you're at the desk, notify yourself and switch tabs:
+
+```bash
+agent-bus wake-config set servonaut-cli \
+  'notify-send -a agent-bus "agent-bus → servonaut-cli" "$AGENT_BUS_FROM: $AGENT_BUS_BODY_PREVIEW"'
+```
+
+**tmux** (only if you do use it):
+
+```bash
+agent-bus wake-config set servonaut-cli \
+  'tmux send-keys -t main:servonaut.0 "check inbox" Enter'
+```
+
+**Disable for a specific agent** (e.g. the human):
+
+```bash
+agent-bus wake-config set zoltan false   # or just omit the entry
+```
+
+### Failure modes
+
+- Wake command crashes / exits nonzero: agent-bus doesn't notice
+  (we don't await the process). The `op="wake"` audit row says
+  `fired:OK` because the launch succeeded. Debug your wake command
+  separately by running it yourself.
+- `wake.json` is missing or malformed: silently no-op for every
+  recipient. `agent-bus wake-config show` reports
+  `(no wake commands configured)`.
+- `emacsclient` can't reach an emacs server: command exits nonzero
+  out-of-band. Run `emacsclient -e '(message "ping")'` once to verify
+  before wiring it.
 
 ## Privacy & security
 
@@ -460,15 +531,25 @@ idle session. The practical options:
 
 ## Out of scope (future work)
 
-- HTTP / SSE transport.
+- **Online / cross-machine mode.** A Streamable HTTP MCP transport
+  (`mcp.run_streamable_http_async()` — the successor to SSE) would
+  let agents on different machines join one bus, expose a web/mobile
+  UI for the human, and accept webhooks from external integrations as
+  first-class senders. Not yet built; the SQLite + stdio design is
+  intentional for now to keep the install lightweight and the trust
+  story simple. `wake.json` is forward-compatible — wake commands
+  fire from wherever `send_message` runs, so an HTTP mode later
+  reuses the same config.
 - Authentication (local-only, single-user assumed).
 - Message expiry / log rotation.
 - Synchronous request/reply within a single tool call (would require
   the peer's session to be actively running).
-- **Idle-session wake-up.** Claude Code can't be externally poked into a
-  new turn while idle — the user must type something, or the session
-  must use `/loop` for hands-free polling. Hooks only fire when Claude
-  is already taking a turn.
+- **Push wake without `wake.json`.** Anthropic ships
+  `notifications/claude/channel` for exactly this, but (a) it's
+  Claude-Code-only and we stay client-neutral (OpenCode and Gemini
+  CLI need to participate too), and (b) the upstream wake path has
+  known open bugs (`#44380` and dozens of duplicates). `wake.json`
+  is the portable answer until the spec + clients converge.
 
 ---
 

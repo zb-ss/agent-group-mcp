@@ -25,3 +25,8 @@ venv/
 *.db-shm
 audit.log
 .claude-agent-bus/
+
+# Claude Code user-local state (settings, scheduled tasks, worktrees)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/worktrees/

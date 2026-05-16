@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from . import audit
+from . import audit, wake
 from .paths import db_path, ensure_parents
 
 BROADCAST = "*"
@@ -317,6 +317,15 @@ class Storage:
 
         audit.append_many(audit_rows)
 
+        self._fire_wakes(
+            recipients=recipients,
+            message_ids=message_ids,
+            from_agent=from_agent,
+            actor_name=actor_name,
+            body=body,
+            thread_id=thread,
+        )
+
         if to == BROADCAST:
             return {
                 "message_ids": message_ids,
@@ -498,6 +507,65 @@ class Storage:
         ]
         msgs.reverse()  # oldest first for display
         return msgs
+
+    def _fire_wakes(
+        self,
+        *,
+        recipients: list[str],
+        message_ids: list[str],
+        from_agent: str,
+        actor_name: str,
+        body: str,
+        thread_id: str,
+    ) -> None:
+        """Run each recipient's configured wake command. Fire-and-forget.
+
+        Wake config is loaded once per send (cheap: file is ~hundreds of
+        bytes typically) so per-call edits to wake.json take effect on
+        the very next message — no daemon restart needed.
+
+        Failures are absorbed: a misconfigured wake must never break a
+        send. The op='wake' audit row captures launch status either way
+        so users can debug from the log.
+        """
+        try:
+            cfg = wake.load_wake_config()
+        except Exception:
+            cfg = {}
+        if not cfg:
+            return
+
+        wake_rows: list[dict] = []
+        for mid, recipient in zip(message_ids, recipients):
+            try:
+                fired, status = wake.fire_wake(
+                    recipient,
+                    from_agent=from_agent,
+                    to_agent=recipient,
+                    body=body,
+                    thread_id=thread_id,
+                    message_id=mid,
+                    config=cfg,
+                )
+            except Exception as e:
+                fired, status = False, f"fired:ERR:{type(e).__name__}"
+            if fired or status.startswith("fired:"):
+                wake_rows.append(
+                    {
+                        "ts": _utc_now_iso(),
+                        "op": "wake",
+                        "actor": actor_name,
+                        "message_id": mid,
+                        "from": from_agent,
+                        "to": recipient,
+                        "thread_id": thread_id,
+                        "body_preview": audit.body_preview(body),
+                        "body_sha256": audit.body_sha256(body),
+                        "wake_status": status,
+                    }
+                )
+        if wake_rows:
+            audit.append_many(wake_rows)
 
     def pending_count(self, *, agent: str) -> int:
         self.init_schema()
