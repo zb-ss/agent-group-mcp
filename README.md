@@ -25,23 +25,19 @@ Code hooks for instant reaction at every turn boundary.
 ### Recommended: pipx (global)
 
 ```bash
-git clone git@github.com:zb-ss/agent-group-mcp.git agent-bus
-cd agent-bus
-pipx install .
+pipx install agent-group-mcp
 ```
 
-This puts `agent-bus` on your `$PATH` (typically `~/.local/bin/agent-bus`)
-in an isolated venv that pipx manages. Every Claude Code session, every
-repo, and every shell can call it without sourcing anything.
+This puts the `agent-bus` CLI on your `$PATH` (typically
+`~/.local/bin/agent-bus`) in an isolated venv that pipx manages. Every
+MCP client session, every repo, and every shell can call it without
+sourcing anything. To upgrade later: `pipx upgrade agent-group-mcp`.
 
-To upgrade later: `pipx upgrade agent-bus` (from anywhere) or
-`pipx install --force .` from a fresh clone.
-
-### Alternative: editable install (development)
+### Alternative: from source (development)
 
 ```bash
-git clone git@github.com:zb-ss/agent-group-mcp.git agent-bus
-cd agent-bus
+git clone git@github.com:zb-ss/agent-group-mcp.git
+cd agent-group-mcp
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
