@@ -163,7 +163,7 @@ identity is auto-registered in the `agents` table the first time it
 sends, so peers can address you directly.
 
 If you end up with stale identities on the roster (e.g. you sent once
-as the default `human`, then started using `--name zoltan` and now both
+as the default `human`, then started using `--name alex` and now both
 show up in `/agents`), run `agent-bus forget human` to drop the stale
 row. Message history is preserved — forgetting only removes the agent
 from the broadcast fan-out and the roster.
@@ -179,18 +179,18 @@ display (full UUIDs still live in the DB and in `--json` output).
 On connect you get:
 
 ```
-agent-bus chat — connected as 'zoltan' (default → *). /help for commands.
+agent-bus chat — connected as 'alex' (default → *). /help for commands.
 agents on the bus (3):
-  servonaut-cli         last seen 1m ago     pending=0
-  servonaut-web-backend last seen 4s ago     pending=2
-  zoltan                last seen just now (you)  pending=0
+  api-service  last seen 1m ago     pending=0
+  web-app      last seen 4s ago     pending=2
+  alex         last seen just now (you)  pending=0
 recent activity (last 10 sends):
-  14:30:51  servonaut-web-backend → servonaut-cli    can you check the dashboard?
-  14:31:02  servonaut-cli         → servonaut-web    on it [c7a3b2f0]
+  14:30:51  web-app     → api-service  can you check the dashboard?
+  14:31:02  api-service → web-app      on it [c7a3b2f0]
   ...
 
-[zoltan → *] ▌
-                                                 zoltan → *   /help · /quit
+[alex → *] ▌
+                                                 alex → *   /help · /quit
 ```
 
 Commands inside the TUI:
@@ -254,7 +254,7 @@ Each managed repo gets:
    `permissions.allow` (deduped if already present).
 
 **Name derivation.** Default = slug of the repo's basename:
-`~/websites/servonaut.dev` → `servonaut-dev`, `~/projects/my_thing` →
+`~/websites/acme.dev` → `acme-dev`, `~/projects/my_thing` →
 `my-thing`. Collisions across directories are resolved by prefixing the
 parent dir (`projects-foo` vs `websites-foo`).
 
@@ -525,44 +525,44 @@ Edit it directly, or use the CLI helpers:
 
 ```bash
 agent-bus wake-config show
-agent-bus wake-config set servonaut-cli \
-  'emacsclient -e "(with-current-buffer (get-buffer \"*vterm: servonaut-cli*\") (vterm-send-string \"check inbox\") (vterm-send-return))"'
-agent-bus wake-config test servonaut-cli   # fire a synthetic wake to verify
-agent-bus wake-config clear servonaut-cli
+agent-bus wake-config set web-app \
+  'emacsclient -e "(with-current-buffer (get-buffer \"*vterm: web-app*\") (vterm-send-string \"check inbox\") (vterm-send-return))"'
+agent-bus wake-config test web-app   # fire a synthetic wake to verify
+agent-bus wake-config clear web-app
 ```
 
 ### Example wake commands
 
 **emacs / vterm.** Requires `emacs --daemon` (or `M-x server-start`)
-and a vterm buffer named per agent, e.g. `*vterm: servonaut-cli*`.
+and a vterm buffer named per agent, e.g. `*vterm: web-app*`.
 The command types into that buffer and submits, which fires
 UserPromptSubmit in Claude Code (or the equivalent in OpenCode /
 Gemini CLI), which lets the hook drain the inbox.
 
 ```bash
-agent-bus wake-config set servonaut-cli \
-  'emacsclient -e "(with-current-buffer (get-buffer \"*vterm: servonaut-cli*\") (vterm-send-string \"check inbox\") (vterm-send-return))"'
+agent-bus wake-config set web-app \
+  'emacsclient -e "(with-current-buffer (get-buffer \"*vterm: web-app*\") (vterm-send-string \"check inbox\") (vterm-send-return))"'
 ```
 
 **Plain terminals (desktop notification).** When no multiplexer is in
 the picture and you're at the desk, notify yourself and switch tabs:
 
 ```bash
-agent-bus wake-config set servonaut-cli \
-  'notify-send -a agent-bus "agent-bus → servonaut-cli" "$AGENT_BUS_FROM: $AGENT_BUS_BODY_PREVIEW"'
+agent-bus wake-config set web-app \
+  'notify-send -a agent-bus "agent-bus → web-app" "$AGENT_BUS_FROM: $AGENT_BUS_BODY_PREVIEW"'
 ```
 
 **tmux** (only if you do use it):
 
 ```bash
-agent-bus wake-config set servonaut-cli \
-  'tmux send-keys -t main:servonaut.0 "check inbox" Enter'
+agent-bus wake-config set web-app \
+  'tmux send-keys -t main:agents.0 "check inbox" Enter'
 ```
 
 **Disable for a specific agent** (e.g. the human):
 
 ```bash
-agent-bus wake-config set zoltan false   # or just omit the entry
+agent-bus wake-config set alex false   # or just omit the entry
 ```
 
 ### Failure modes

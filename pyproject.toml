@@ -9,7 +9,7 @@ description = "Local MCP server + CLI letting multiple Claude Code instances exc
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "agent-bus" }]
+authors = [{ name = "Zoltan Nagy" }]
 keywords = ["mcp", "claude-code", "claude", "agents", "messaging", "sqlite"]
 classifiers = [
     "Development Status :: 4 - Beta",

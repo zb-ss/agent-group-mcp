@@ -16,8 +16,8 @@ from agent_bus import init_cmd
 @pytest.mark.parametrize(
     "raw,expected",
     [
-        ("servonaut.dev", "servonaut-dev"),
-        ("servonaut", "servonaut"),
+        ("acme.dev", "acme-dev"),
+        ("acme", "acme"),
         ("My Cool Thing", "my-cool-thing"),
         ("a_b_c", "a-b-c"),
         ("UPPER", "upper"),
@@ -40,9 +40,9 @@ def test_slugify_truncates_long_names():
 
 
 def test_resolve_name_uses_basename(tmp_path):
-    repo = tmp_path / "servonaut.dev"
+    repo = tmp_path / "acme.dev"
     repo.mkdir()
-    assert init_cmd.resolve_name(repo) == "servonaut-dev"
+    assert init_cmd.resolve_name(repo) == "acme-dev"
 
 
 def test_resolve_name_prefix(tmp_path):
@@ -52,10 +52,10 @@ def test_resolve_name_prefix(tmp_path):
 
 
 def test_resolve_name_respects_per_repo_file(tmp_path):
-    repo = tmp_path / "servonaut.dev"
+    repo = tmp_path / "acme.dev"
     repo.mkdir()
-    (repo / init_cmd.NAME_FILE).write_text("servonaut-web-backend\n")
-    assert init_cmd.resolve_name(repo) == "servonaut-web-backend"
+    (repo / init_cmd.NAME_FILE).write_text("legacy-agent-name\n")
+    assert init_cmd.resolve_name(repo) == "legacy-agent-name"
 
 
 def test_resolve_name_explicit_override_wins(tmp_path):
@@ -120,10 +120,10 @@ def _make_repo(tmp_path: Path, name: str, *, name_file: str | None = None,
 
 
 def test_plan_write_for_fresh_repo(tmp_path):
-    repo = _make_repo(tmp_path, "servonaut.dev")
+    repo = _make_repo(tmp_path, "acme.dev")
     plan = init_cmd.plan_for_repo(repo)
     assert plan.action == init_cmd.Action.WRITE
-    assert plan.name == "servonaut-dev"
+    assert plan.name == "acme-dev"
 
 
 def test_plan_skips_ignored(tmp_path):
@@ -140,12 +140,12 @@ def test_plan_skips_non_repo(tmp_path):
 
 
 def test_apply_writes_mcp_and_settings(tmp_path):
-    repo = _make_repo(tmp_path, "servonaut.dev")
+    repo = _make_repo(tmp_path, "acme.dev")
     plan = init_cmd.plan_for_repo(repo)
     init_cmd.apply_plan(plan, bin_path="/usr/local/bin/agent-bus")
 
     mcp = json.loads((repo / ".mcp.json").read_text())
-    assert mcp["mcpServers"]["agent-bus"]["env"]["AGENT_BUS_NAME"] == "servonaut-dev"
+    assert mcp["mcpServers"]["agent-bus"]["env"]["AGENT_BUS_NAME"] == "acme-dev"
     assert mcp["mcpServers"]["agent-bus"]["env"]["AGENT_BUS_REPO"] == str(repo)
     assert mcp["mcpServers"]["agent-bus"]["args"] == ["serve"]
 
@@ -161,13 +161,13 @@ def test_apply_writes_mcp_and_settings(tmp_path):
     )
     assert "hook-user-prompt" in hook_cmds
     assert "hook-stop" in hook_cmds
-    assert "AGENT_BUS_NAME=servonaut-dev" in hook_cmds
+    assert "AGENT_BUS_NAME=acme-dev" in hook_cmds
 
 
 def test_apply_is_idempotent(tmp_path):
     """Running init twice should produce identical files (no duplicate
     hooks, no duplicate allow-list entries)."""
-    repo = _make_repo(tmp_path, "servonaut.dev")
+    repo = _make_repo(tmp_path, "acme.dev")
     for _ in range(2):
         plan = init_cmd.plan_for_repo(repo)
         init_cmd.apply_plan(plan, bin_path="/usr/local/bin/agent-bus")
@@ -223,13 +223,13 @@ def test_apply_preserves_unrelated_hooks_and_perms(tmp_path):
 
 
 def test_refresh_renames_existing_managed_entry(tmp_path):
-    """The user's `servonaut-web-backend` migration case: a managed
-    entry with a custom name should refresh to the slug-derived name."""
-    repo = _make_repo(tmp_path, "servonaut.dev")
+    """Migration case: a managed entry whose custom name no longer
+    matches the slug should refresh to the slug-derived name."""
+    repo = _make_repo(tmp_path, "acme.dev")
     (repo / ".mcp.json").write_text(json.dumps({
         "mcpServers": {
             "agent-bus": init_cmd.build_mcp_entry(
-                name="servonaut-web-backend",
+                name="legacy-agent-name",
                 repo=repo,
                 bin_path="/old/path/agent-bus",
             ),
@@ -237,13 +237,13 @@ def test_refresh_renames_existing_managed_entry(tmp_path):
     }))
     plan = init_cmd.plan_for_repo(repo)
     assert plan.action == init_cmd.Action.REFRESH
-    assert plan.previous_name == "servonaut-web-backend"
-    assert plan.name == "servonaut-dev"
+    assert plan.previous_name == "legacy-agent-name"
+    assert plan.name == "acme-dev"
 
     init_cmd.apply_plan(plan, bin_path="/new/path/agent-bus")
     mcp = json.loads((repo / ".mcp.json").read_text())
     entry = mcp["mcpServers"]["agent-bus"]
-    assert entry["env"]["AGENT_BUS_NAME"] == "servonaut-dev"
+    assert entry["env"]["AGENT_BUS_NAME"] == "acme-dev"
     assert entry["command"] == "/new/path/agent-bus"
 
 
@@ -281,6 +281,6 @@ def test_deconflict_handles_collisions(tmp_path):
 
 
 def test_per_repo_name_file_respected(tmp_path):
-    repo = _make_repo(tmp_path, "servonaut.dev", name_file="servonaut-web-backend")
+    repo = _make_repo(tmp_path, "acme.dev", name_file="legacy-agent-name")
     plan = init_cmd.plan_for_repo(repo)
-    assert plan.name == "servonaut-web-backend"
+    assert plan.name == "legacy-agent-name"

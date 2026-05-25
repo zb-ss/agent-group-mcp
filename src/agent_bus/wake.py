@@ -6,7 +6,7 @@ The wake command is whatever the user's setup makes feasible:
 
   - emacs/vterm:    emacsclient -e "(with-current-buffer ...)"
   - desktop:        notify-send agent-bus "$AGENT_BUS_BODY_PREVIEW"
-  - tmux:           tmux send-keys -t main:servonaut.0 "check inbox" Enter
+  - tmux:           tmux send-keys -t main:agents.0 "check inbox" Enter
   - screen:         screen -S agent -X stuff "check inbox\\n"
   - anything else:  webhook curl, custom script, ntfy push…
 

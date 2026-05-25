@@ -10,7 +10,7 @@ Each repo gets:
      preserved.
 
 The agent name is derived from the repo's basename by default (e.g.
-``~/websites/servonaut.dev`` → ``servonaut-dev``). Two overrides:
+``~/websites/acme.dev`` → ``acme-dev``). Two overrides:
 
   * A per-repo ``.agent-bus-name`` file (one line, the desired name).
   * The ``--name`` CLI flag (single-repo init only).

@@ -17,7 +17,7 @@ def test_color_for_is_stable():
 
 
 def test_color_for_varies_between_names():
-    seen = {fmt.color_for(name) for name in ("alpha", "beta", "gamma", "human", "zoltan")}
+    seen = {fmt.color_for(name) for name in ("alpha", "beta", "gamma", "human", "alex")}
     # not strictly guaranteed, but the palette has 8 colors and we picked 5 distinct names
     assert len(seen) >= 2
 
@@ -130,7 +130,7 @@ def test_style_map_keys_are_prompt_toolkit_safe():
     """prompt_toolkit's Style.from_dict requires `[A-Za-z0-9_-]+` keys."""
     import re
 
-    style = fmt.style_map(["alpha", "beta", "servonaut-web-backend", "weird.name", "*"])
+    style = fmt.style_map(["alpha", "beta", "legacy-agent-name", "weird.name", "*"])
     pattern = re.compile(r"^[A-Za-z0-9_-]+$")
     for key in style:
         assert pattern.match(key), f"unsafe class name: {key!r}"
@@ -139,7 +139,7 @@ def test_style_map_keys_are_prompt_toolkit_safe():
 def test_safe_class_normalises_special_chars():
     assert fmt.safe_class("*") == "broadcast"
     assert fmt.safe_class("alpha") == "alpha"
-    assert fmt.safe_class("servonaut-web-backend") == "servonaut-web-backend"
+    assert fmt.safe_class("legacy-agent-name") == "legacy-agent-name"
     assert fmt.safe_class("weird.name") == "weird_name"
     assert fmt.safe_class("a/b c") == "a_b_c"
     assert fmt.safe_class("") == "anon"
@@ -149,7 +149,7 @@ def test_style_loads_into_prompt_toolkit():
     """Regression: prompt_toolkit.Style.from_dict() must accept the result."""
     from prompt_toolkit.styles import Style
 
-    style_dict = fmt.style_map(["alpha", "beta", "servonaut-web-backend", "*"])
+    style_dict = fmt.style_map(["alpha", "beta", "legacy-agent-name", "*"])
     Style.from_dict(style_dict)  # would AssertionError on a bad key
 
 
