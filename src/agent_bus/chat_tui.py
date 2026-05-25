@@ -34,6 +34,7 @@ from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.shortcuts import clear as pt_clear
 from prompt_toolkit.styles import Style
 
 from . import audit
@@ -243,8 +244,7 @@ class ChatTUI:
                 self._system(line)
             return True
         if cmd == "/clear":
-            sys.stdout.write("\033[2J\033[H")
-            sys.stdout.flush()
+            pt_clear()
             self._print_connect_banner()
             return True
         if cmd == "/agents":
