@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-group-mcp"
-version = "0.4.2"
+version = "0.4.3"
 description = "Local MCP server + CLI letting multiple MCP clients (Claude Code, OpenCode, Gemini CLI, …) exchange messages over a shared SQLite bus with audit logging."
 readme = "README.md"
 requires-python = ">=3.11"

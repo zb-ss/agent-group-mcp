@@ -65,6 +65,43 @@ def test_resolve_name_explicit_override_wins(tmp_path):
     assert init_cmd.resolve_name(repo, override="custom") == "custom"
 
 
+# --------------------------- bin detection ---------------------------
+
+
+def test_detect_agent_bus_bin_explicit():
+    assert init_cmd.detect_agent_bus_bin(explicit="/some/path") == "/some/path"
+
+
+def test_detect_agent_bus_bin_env_var(monkeypatch):
+    monkeypatch.setenv("AGENT_BUS_BIN", "/from/env/agent-bus")
+    assert init_cmd.detect_agent_bus_bin() == "/from/env/agent-bus"
+
+
+def test_detect_agent_bus_bin_returns_unresolved_shim(tmp_path, monkeypatch):
+    """Regression: the pipx shim is a symlink into a venv; the venv path
+    changes on `pipx reinstall` or package rename, while the shim is stable.
+    We must NOT resolve the symlink — wirings would break on every reinstall.
+    """
+    venv_bin = tmp_path / "venvs" / "agent-bus" / "bin" / "agent-bus"
+    venv_bin.parent.mkdir(parents=True)
+    venv_bin.write_text("#!/bin/sh\nexec true\n")
+    venv_bin.chmod(0o755)
+
+    shim_dir = tmp_path / ".local" / "bin"
+    shim_dir.mkdir(parents=True)
+    shim = shim_dir / "agent-bus"
+    shim.symlink_to(venv_bin)
+
+    monkeypatch.delenv("AGENT_BUS_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(shim_dir))
+
+    result = init_cmd.detect_agent_bus_bin()
+    assert result == str(shim), (
+        f"detect should return the stable shim path, not the resolved venv "
+        f"target (got {result!r}, expected {str(shim)!r})"
+    )
+
+
 # --------------------------- repo detection --------------------------
 
 

@@ -181,7 +181,14 @@ def find_git_repos(
 
 
 def detect_agent_bus_bin(explicit: str | None = None) -> str:
-    """Best-effort: explicit > $AGENT_BUS_BIN env > shutil.which > bare command."""
+    """Best-effort: explicit > $AGENT_BUS_BIN env > shutil.which > bare command.
+
+    Returns the path as PATH gives it to us (typically the pipx shim at
+    ``~/.local/bin/agent-bus``). We deliberately do **not** resolve symlinks:
+    pipx shims survive `pipx upgrade` / `pipx reinstall` and even package
+    renames, while the underlying venv path moves and breaks every wiring
+    that baked in the resolved target.
+    """
     if explicit:
         return explicit
     import os
@@ -191,7 +198,7 @@ def detect_agent_bus_bin(explicit: str | None = None) -> str:
         return env_path
     found = shutil.which("agent-bus")
     if found:
-        return str(Path(found).resolve())
+        return found
     return "agent-bus"
 
 
