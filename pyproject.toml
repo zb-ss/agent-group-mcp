@@ -23,7 +23,7 @@ classifiers = [
     "Topic :: Software Development",
 ]
 dependencies = [
-    "mcp>=1.0",
+    "mcp>=1.0,<2",
     "prompt_toolkit>=3.0",
 ]
 
