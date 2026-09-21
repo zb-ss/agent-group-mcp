@@ -27,11 +27,13 @@ from . import audit
 from . import formatting as fmt
 from . import init_cmd
 from . import wake
+from .migrations import SchemaTooNewError
 from .paths import audit_path
 from .storage import BROADCAST, Storage
 
 NAME_COL = 18
 TARGET_COL = 18
+EXIT_SCHEMA_TOO_NEW = 3
 
 
 def _human_identity(explicit: str | None) -> str:
@@ -605,7 +607,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except SchemaTooNewError as e:
+        sys.stderr.write(f"agent-bus: {e}\n")
+        return EXIT_SCHEMA_TOO_NEW
 
 
 if __name__ == "__main__":  # pragma: no cover

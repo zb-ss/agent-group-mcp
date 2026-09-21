@@ -4,7 +4,7 @@ WAL mode lets multiple processes write concurrently. Each call opens a
 short-lived connection so the module is safe from any thread, and so the
 OS reclaims file descriptors promptly when callers go away.
 
-Schema (declared in SCHEMA_SQL below):
+Schema (created and versioned by `migrations.py`):
   agents(name PK, repo_path, registered_at, last_seen)
   messages(message_id PK, from_agent, to_agent, body, thread_id,
            sent_at, read_at, delivered_at)
@@ -25,36 +25,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from . import audit, wake
+from . import audit, migrations, wake
 from .paths import db_path, ensure_parents
 
 BROADCAST = "*"
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS agents (
-    name           TEXT PRIMARY KEY,
-    repo_path      TEXT NOT NULL,
-    registered_at  TEXT NOT NULL,
-    last_seen      TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    message_id     TEXT PRIMARY KEY,
-    from_agent     TEXT NOT NULL,
-    to_agent       TEXT NOT NULL,
-    body           TEXT NOT NULL,
-    thread_id      TEXT NOT NULL,
-    sent_at        TEXT NOT NULL,
-    read_at        TEXT,
-    delivered_at   TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_inbox
-    ON messages (to_agent, read_at);
-
-CREATE INDEX IF NOT EXISTS idx_messages_thread
-    ON messages (thread_id, sent_at);
-"""
 
 
 def _utc_now_iso() -> str:
@@ -135,7 +109,7 @@ class Storage:
         if self._initialised:
             return
         with self.connect() as conn:
-            conn.executescript(SCHEMA_SQL)
+            migrations.migrate(conn, self.path)
         self._initialised = True
 
     # ----------------------------- agents -----------------------------------
