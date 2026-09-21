@@ -5,9 +5,12 @@ short-lived connection so the module is safe from any thread, and so the
 OS reclaims file descriptors promptly when callers go away.
 
 Schema (created and versioned by `migrations.py`):
-  agents(name PK, repo_path, registered_at, last_seen)
+  agents(name PK, repo_path, registered_at, last_seen, group_name, client)
   messages(message_id PK, from_agent, to_agent, body, thread_id,
            sent_at, read_at, delivered_at)
+
+An agent named `<group>/<client>` belongs to `<group>`; any other name is
+a group of one (see `identity.py`).
 
 A "broadcast" send (to="*") fans out into N message rows, one per
 non-sender peer, each with its own unique message_id. We never expand
@@ -25,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from . import audit, migrations, wake
+from . import audit, identity, migrations, wake
 from .paths import db_path, ensure_parents
 
 BROADCAST = "*"
@@ -59,16 +62,31 @@ class Message:
         }
 
 
+AGENT_COLUMNS = "name, repo_path, registered_at, last_seen, group_name, client"
+
+
 @dataclass
 class AgentRow:
     name: str
     repo_path: str
     registered_at: str
     last_seen: str
+    # NULL for a name with no client part, and for any row written by an
+    # agent-bus that predates these columns.
+    group_name: str | None = None
+    client: str | None = None
+
+    @property
+    def group(self) -> str:
+        """The group this agent answers to. An agent without a client
+        part is a group of one, named after itself."""
+        return self.group_name or self.name
 
     def to_dict(self, *, pending_count: int | None = None) -> dict:
         out = {
             "name": self.name,
+            "group": self.group,
+            "client": self.client,
             "repo_path": self.repo_path,
             "registered_at": self.registered_at,
             "last_seen": self.last_seen,
@@ -115,21 +133,40 @@ class Storage:
     # ----------------------------- agents -----------------------------------
 
     def upsert_agent(self, name: str, repo_path: str) -> AgentRow:
+        """Register `name` as living in `repo_path`. Authoritative: call it
+        only from the process that owns the identity (its MCP server).
+        Anything merely speaking as a name uses `ensure_agent`."""
+        return self._register(name, repo_path, overwrite_repo=True)
+
+    def ensure_agent(self, name: str, repo_path: str) -> AgentRow:
+        """Put `name` on the roster if it is missing; otherwise only bump
+        `last_seen`. Never rewrites where an existing agent lives."""
+        return self._register(name, repo_path, overwrite_repo=False)
+
+    def _register(self, name: str, repo_path: str, *, overwrite_repo: bool) -> AgentRow:
         self.init_schema()
         now = _utc_now_iso()
+        parsed = identity.parse_or_none(name)
+        has_client = parsed is not None and parsed.client is not None
+        group_name = parsed.group if has_client else None
+        client = parsed.client if has_client else None
+        repo_update = "repo_path = excluded.repo_path," if overwrite_repo else ""
         with self.connect() as conn:
             conn.execute(
-                """
-                INSERT INTO agents (name, repo_path, registered_at, last_seen)
-                VALUES (?, ?, ?, ?)
+                f"""
+                INSERT INTO agents
+                    (name, repo_path, registered_at, last_seen, group_name, client)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
-                    repo_path = excluded.repo_path,
+                    {repo_update}
+                    group_name = excluded.group_name,
+                    client = excluded.client,
                     last_seen = excluded.last_seen
                 """,
-                (name, repo_path, now, now),
+                (name, repo_path, now, now, group_name, client),
             )
             row = conn.execute(
-                "SELECT name, repo_path, registered_at, last_seen FROM agents WHERE name = ?",
+                f"SELECT {AGENT_COLUMNS} FROM agents WHERE name = ?",
                 (name,),
             ).fetchone()
         return AgentRow(**dict(row))
@@ -138,7 +175,7 @@ class Storage:
         self.init_schema()
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT name, repo_path, registered_at, last_seen FROM agents WHERE name = ?",
+                f"SELECT {AGENT_COLUMNS} FROM agents WHERE name = ?",
                 (name,),
             ).fetchone()
         return AgentRow(**dict(row)) if row else None
@@ -147,10 +184,7 @@ class Storage:
         self.init_schema()
         with self.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT name, repo_path, registered_at, last_seen
-                FROM agents ORDER BY name
-                """
+                f"SELECT {AGENT_COLUMNS} FROM agents ORDER BY name"
             ).fetchall()
         return [AgentRow(**dict(r)) for r in rows]
 
@@ -158,27 +192,21 @@ class Storage:
         self.init_schema()
         with self.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT a.name, a.repo_path, a.registered_at, a.last_seen,
+                f"""
+                SELECT {AGENT_COLUMNS},
                        COALESCE((
                          SELECT COUNT(*) FROM messages m
-                         WHERE m.to_agent = a.name AND m.read_at IS NULL
+                         WHERE m.to_agent = agents.name AND m.read_at IS NULL
                        ), 0) AS pending_count
-                FROM agents a ORDER BY a.name
+                FROM agents ORDER BY name
                 """
             ).fetchall()
-        return [
-            (
-                AgentRow(
-                    name=r["name"],
-                    repo_path=r["repo_path"],
-                    registered_at=r["registered_at"],
-                    last_seen=r["last_seen"],
-                ),
-                int(r["pending_count"]),
-            )
-            for r in rows
-        ]
+        agents: list[tuple[AgentRow, int]] = []
+        for r in rows:
+            fields = dict(r)
+            pending = int(fields.pop("pending_count"))
+            agents.append((AgentRow(**fields), pending))
+        return agents
 
     def touch_agent(self, name: str) -> None:
         self.init_schema()

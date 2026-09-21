@@ -156,7 +156,7 @@ def cmd_agents(args: argparse.Namespace) -> int:
         last_seen = fmt.humanize_relative(agent.last_seen)
         pending_text = f"pending={count}" if count else "pending=0"
         _emit([
-            (f"class:agent-{agent.name}", agent.name.ljust(name_col)),
+            (f"class:agent-{fmt.safe_class(agent.name)}", agent.name.ljust(name_col)),
             ("", "  "),
             ("class:system", f"repo={agent.repo_path}"),
             ("", "  "),

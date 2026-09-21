@@ -307,8 +307,10 @@ def style_map(names: Iterable[str]) -> dict[str, str]:
         if n in seen or not n:
             continue
         seen.add(n)
-        color = color_for(n)
         cls = safe_class(n)
+        # keyed on the class, not the name: render_plain() only ever sees
+        # the class, and both renderers must agree on a color
+        color = color_for(cls)
         style[f"agent-{cls}"] = f"{color} bold"
         style[f"target-{cls}"] = color
     # broadcast target gets a neutral hue

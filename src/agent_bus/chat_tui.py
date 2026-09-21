@@ -122,7 +122,7 @@ class ChatTUI:
             seen = fmt.humanize_relative(agent.last_seen)
             self._emit([
                 ("", "  "),
-                (f"class:agent-{agent.name}", agent.name.ljust(NAME_COL)),
+                (f"class:agent-{fmt.safe_class(agent.name)}", agent.name.ljust(NAME_COL)),
                 ("class:system", f"  last seen {seen}{tag}"),
                 ("class:thread", f"  pending={count}"),
             ])

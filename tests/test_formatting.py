@@ -136,6 +136,15 @@ def test_style_map_keys_are_prompt_toolkit_safe():
         assert pattern.match(key), f"unsafe class name: {key!r}"
 
 
+def test_cli_and_tui_pick_the_same_color_for_a_client_name():
+    """The plain renderer only sees the sanitised class, so the TUI style
+    must be derived from it too or `repo-a/claude` gets two colors."""
+    name = "repo-a/claude"
+    cls = fmt.safe_class(name)
+    tui_color = fmt.style_map([name])[f"target-{cls}"]
+    assert tui_color == fmt.color_for(cls)
+
+
 def test_safe_class_normalises_special_chars():
     assert fmt.safe_class("*") == "broadcast"
     assert fmt.safe_class("alpha") == "alpha"

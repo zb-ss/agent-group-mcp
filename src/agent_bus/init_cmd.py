@@ -28,16 +28,17 @@ the user passes ``--force``.
 from __future__ import annotations
 
 import json
-import re
 import shutil
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
+from .identity import MAX_GROUP_LEN, slugify
+
 NAME_FILE = ".agent-bus-name"
 IGNORE_FILE = ".agent-bus-ignore"
-MAX_NAME_LEN = 40
+MAX_NAME_LEN = MAX_GROUP_LEN  # kept for callers that imported it from here
 DEFAULT_SCAN_DEPTH = 6
 
 ALLOW_TOOLS = (
@@ -55,22 +56,7 @@ MANAGED_DESCRIPTION = (
 )
 
 
-# --------------------------- slugify -----------------------------------
-
-
-_NON_SLUG = re.compile(r"[^a-z0-9-]+")
-_DASHES = re.compile(r"-+")
-
-
-def slugify(name: str) -> str:
-    s = name.lower()
-    s = s.replace("_", "-").replace(".", "-")
-    s = re.sub(r"\s+", "-", s)
-    s = _NON_SLUG.sub("-", s)
-    s = _DASHES.sub("-", s).strip("-")
-    if not s:
-        s = "repo"
-    return s[:MAX_NAME_LEN]
+# --------------------------- naming ------------------------------------
 
 
 def resolve_name(

@@ -27,6 +27,46 @@ def test_upsert_is_idempotent_and_updates_repo(storage):
     assert len(storage.list_agents()) == 1
 
 
+def test_upsert_records_group_and_client_from_the_name(storage):
+    row = storage.upsert_agent("repo-a/claude", "/code/repo-a")
+    assert (row.group_name, row.client, row.group) == ("repo-a", "claude", "repo-a")
+
+    second = storage.upsert_agent("repo-a/claude-2", "/code/repo-a")
+    assert (second.group, second.client) == ("repo-a", "claude")
+
+
+def test_bare_name_is_its_own_group(storage):
+    row = storage.upsert_agent("repo-a", "/code/repo-a")
+    assert (row.group_name, row.client) == (None, None)
+    assert row.group == "repo-a"
+
+
+def test_foreign_name_with_a_separator_is_kept_as_is(storage):
+    """A name that predates the grammar must not be rejected or split."""
+    row = storage.upsert_agent("Team/Alpha/1", "/code/x")
+    assert row.name == "Team/Alpha/1"
+    assert (row.group_name, row.client, row.group) == (None, None, "Team/Alpha/1")
+
+
+def test_agent_dict_exposes_group_and_client(storage):
+    storage.upsert_agent("repo-a/codex", "/code/repo-a")
+    (row,) = storage.list_agents()
+    assert row.to_dict()["group"] == "repo-a"
+    assert row.to_dict()["client"] == "codex"
+
+
+def test_ensure_agent_registers_a_missing_name(storage):
+    row = storage.ensure_agent("human", "/somewhere")
+    assert (row.name, row.repo_path) == ("human", "/somewhere")
+
+
+def test_ensure_agent_never_rewrites_an_existing_repo_path(storage):
+    storage.upsert_agent("repo-a/claude", "/code/repo-a")
+    row = storage.ensure_agent("repo-a/claude", "/some/other/cwd")
+    assert row.repo_path == "/code/repo-a"
+    assert row.last_seen >= row.registered_at
+
+
 def test_send_read_round_trip(two_agents, bus_paths):
     result = two_agents.send_message(
         from_agent="alpha", to="beta", body="hello beta"
