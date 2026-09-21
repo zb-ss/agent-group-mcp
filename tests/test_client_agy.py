@@ -53,9 +53,10 @@ def test_fresh_repo_gets_a_server_and_a_named_hook(tmp_path, agy):
     (stop,) = hook["Stop"]
     assert pre == {
         "type": "command",
-        "command": f"AGENT_BUS_NAME=repo-a/agy {BIN} hook-user-prompt --client agy",
+        "command": f"AGENT_BUS_NAME=repo-a/agy {BIN} hook-user-prompt --client agy || true",
     }
-    assert stop["command"] == f"AGENT_BUS_NAME=repo-a/agy {BIN} hook-stop --client agy"
+    assert stop["command"] == (
+        f"AGENT_BUS_NAME=repo-a/agy {BIN} hook-stop --client agy || true")
     assert agy.inspect(repo) == WiringState(WiringStatus.MANAGED, "repo-a/agy")
 
 
@@ -121,7 +122,7 @@ def test_the_wired_hooks_answer_agy_in_its_own_json(
     monkeypatch.chdir(repo / PLUGIN)
 
     def run(command: str) -> dict:
-        assignment, _binary, *argv = command.split()
+        assignment, _binary, *argv = command.removesuffix(" || true").split()
         key, _, value = assignment.partition("=")
         monkeypatch.setenv(key, value)
         monkeypatch.setattr("sys.stdin", io.StringIO(payload))

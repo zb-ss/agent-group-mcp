@@ -48,9 +48,9 @@ def test_fresh_repo_gets_a_server_entry_and_both_hooks(tmp_path, codex):
     assert "AGENT_BUS_INSTANCE" in server["env_vars"]
 
     assert _hook_commands(repo, "UserPromptSubmit") == [
-        f"{BIN} hook-user-prompt --client codex"
+        f"{BIN} hook-user-prompt --client codex || true"
     ]
-    assert _hook_commands(repo, "Stop") == [f"{BIN} hook-stop --client codex"]
+    assert _hook_commands(repo, "Stop") == [f"{BIN} hook-stop --client codex || true"]
     assert codex.inspect(repo) == clients.base.WiringState(
         WiringStatus.MANAGED, "repo-a/codex"
     )
@@ -86,7 +86,7 @@ def test_apply_keeps_the_rest_of_the_config(tmp_path, codex):
     assert config["model"] == "some-model"
     assert sorted(config["mcp_servers"]) == ["agent-bus", "other"]
     assert _hook_commands(repo, "Stop") == [
-        "echo unrelated", f"{BIN} hook-stop --client codex",
+        "echo unrelated", f"{BIN} hook-stop --client codex || true",
     ]
 
 
@@ -156,7 +156,7 @@ def test_paths_with_awkward_characters_survive_the_toml_round_trip(tmp_path, cod
     assert server["command"] == "/opt/my tools/agent-bus"
     assert server["env"]["AGENT_BUS_REPO"] == str(repo)
     assert _hook_commands(repo, "Stop") == [
-        "'/opt/my tools/agent-bus' hook-stop --client codex"
+        "'/opt/my tools/agent-bus' hook-stop --client codex || true"
     ]
 
 

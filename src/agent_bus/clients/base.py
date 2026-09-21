@@ -120,9 +120,19 @@ def hook_command(
 
     `--client` doubles as the owner tag: a config file shared by several
     clients can hold one managed hook per client without them clobbering
-    each other."""
+    each other.
+
+    The trailing `|| true` is what makes an uninstalled, half-upgraded or
+    otherwise unusable `agent-bus` harmless. Several clients read a non-zero
+    exit from an end-of-turn hook as "keep going, here is why" and show the
+    hook's stderr as the reason, so without it a broken binary would hold
+    every turn open quoting an error. Delivering mail is best-effort;
+    blocking is deliberate and travels on stdout, which this does not
+    touch."""
     prefix = f"AGENT_BUS_NAME={shlex.quote(name)} " if name else ""
-    return f"{prefix}{shlex.quote(bin_path)} {subcommand} --client {client}"
+    return (
+        f"{prefix}{shlex.quote(bin_path)} {subcommand} --client {client} || true"
+    )
 
 
 def hook_owner(command: str) -> str | None:

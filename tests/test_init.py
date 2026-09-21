@@ -378,6 +378,7 @@ def test_old_wiring_is_upgraded_in_place(tmp_path):
     for event in ("UserPromptSubmit", "Stop"):
         (command,) = _hook_commands(repo, event)  # replaced, not appended to
         assert command.startswith("AGENT_BUS_NAME=acme-dev/claude /new/agent-bus")
+        assert command.endswith("|| true")
 
     again = init_cmd.plan_for_paths([repo], scan=False)[0]
     assert again.renames() == []
@@ -491,3 +492,37 @@ def test_planning_without_a_storage_never_opens_the_database(tmp_path, monkeypat
     plan = init_cmd.plan_for_paths([repo], scan=False)[0]
     init_cmd.apply_plan(plan, bin_path="/bin/agent-bus")
     assert not (tmp_path / "must-not-exist.db").exists()
+
+
+def test_hook_commands_fail_safe(tmp_path):
+    """A missing or half-upgraded binary must not hold every turn open: a
+    client that reads a non-zero exit as 'keep going' would do exactly that."""
+    from agent_bus import clients
+
+    repo = _make_repo(tmp_path, "ok")
+    for client in clients.wirable_clients():
+        clients.wiring(client).apply(repo, name=f"ok/{client}", bin_path="/bin/agent-bus")
+
+    commands = [
+        h["command"]
+        for ev in ("UserPromptSubmit", "Stop")
+        for block in json.loads((repo / ".claude" / "settings.json").read_text())["hooks"][ev]
+        for h in block["hooks"]
+    ]
+    assert commands and all(c.endswith("|| true") for c in commands)
+
+
+def test_a_failing_binary_neither_blocks_nor_speaks(tmp_path):
+    """Run the written command for real, with a binary that does not exist."""
+    import subprocess
+
+    repo = _make_repo(tmp_path, "ok")
+    init_cmd.apply_plan(init_cmd.plan_for_repo(repo), bin_path="/nonexistent/agent-bus")
+    (command,) = [
+        h["command"]
+        for block in json.loads((repo / ".claude" / "settings.json").read_text())["hooks"]["Stop"]
+        for h in block["hooks"]
+    ]
+    done = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0
+    assert done.stdout == ""
