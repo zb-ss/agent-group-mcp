@@ -442,3 +442,91 @@ def test_cli_init_upgrade_retires_the_old_name(bus_paths, tmp_path):
     assert "renaming from 'acme-dev' to 'acme-dev/claude'" in r.stdout
     assert "[claude]" in r.stdout
     assert Storage().get_agent("acme-dev") is None
+
+
+# --------------------------- several agents per repo ---------------------
+
+
+def _shared_bus(bus_paths):
+    from agent_bus.storage import Storage
+
+    s = Storage()
+    s.upsert_agent("repo-a/claude", "/code/repo-a")
+    s.upsert_agent("repo-a/codex", "/code/repo-a")
+    s.upsert_agent("repo-b", "/code/repo-b")
+    s.ensure_agent("human", "/home")
+    return s, {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+
+
+def test_cli_agents_groups_the_clients_of_a_repo(bus_paths):
+    s, env = _shared_bus(bus_paths)
+    s.send_message(from_agent="human", to="repo-a/codex", body="x")
+
+    r = _run_cli(["agents"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.splitlines()
+    header = next(i for i, l in enumerate(lines) if l.startswith("repo-a "))
+    assert "repo=/code/repo-a" in lines[header]
+    assert "2 agents" in lines[header]
+    assert lines[header + 1].startswith("  repo-a/claude")
+    assert lines[header + 2].startswith("  repo-a/codex")
+    assert "pending=1" in lines[header + 2]
+    assert "repo=" not in lines[header + 1]  # said once, on the repo's line
+    # an agent on its own keeps the one-line form
+    solo = next(l for l in lines if l.startswith("repo-b"))
+    assert "repo=/code/repo-b" in solo and "pending=0" in solo
+
+
+def test_cli_agents_json_stays_a_flat_list(bus_paths):
+    _s, env = _shared_bus(bus_paths)
+    rows = json.loads(_run_cli(["agents", "--json"], env_extra=env).stdout)
+    assert [(r["name"], r["group"], r["client"]) for r in rows] == [
+        ("human", "human", None),
+        ("repo-a/claude", "repo-a", "claude"),
+        ("repo-a/codex", "repo-a", "codex"),
+        ("repo-b", "repo-b", None),
+    ]
+
+
+def test_cli_forget_one_client_leaves_its_repo_mates(bus_paths):
+    s, env = _shared_bus(bus_paths)
+    r = _run_cli(["forget", "repo-a/codex"], env_extra=env)
+    assert r.returncode == 0
+    assert [a.name for a in s.list_agents() if a.group == "repo-a"] == ["repo-a/claude"]
+
+
+def test_cli_forget_a_bare_repo_name_asks_for_group(bus_paths):
+    s, env = _shared_bus(bus_paths)
+    r = _run_cli(["forget", "repo-a"], env_extra=env)
+    assert r.returncode == 1
+    assert "--group" in r.stdout and "repo-a/claude" in r.stdout
+    assert len([a for a in s.list_agents() if a.group == "repo-a"]) == 2
+
+
+def test_cli_forget_group_removes_every_client_of_the_repo(bus_paths):
+    s, env = _shared_bus(bus_paths)
+    r = _run_cli(["forget", "--group", "repo-a"], env_extra=env)
+    assert r.returncode == 0
+    assert "repo-a/claude" in r.stdout and "repo-a/codex" in r.stdout
+    assert sorted(a.name for a in s.list_agents()) == ["human", "repo-b"]
+
+
+def test_cli_wake_config_test_uses_the_repo_level_command(bus_paths, tmp_path):
+    _s, env = _shared_bus(bus_paths)
+    marker = tmp_path / "woken"
+    r = _run_cli(["wake-config", "set", "repo-a", f'touch "{marker}"'], env_extra=env)
+    assert r.returncode == 0
+
+    r = _run_cli(["wake-config", "test", "repo-a/claude"], env_extra=env)
+    assert r.returncode == 0, r.stdout
+    assert "fired=True" in r.stdout
+    deadline = time.time() + 5
+    while not marker.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    assert marker.exists()
+
+    shown = _run_cli(["wake-config", "show"], env_extra=env).stdout
+    assert "repo-a" in shown and "every agent in the repo" in shown

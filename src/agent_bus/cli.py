@@ -26,6 +26,7 @@ from pathlib import Path
 from . import audit
 from . import clients
 from . import formatting as fmt
+from . import identity
 from . import init_cmd
 from . import wake
 from .migrations import SchemaTooNewError
@@ -64,18 +65,18 @@ def _emit(fragments: list[fmt.Fragment]) -> None:
 
 def cmd_send(args: argparse.Namespace) -> int:
     store = Storage()
-    identity = _human_identity(args.name)
-    _register_speaker(store, identity)
+    speaker = _human_identity(args.name)
+    _register_speaker(store, speaker)
 
     target = args.to or BROADCAST
     body = args.body
     try:
         result = store.send_message(
-            from_agent=identity,
+            from_agent=speaker,
             to=target,
             body=body,
             thread_id=args.thread,
-            actor=identity,
+            actor=speaker,
         )
     except UnknownRecipientError as e:
         sys.stderr.write(f"agent-bus: {e}\n")
@@ -95,7 +96,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     _emit(
         fmt.fragments_for_message(
             sent_at=sent_at,
-            from_agent=identity,
+            from_agent=speaker,
             to_agent=target_label,
             body=body,
             thread_id=thread,
@@ -162,21 +163,44 @@ def cmd_agents(args: argparse.Namespace) -> int:
     if not rows:
         sys.stdout.write("(no agents registered yet)\n")
         return 0
-    name_col = max((len(a.name) for a, _ in rows), default=NAME_COL)
-    name_col = max(name_col, NAME_COL)
+    # indented members are two columns in, so leave room for them
+    name_col = max(NAME_COL, max(len(a.name) for a, _ in rows) + 2)
+    by_group: dict[str, list] = {}
     for agent, count in rows:
-        last_seen = fmt.humanize_relative(agent.last_seen)
-        pending_text = f"pending={count}" if count else "pending=0"
+        by_group.setdefault(agent.group, []).append((agent, count))
+    for group, members in by_group.items():
+        (first, _count), *rest = members
+        if not rest and first.name == group:
+            _emit(_agent_line(first, _count, name_col=name_col, show_repo=True))
+            continue
         _emit([
-            (f"class:agent-{fmt.safe_class(agent.name)}", agent.name.ljust(name_col)),
+            (f"class:agent-{fmt.safe_class(group)}", group.ljust(name_col)),
             ("", "  "),
-            ("class:system", f"repo={agent.repo_path}"),
+            ("class:system", f"repo={first.repo_path}"),
             ("", "  "),
-            ("class:ts", f"seen {last_seen}"),
-            ("", "  "),
-            ("class:thread" if count == 0 else "class:op-send", pending_text),
+            ("class:ts", f"{len(members)} agents" if rest else "1 agent"),
         ])
+        for agent, count in members:
+            _emit(_agent_line(agent, count, name_col=name_col, show_repo=False, indent=2))
     return 0
+
+
+def _agent_line(
+    agent, count: int, *, name_col: int, show_repo: bool, indent: int = 0
+) -> list[fmt.Fragment]:
+    line: list[fmt.Fragment] = [
+        ("", " " * indent),
+        (f"class:agent-{fmt.safe_class(agent.name)}", agent.name.ljust(name_col - indent)),
+    ]
+    if show_repo:
+        line += [("", "  "), ("class:system", f"repo={agent.repo_path}")]
+    line += [
+        ("", "  "),
+        ("class:ts", f"seen {fmt.humanize_relative(agent.last_seen)}"),
+        ("", "  "),
+        ("class:thread" if count == 0 else "class:op-send", f"pending={count}"),
+    ]
+    return line
 
 
 def _audit_render_line(row: dict) -> str:
@@ -271,9 +295,25 @@ def cmd_tail(args: argparse.Namespace) -> int:
 def cmd_forget(args: argparse.Namespace) -> int:
     store = Storage()
     name = args.name
+    if args.group:
+        removed = store.forget_group(name)
+        if not removed:
+            sys.stdout.write(f"(no agents in a repo named {name!r} on the roster)\n")
+            return 0
+        sys.stdout.write(f"forgot {len(removed)} agent(s): {', '.join(removed)}\n")
+        return 0
+
     pending = store.pending_count(agent=name)
     ok = store.forget_agent(name)
     if not ok:
+        members = [a.name for a in store.list_agents() if a.group == name]
+        if members:
+            sys.stdout.write(
+                f"{name!r} is a repo with {len(members)} agent(s): "
+                f"{', '.join(members)}. Forget one by its full name, or all "
+                f"of them with `agent-bus forget --group {name}`.\n"
+            )
+            return 1
         sys.stdout.write(f"(no agent named {name!r} on the roster)\n")
         return 0
     sys.stdout.write(f"forgot agent {name!r}. ")
@@ -430,10 +470,12 @@ def cmd_wake_config(args: argparse.Namespace) -> int:
             sys.stdout.write(f"(no wake commands configured — {cfg_path} does not exist)\n")
             return 0
         sys.stdout.write(f"# {cfg_path}\n")
+        repos = {a.group for a in Storage().list_agents() if a.client}
         for name, entry in cfg.items():
             cmd = entry if isinstance(entry, str) else (entry.get("command") if isinstance(entry, dict) else None)
             cmd_repr = cmd if cmd else "(disabled)"
-            sys.stdout.write(f"{name:<24} {cmd_repr}\n")
+            scope = "  # every agent in the repo without its own entry" if name in repos else ""
+            sys.stdout.write(f"{name:<24} {cmd_repr}{scope}\n")
         return 0
 
     if action == "set":
@@ -463,6 +505,7 @@ def cmd_wake_config(args: argparse.Namespace) -> int:
         if not args.name:
             sys.stdout.write("usage: agent-bus wake-config test NAME\n")
             return 2
+        parsed = identity.parse_or_none(args.name)
         fired, status = wake.fire_wake(
             args.name,
             from_agent="wake-config-test",
@@ -470,6 +513,8 @@ def cmd_wake_config(args: argparse.Namespace) -> int:
             body="agent-bus wake test — if you see something happen, the wake command worked.",
             thread_id="test-thread",
             message_id="test-message",
+            # an agent without an entry of its own falls back to its repo's
+            group=parsed.group if parsed and parsed.client else None,
         )
         sys.stdout.write(f"{args.name}: fired={fired}, status={status}\n")
         return 0 if fired else 1
@@ -549,6 +594,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remove an agent from the roster. Message history is preserved.",
     )
     s.add_argument("name", help="Agent name to remove from the roster.")
+    s.add_argument(
+        "--group",
+        action="store_true",
+        help="Treat NAME as a repo and forget every agent in it.",
+    )
     s.set_defaults(func=cmd_forget)
 
     # tail

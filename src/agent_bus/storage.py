@@ -381,6 +381,24 @@ class Storage:
             }])
         return moved
 
+    def forget_group(self, group: str) -> list[str]:
+        """Forget every agent of one repo. Returns the names removed. Like
+        `forget_agent`, it leaves message history alone."""
+        self.init_schema()
+        in_group = "COALESCE(group_name, name) = ?"
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    f"SELECT name FROM agents WHERE {in_group} ORDER BY name", (group,)
+                ).fetchall()
+                conn.execute(f"DELETE FROM agents WHERE {in_group}", (group,))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return [r["name"] for r in rows]
+
     # ----------------------------- messages ---------------------------------
 
     @staticmethod
