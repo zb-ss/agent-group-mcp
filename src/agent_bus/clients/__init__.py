@@ -18,6 +18,7 @@ _HOOK_DIALECTS: dict[str, HookDialect] = {
 _STANDARD = StandardHookDialect()
 
 _WIRINGS: dict[str, ClientWiring] = {
+    agy.CLIENT_ID: agy.AgyWiring(),
     claude.CLIENT_ID: claude.ClaudeWiring(),
     codex.CLIENT_ID: codex.CodexWiring(),
 }
