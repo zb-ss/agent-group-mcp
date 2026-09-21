@@ -63,13 +63,24 @@ def append(
     }
     target = log_path or audit_path()
     ensure_parents(target)
-    line = json.dumps(row, ensure_ascii=False) + "\n"
+    _append_bytes(target, (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
+    return row
+
+
+def _append_bytes(target: Path, data: bytes) -> None:
+    """Append `data` in full. One O_APPEND write is what keeps concurrent
+    writers from interleaving, and it normally takes everything at once;
+    but os.write may stop short (a full disk, a signal), and leaving half a
+    line behind would lose the row silently, since readers skip lines that
+    do not parse. Finishing the write matters more than the rare chance of
+    another process landing between the two halves."""
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
-        os.write(fd, line.encode("utf-8"))
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
     finally:
         os.close(fd)
-    return row
 
 
 def tail(limit: int = 50, *, log_path: Path | None = None) -> list[dict]:
@@ -118,8 +129,4 @@ def append_many(rows: Iterable[dict], *, log_path: Path | None = None) -> None:
     payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
     if not payload:
         return
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    try:
-        os.write(fd, payload.encode("utf-8"))
-    finally:
-        os.close(fd)
+    _append_bytes(target, payload.encode("utf-8"))
