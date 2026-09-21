@@ -530,3 +530,25 @@ def test_cli_wake_config_test_uses_the_repo_level_command(bus_paths, tmp_path):
 
     shown = _run_cli(["wake-config", "show"], env_extra=env).stdout
     assert "repo-a" in shown and "every agent in the repo" in shown
+
+
+def test_cli_reports_its_version(bus_paths):
+    """A setup runbook needs a way to tell which build is installed."""
+    from agent_bus import __version__
+
+    r = _run_cli(["--version"])
+    assert r.returncode == 0
+    assert r.stdout.strip() == f"agent-bus {__version__}"
+
+
+def test_version_is_the_same_in_both_places():
+    """pyproject.toml and __init__.py are hand-synced; drift ships a wrong
+    version to PyPI."""
+    import tomllib
+    from pathlib import Path
+
+    from agent_bus import __version__
+
+    root = Path(__file__).resolve().parents[1]
+    declared = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+    assert declared == __version__

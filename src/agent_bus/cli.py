@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import audit
+from . import __version__, audit
 from . import clients
 from . import formatting as fmt
 from . import identity
@@ -558,6 +558,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Local multi-agent message bus. Tools talk over MCP; the CLI "
             "talks directly to the SQLite store + audit log."
         ),
+    )
+    p.add_argument(
+        "--version",
+        action="version",
+        version=f"agent-bus {__version__}",
+        help="Print the installed version and exit.",
     )
     sub = p.add_subparsers(dest="command", required=True)
 

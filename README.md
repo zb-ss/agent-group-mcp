@@ -22,6 +22,12 @@ each with an inbox of its own.
 - **Open-source friendly:** MIT, no telemetry, no network calls, all
   state lives under `~/.claude-agent-bus/` (gitignored by default).
 
+> **Setting this up?** [`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md) is a
+> step-by-step install and configuration runbook, written so you can hand it
+> to a coding agent: *"set up agent-bus by following docs/AGENT_SETUP.md"*.
+> Every step says what output means it worked. This README explains how the
+> bus behaves and why.
+
 ---
 
 ## Install
@@ -36,6 +42,10 @@ This puts the `agent-bus` CLI on your `$PATH` (typically
 `~/.local/bin/agent-bus`) in an isolated venv that pipx manages. Every
 MCP client session, every repo, and every shell can call it without
 sourcing anything. To upgrade later: `pipx upgrade agent-group-mcp`.
+
+Check what you have with `agent-bus --version`. If the package was once
+installed under its older name, run `pipx uninstall agent-bus` first so a
+single package owns the command.
 
 ### Alternative: from source (development)
 
@@ -387,11 +397,12 @@ What differs per client:
   hook commands. It adds pending mail to the system prompt before each
   model request (repeating it for the rest of the turn, since that
   addition is not kept in the transcript). opencode **cannot be kept from
-  finishing a turn**: when mail arrives mid-turn, the plugin starts a
-  follow-up turn as soon as the session goes idle. The injection uses an
-  `experimental.*` plugin hook that may change between opencode releases.
-  A `.opencode/opencode.json` containing comments cannot be merged and is
-  skipped.
+  finishing a turn**: when mail arrives mid-turn, the plugin asks it to
+  start a follow-up turn once the session goes idle. That follow-up is
+  best-effort — if it does not happen, the message is simply waiting at
+  the next prompt. The injection uses an `experimental.*` plugin hook that
+  may change between opencode releases, and a `.opencode/opencode.json`
+  containing comments cannot be merged and is skipped.
 
 Everything `init` writes contains absolute paths for this machine — add the
 files above to your `.gitignore` rather than committing them.
@@ -802,6 +813,28 @@ agent-bus wake-config set alex false   # or just omit the entry
 - `emacsclient` can't reach an emacs server: command exits nonzero
   out-of-band. Run `emacsclient -e '(message "ping")'` once to verify
   before wiring it.
+
+## Using more than one machine
+
+The bus is local: the database, the audit log and the wiring all live on
+one machine, and agents on different machines cannot see each other.
+
+The files `agent-bus init` writes contain absolute paths to a `pipx` venv,
+so they do not travel. If you sync dotfiles or repositories between
+machines, run `agent-bus init` on each one rather than syncing its output,
+and keep the generated files out of git (see the list in
+[`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md#7-keep-the-wiring-out-of-git)).
+
+One trap is worth calling out. If you sync a **user-level** client config
+that invokes `agent-bus` — a global MCP server entry or a global hook —
+then every machine it reaches must already have a version whose CLI
+understands the flags in it. Install or upgrade the package on each
+machine *before* the config arrives, or the older binary will reject the
+arguments. Hook commands written by `init` end in `|| true` for exactly
+this reason: a binary that cannot run the command stays silent instead of
+holding turns open.
+
+---
 
 ## Privacy & security
 
