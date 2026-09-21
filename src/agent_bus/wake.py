@@ -10,12 +10,13 @@ The wake command is whatever the user's setup makes feasible:
   - screen:         screen -S agent -X stuff "check inbox\\n"
   - anything else:  webhook curl, custom script, ntfy push…
 
-Design constraints (see [[agent-bus-client-neutral]]):
+Design constraints:
   - Generic MCP, no Claude-Code-only features. The wake fires from the
     sender's MCP server process (or from `agent-bus send` in a shell)
     regardless of which client the *recipient* uses.
   - Opt-in per agent. No wake.json entry → no command runs → existing
-    behaviour unchanged.
+    behaviour unchanged. An entry keyed by a bare repo name covers every
+    agent in that repo that has no entry of its own.
   - Latency-sensitive: subprocess.Popen returns immediately, so the
     sender never blocks on the recipient's wake.
 
@@ -92,6 +93,23 @@ def _resolve_command(entry: Any) -> str | None:
     return None
 
 
+def wake_command(
+    config: dict[str, Any], agent: str, group: str | None = None
+) -> tuple[str | None, str]:
+    """Find the command that wakes `agent`: its own entry, else its repo's.
+
+    Returns ``(command, status)``; the command is None when the status is
+    ``"no-config"`` or ``"disabled"``. An agent's own entry always wins, so
+    disabling one client does not fall back to the repo-wide command.
+    """
+    for key in (agent, group):
+        if key is None or key not in config:
+            continue
+        cmd = _resolve_command(config[key])
+        return (cmd, "configured") if cmd else (None, "disabled")
+    return None, "no-config"
+
+
 def fire_wake(
     agent: str,
     *,
@@ -101,11 +119,12 @@ def fire_wake(
     thread_id: str,
     message_id: str,
     config: dict[str, Any] | None = None,
+    group: str | None = None,
 ) -> tuple[bool, str]:
-    """Look up `agent` in wake.json and run the configured command.
+    """Look up `agent` (then its `group`) in wake.json and run the command.
 
     Returns ``(fired, status)``:
-      - ``(False, "no-config")``  : agent has no entry in wake.json
+      - ``(False, "no-config")``  : neither the agent nor its repo has an entry
       - ``(False, "disabled")``   : entry is explicitly null/false/empty
       - ``(True,  "fired:OK")``   : subprocess launched
       - ``(False, "fired:ERR…")`` : Popen raised before launch
@@ -118,11 +137,9 @@ def fire_wake(
     on purpose so a slow or noisy wake never floods the MCP transport).
     """
     cfg = config if config is not None else load_wake_config()
-    if agent not in cfg:
-        return False, "no-config"
-    cmd = _resolve_command(cfg[agent])
+    cmd, status = wake_command(cfg, agent, group)
     if cmd is None:
-        return False, "disabled"
+        return False, status
 
     env = os.environ.copy()
     env.update(
@@ -159,13 +176,30 @@ def fire_wake(
     except (OSError, ValueError) as e:
         return False, f"fired:ERR:{type(e).__name__}"
 
-    # write the JSON payload to stdin, then immediately close. We don't
-    # wait for the process — fire-and-forget.
-    try:
-        if proc.stdin is not None:
-            proc.stdin.write(payload)
-            proc.stdin.close()
-    except (BrokenPipeError, OSError):
-        pass
-
+    # Hand the payload over without ever waiting on the child. A wake
+    # command that does not read stdin — `notify-send`, `tmux send-keys` —
+    # fills the pipe buffer, and a plain blocking write would then stall the
+    # sender for as long as that process lives. A non-blocking write puts in
+    # what fits and drops the rest; the routing metadata is on the
+    # environment anyway, so a truncated body only costs a command that
+    # bothers to read it a longer preview.
+    _hand_over_payload(proc, payload)
     return True, "fired:OK"
+
+
+def _hand_over_payload(proc: subprocess.Popen, payload: bytes) -> None:
+    if proc.stdin is None:
+        return
+    try:
+        os.set_blocking(proc.stdin.fileno(), False)
+    except (OSError, ValueError):
+        pass
+    try:
+        proc.stdin.write(payload)
+    except (BlockingIOError, BrokenPipeError, OSError, ValueError):
+        pass  # the child is slow, gone, or not listening — not our problem
+    finally:
+        try:
+            proc.stdin.close()
+        except (BlockingIOError, BrokenPipeError, OSError, ValueError):
+            pass

@@ -23,23 +23,38 @@ import sys
 import time
 from pathlib import Path
 
-from . import audit
+from . import __version__, audit
+from . import clients
 from . import formatting as fmt
+from . import identity
 from . import init_cmd
 from . import wake
+from .migrations import SchemaTooNewError
 from .paths import audit_path
-from .storage import BROADCAST, Storage
+from .clients.base import UnreadableConfigError
+from .storage import BROADCAST, Storage, UnknownRecipientError
 
 NAME_COL = 18
 TARGET_COL = 18
+EXIT_SCHEMA_TOO_NEW = 3
 
 
 def _human_identity(explicit: str | None) -> str:
     return explicit or os.environ.get("AGENT_BUS_NAME") or "human"
 
 
-def _repo_for(name: str) -> str:
-    return os.environ.get("AGENT_BUS_REPO") or str(Path.cwd())
+def _register_speaker(store: Storage, name: str) -> None:
+    """Put whoever is speaking on the roster without moving anyone.
+
+    $AGENT_BUS_REPO describes $AGENT_BUS_NAME and nobody else, so it is only
+    authoritative when we speak as that name. Speaking as any other name
+    (`--name`) registers it if it is new and otherwise leaves its repo alone.
+    """
+    env_repo = os.environ.get("AGENT_BUS_REPO")
+    if env_repo and name == os.environ.get("AGENT_BUS_NAME"):
+        store.upsert_agent(name, env_repo)
+        return
+    store.ensure_agent(name, str(Path.cwd()))
 
 
 def _emit(fragments: list[fmt.Fragment]) -> None:
@@ -51,37 +66,38 @@ def _emit(fragments: list[fmt.Fragment]) -> None:
 
 def cmd_send(args: argparse.Namespace) -> int:
     store = Storage()
-    identity = _human_identity(args.name)
-    store.upsert_agent(identity, _repo_for(identity))
+    speaker = _human_identity(args.name)
+    _register_speaker(store, speaker)
 
     target = args.to or BROADCAST
     body = args.body
-    result = store.send_message(
-        from_agent=identity,
-        to=target,
-        body=body,
-        thread_id=args.thread,
-        actor=identity,
-    )
+    try:
+        result = store.send_message(
+            from_agent=speaker,
+            to=target,
+            body=body,
+            thread_id=args.thread,
+            actor=speaker,
+        )
+    except UnknownRecipientError as e:
+        sys.stderr.write(f"agent-bus: {e}\n")
+        return 1
     if args.json:
         sys.stdout.write(json.dumps(result) + "\n")
         return 0
 
     sent_at = result.get("sent_at", "")
     thread = result.get("thread_id")
-    if "message_ids" in result:
-        recipients = result.get("recipients", [])
-        if not recipients:
-            sys.stdout.write("(no peers connected — message dropped)\n")
-            return 0
-        target_label = f"all ({len(recipients)})"
-    else:
-        target_label = target
+    recipients = result.get("recipients", [])
+    if not recipients:
+        sys.stdout.write("(nobody to deliver to — message dropped)\n")
+        return 0
+    target_label = fmt.fan_out_label(target, result["kind"], len(recipients))
 
     _emit(
         fmt.fragments_for_message(
             sent_at=sent_at,
-            from_agent=identity,
+            from_agent=speaker,
             to_agent=target_label,
             body=body,
             thread_id=thread,
@@ -148,21 +164,44 @@ def cmd_agents(args: argparse.Namespace) -> int:
     if not rows:
         sys.stdout.write("(no agents registered yet)\n")
         return 0
-    name_col = max((len(a.name) for a, _ in rows), default=NAME_COL)
-    name_col = max(name_col, NAME_COL)
+    # indented members are two columns in, so leave room for them
+    name_col = max(NAME_COL, max(len(a.name) for a, _ in rows) + 2)
+    by_group: dict[str, list] = {}
     for agent, count in rows:
-        last_seen = fmt.humanize_relative(agent.last_seen)
-        pending_text = f"pending={count}" if count else "pending=0"
+        by_group.setdefault(agent.group, []).append((agent, count))
+    for group, members in by_group.items():
+        (first, _count), *rest = members
+        if not rest and first.name == group:
+            _emit(_agent_line(first, _count, name_col=name_col, show_repo=True))
+            continue
         _emit([
-            (f"class:agent-{agent.name}", agent.name.ljust(name_col)),
+            (f"class:agent-{fmt.safe_class(group)}", group.ljust(name_col)),
             ("", "  "),
-            ("class:system", f"repo={agent.repo_path}"),
+            ("class:system", f"repo={first.repo_path}"),
             ("", "  "),
-            ("class:ts", f"seen {last_seen}"),
-            ("", "  "),
-            ("class:thread" if count == 0 else "class:op-send", pending_text),
+            ("class:ts", f"{len(members)} agents" if rest else "1 agent"),
         ])
+        for agent, count in members:
+            _emit(_agent_line(agent, count, name_col=name_col, show_repo=False, indent=2))
     return 0
+
+
+def _agent_line(
+    agent, count: int, *, name_col: int, show_repo: bool, indent: int = 0
+) -> list[fmt.Fragment]:
+    line: list[fmt.Fragment] = [
+        ("", " " * indent),
+        (f"class:agent-{fmt.safe_class(agent.name)}", agent.name.ljust(name_col - indent)),
+    ]
+    if show_repo:
+        line += [("", "  "), ("class:system", f"repo={agent.repo_path}")]
+    line += [
+        ("", "  "),
+        ("class:ts", f"seen {fmt.humanize_relative(agent.last_seen)}"),
+        ("", "  "),
+        ("class:thread" if count == 0 else "class:op-send", f"pending={count}"),
+    ]
+    return line
 
 
 def _audit_render_line(row: dict) -> str:
@@ -257,9 +296,25 @@ def cmd_tail(args: argparse.Namespace) -> int:
 def cmd_forget(args: argparse.Namespace) -> int:
     store = Storage()
     name = args.name
+    if args.group:
+        removed = store.forget_group(name)
+        if not removed:
+            sys.stdout.write(f"(no agents in a repo named {name!r} on the roster)\n")
+            return 0
+        sys.stdout.write(f"forgot {len(removed)} agent(s): {', '.join(removed)}\n")
+        return 0
+
     pending = store.pending_count(agent=name)
     ok = store.forget_agent(name)
     if not ok:
+        members = [a.name for a in store.list_agents() if a.group == name]
+        if members:
+            sys.stdout.write(
+                f"{name!r} is a repo with {len(members)} agent(s): "
+                f"{', '.join(members)}. Forget one by its full name, or all "
+                f"of them with `agent-bus forget --group {name}`.\n"
+            )
+            return 1
         sys.stdout.write(f"(no agent named {name!r} on the roster)\n")
         return 0
     sys.stdout.write(f"forgot agent {name!r}. ")
@@ -273,8 +328,64 @@ def cmd_forget(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_clients(raw: str | None) -> list[str]:
+    """`--clients a,b` as a list, checked against what init can wire."""
+    if not raw:
+        return list(init_cmd.DEFAULT_CLIENTS)
+    wanted = [c.strip() for c in raw.split(",") if c.strip()]
+    known = clients.wirable_clients()
+    unknown = [c for c in wanted if c not in known]
+    if unknown or not wanted:
+        raise ValueError(
+            f"unknown client(s): {', '.join(unknown) or '(none given)'}. "
+            f"init can wire: {', '.join(known)}"
+        )
+    return list(dict.fromkeys(wanted))
+
+
+def _plan_as_json(plan: init_cmd.InitPlan) -> dict:
+    return {
+        "repo": str(plan.repo),
+        "name": plan.name,
+        "action": plan.action.value,
+        "previous_name": plan.previous_name,
+        "notes": plan.notes,
+        "clients": [
+            {
+                "client": c.client,
+                "name": plan.agent_name(c.client) if plan.name else None,
+                "action": c.action.value,
+                "previous_name": c.previous_name,
+            }
+            for c in plan.clients
+        ],
+    }
+
+
+def _print_plan_table(plans: list[init_cmd.InitPlan]) -> None:
+    width_name = max((len(p.name) for p in plans if p.name), default=8)
+    width_name = max(width_name, 8)
+    width_action = max(len(a.value) for a in init_cmd.Action)
+    for p in plans:
+        repo_short = str(p.repo)
+        try:
+            repo_short = "~/" + str(p.repo.relative_to(Path.home()))
+        except ValueError:
+            pass
+        wired = ",".join(c.client for c in p.clients if c.is_change)
+        line = (
+            f"  {p.action.value:<{width_action}}  "
+            f"{p.name:<{width_name}}  {repo_short}"
+        )
+        if wired:
+            line += f"   [{wired}]"
+        if p.notes:
+            line += f"   ({'; '.join(p.notes)})"
+        sys.stdout.write(line + "\n")
+
+
 def cmd_init(args: argparse.Namespace) -> int:
-    """Wire `.mcp.json` + `.claude/settings.json` for one or many repos."""
+    """Wire each requested MCP client into one or many repos."""
     paths = [Path(p) for p in (args.paths or [Path.cwd()])]
     bin_path = init_cmd.detect_agent_bus_bin(args.bin_path)
 
@@ -284,7 +395,13 @@ def cmd_init(args: argparse.Namespace) -> int:
             "(omit --scan and pass exactly one path)\n"
         )
         return 2
+    try:
+        client_ids = _parse_clients(args.clients)
+    except ValueError as e:
+        sys.stderr.write(f"agent-bus: {e}\n")
+        return 2
 
+    store = Storage()
     plans = init_cmd.plan_for_paths(
         paths,
         scan=args.scan,
@@ -292,52 +409,27 @@ def cmd_init(args: argparse.Namespace) -> int:
         override=args.name,
         force=args.force,
         bin_path=bin_path,
+        client_ids=client_ids,
+        storage=store,
     )
 
     if args.json:
-        out = [
-            {
-                "repo": str(p.repo),
-                "name": p.name,
-                "action": p.action.value,
-                "previous_name": p.previous_name,
-                "notes": p.notes,
-            }
-            for p in plans
-        ]
-        sys.stdout.write(json.dumps(out, indent=2) + "\n")
+        sys.stdout.write(json.dumps([_plan_as_json(p) for p in plans], indent=2) + "\n")
         return 0
 
-    # Render the plan table.
     if not plans:
         sys.stdout.write("(no repos found)\n")
         return 0
 
-    width_name = max((len(p.name) for p in plans if p.name), default=8)
-    width_name = max(width_name, 8)
-    width_action = max(len(a.value) for a in init_cmd.Action)
-
-    for p in plans:
-        repo_short = str(p.repo)
-        try:
-            repo_short = "~/" + str(p.repo.relative_to(Path.home()))
-        except ValueError:
-            pass
-        line = (
-            f"  {p.action.value:<{width_action}}  "
-            f"{p.name:<{width_name}}  {repo_short}"
-        )
-        if p.notes:
-            line += f"   ({'; '.join(p.notes)})"
-        sys.stdout.write(line + "\n")
-
+    _print_plan_table(plans)
     counts = init_cmd.summarise(plans)
     changes = [p for p in plans if p.is_change]
     sys.stdout.write(
-        f"\n{len(plans)} repo(s) scanned · "
+        f"\n{len(plans)} repo(s) scanned · clients={','.join(client_ids)} · "
         f"write={counts['write']} refresh={counts['refresh']} "
         f"renamed={counts['rename']} "
         f"handwritten-skip={counts['skip-handwritten']} "
+        f"unreadable-skip={counts['skip-unreadable']} "
         f"ignored={counts['skip-ignored']} "
         f"not-repo={counts['skip-not-repo']}\n"
     )
@@ -357,13 +449,22 @@ def cmd_init(args: argparse.Namespace) -> int:
         )
         return 0
 
-    written = 0
-    for p in plans:
-        if p.is_change:
-            init_cmd.apply_plan(p, bin_path=bin_path)
-            written += 1
-    sys.stdout.write(f"\nApplied to {written} repo(s).\n")
-    return 0
+    written, failed = [], []
+    for p in changes:
+        try:
+            init_cmd.apply_plan(p, bin_path=bin_path, storage=store)
+        except UnreadableConfigError as e:
+            # one repo's surprising config must not abandon the rest half-done
+            failed.append((p, e))
+        else:
+            written.append(p)
+    sys.stdout.write(f"\nApplied to {len(written)} repo(s).\n")
+    for plan, error in failed:
+        sys.stderr.write(f"agent-bus: skipped {plan.repo} — {error}\n")
+    for client_id in client_ids:
+        for limitation in clients.wiring(client_id).limitations:
+            sys.stdout.write(f"note ({client_id}): {limitation}\n")
+    return 1 if failed else 0
 
 
 def cmd_wake_config(args: argparse.Namespace) -> int:
@@ -379,10 +480,12 @@ def cmd_wake_config(args: argparse.Namespace) -> int:
             sys.stdout.write(f"(no wake commands configured — {cfg_path} does not exist)\n")
             return 0
         sys.stdout.write(f"# {cfg_path}\n")
+        repos = {a.group for a in Storage().list_agents() if a.client}
         for name, entry in cfg.items():
             cmd = entry if isinstance(entry, str) else (entry.get("command") if isinstance(entry, dict) else None)
             cmd_repr = cmd if cmd else "(disabled)"
-            sys.stdout.write(f"{name:<24} {cmd_repr}\n")
+            scope = "  # every agent in the repo without its own entry" if name in repos else ""
+            sys.stdout.write(f"{name:<24} {cmd_repr}{scope}\n")
         return 0
 
     if action == "set":
@@ -412,6 +515,7 @@ def cmd_wake_config(args: argparse.Namespace) -> int:
         if not args.name:
             sys.stdout.write("usage: agent-bus wake-config test NAME\n")
             return 2
+        parsed = identity.parse_or_none(args.name)
         fired, status = wake.fire_wake(
             args.name,
             from_agent="wake-config-test",
@@ -419,6 +523,8 @@ def cmd_wake_config(args: argparse.Namespace) -> int:
             body="agent-bus wake test — if you see something happen, the wake command worked.",
             thread_id="test-thread",
             message_id="test-message",
+            # an agent without an entry of its own falls back to its repo's
+            group=parsed.group if parsed and parsed.client else None,
         )
         sys.stdout.write(f"{args.name}: fired={fired}, status={status}\n")
         return 0 if fired else 1
@@ -436,19 +542,19 @@ def cmd_chat(args: argparse.Namespace) -> int:
 def cmd_hook_stop(args: argparse.Namespace) -> int:
     from .hooks import run_hook_stop
 
-    return run_hook_stop()
+    return run_hook_stop(client=args.client)
 
 
 def cmd_hook_user_prompt(args: argparse.Namespace) -> int:
     from .hooks import run_hook_user_prompt
 
-    return run_hook_user_prompt()
+    return run_hook_user_prompt(client=args.client)
 
 
 def cmd_serve(args: argparse.Namespace) -> int:  # pragma: no cover
     from .server import main as server_main
 
-    server_main()
+    server_main(client=args.client)
     return 0
 
 
@@ -462,6 +568,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Local multi-agent message bus. Tools talk over MCP; the CLI "
             "talks directly to the SQLite store + audit log."
         ),
+    )
+    p.add_argument(
+        "--version",
+        action="version",
+        version=f"agent-bus {__version__}",
+        help="Print the installed version and exit.",
     )
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -498,6 +610,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remove an agent from the roster. Message history is preserved.",
     )
     s.add_argument("name", help="Agent name to remove from the roster.")
+    s.add_argument(
+        "--group",
+        action="store_true",
+        help="Treat NAME as a repo and forget every agent in it.",
+    )
     s.set_defaults(func=cmd_forget)
 
     # tail
@@ -515,7 +632,7 @@ def build_parser() -> argparse.ArgumentParser:
     # init
     s = sub.add_parser(
         "init",
-        help="Wire .mcp.json and .claude/settings.json into one or many repos.",
+        help="Wire agent-bus into one or many repos, once per MCP client.",
         description=(
             "Single-repo (no --scan): writes immediately. "
             "Bulk (--scan): dry-run by default; pass --apply to commit. "
@@ -549,7 +666,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument(
         "--name",
-        help="Explicit agent name (single-repo init only).",
+        help="Explicit group name for the repo (single-repo init only). "
+             "Each client is wired as <name>/<client>.",
+    )
+    s.add_argument(
+        "--clients",
+        help="Comma-separated MCP clients to wire "
+             f"({', '.join(clients.wirable_clients())}). Default: "
+             f"{','.join(init_cmd.DEFAULT_CLIENTS)}.",
     )
     s.add_argument(
         "--bin-path",
@@ -584,19 +708,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--repo", help="repo_path to register. Default $PWD.")
     s.set_defaults(func=cmd_chat)
 
+    client_help = (
+        "Which MCP client this is (claude, codex, agy, opencode, ...). With "
+        "no $AGENT_BUS_NAME, the agent is <repo>/<client>, found from the "
+        "repository this runs in. Default: $AGENT_BUS_CLIENT."
+    )
+
     # hook entrypoints
-    s = sub.add_parser("hook-stop", help="Claude Code Stop hook handler.")
+    s = sub.add_parser(
+        "hook-stop", help="Hook handler: keep the agent going if it has mail."
+    )
+    s.add_argument("--client", help=client_help)
     s.set_defaults(func=cmd_hook_stop)
 
     s = sub.add_parser(
-        "hook-user-prompt", help="Claude Code UserPromptSubmit hook handler."
+        "hook-user-prompt", help="Hook handler: add pending mail to the next prompt."
     )
+    s.add_argument("--client", help=client_help)
     s.set_defaults(func=cmd_hook_user_prompt)
 
     # optional serve helper (so `agent-bus serve` works besides python -m)
     s = sub.add_parser(
         "serve", help="Run the MCP stdio server (same as python -m agent_bus.server)."
     )
+    s.add_argument("--client", help=client_help)
     s.set_defaults(func=cmd_serve)
 
     return p
@@ -605,7 +740,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except SchemaTooNewError as e:
+        sys.stderr.write(f"agent-bus: {e}\n")
+        return EXIT_SCHEMA_TOO_NEW
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -15,6 +15,8 @@ import textwrap
 from datetime import datetime, timezone
 from typing import Iterable
 
+from .identity import KIND_BROADCAST, KIND_GROUP
+
 # Curated palette for per-agent colors. Avoids red (= errors) and white
 # (= system messages). Mapped via hashlib so the same agent name always
 # renders in the same color across all subcommands and processes.
@@ -69,6 +71,16 @@ def safe_class(name: str) -> str:
     if not name:
         return "anon"
     return _CLASS_SAFE_RE.sub("_", name)
+
+
+def fan_out_label(target: str, kind: str, recipient_count: int) -> str:
+    """How a just-sent message's target reads: `all (3)` for a broadcast,
+    `repo-a (2)` for a repo's group, the plain name for one agent."""
+    if kind == KIND_BROADCAST:
+        return f"all ({recipient_count})"
+    if kind == KIND_GROUP:
+        return f"{target} ({recipient_count})"
+    return target
 
 
 def color_for(name: str) -> str:
@@ -307,8 +319,10 @@ def style_map(names: Iterable[str]) -> dict[str, str]:
         if n in seen or not n:
             continue
         seen.add(n)
-        color = color_for(n)
         cls = safe_class(n)
+        # keyed on the class, not the name: render_plain() only ever sees
+        # the class, and both renderers must agree on a color
+        color = color_for(cls)
         style[f"agent-{cls}"] = f"{color} bold"
         style[f"target-{cls}"] = color
     # broadcast target gets a neutral hue

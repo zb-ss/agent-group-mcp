@@ -1,31 +1,66 @@
-"""MCP stdio server. One instance per Claude Code session.
+"""MCP stdio server. One instance per client session.
 
-Identity is taken from the environment (AGENT_BUS_NAME / AGENT_BUS_REPO),
-upserted on startup, and silently attached to every tool call. There is
-no register_agent tool — identity is config, not data.
+Identity comes from the environment — AGENT_BUS_NAME, or a client id plus
+the repo (see `resolution.py`) — is upserted on startup, and is silently
+attached to every tool call. There is no register_agent tool — identity is
+config, not data.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
-from . import audit
-from .storage import BROADCAST, Storage
+from . import audit, identity, resolution
+from .storage import Storage
 
 
-def _require_env(name: str) -> str:
-    val = os.environ.get(name)
-    if not val:
+def _who_am_i(
+    store: Storage, name: str | None, repo_path: str | None, client: str | None
+) -> resolution.ResolvedIdentity:
+    if name is not None and repo_path is not None:
+        return resolution.ResolvedIdentity(name, repo_path)
+    try:
+        who = resolution.resolve(storage=store, client=client)
+    except resolution.RepoOptedOutError as e:
+        # a deliberate choice, not a misconfiguration: say so and nothing more
+        sys.stderr.write(f"agent-bus: {e}\n")
+        raise SystemExit(2) from None
+    except resolution.IdentityError as e:
         sys.stderr.write(
-            f"agent-bus: missing required env var {name}. "
-            "Set it in the .mcp.json `env` block.\n"
+            f"agent-bus: {e}. Set it in the `env` block of this client's "
+            "MCP server config.\n"
         )
-        raise SystemExit(2)
-    return val
+        raise SystemExit(2) from None
+    assert who is not None  # only None with registered_only=True
+    return who
+
+
+def _mcp_client_name(ctx: Context) -> str | None:
+    """What the connected client calls itself in the MCP handshake. Purely
+    diagnostic: it shows a config file being read by a client other than the
+    one the agent is named after."""
+    try:
+        params = ctx.session.client_params
+    except (ValueError, LookupError, AttributeError):
+        return None  # no live session, e.g. a tool called directly in tests
+    return params.clientInfo.name if params else None
+
+
+def _startup_warnings(store: Storage, who: resolution.ResolvedIdentity) -> list[str]:
+    """Things worth telling the agent about its own wiring. Computed before
+    this process registers, so the roster still shows the other claimant."""
+    existing = store.get_agent(who.name)
+    if existing is None or existing.repo_path == who.repo_path:
+        return []
+    return [
+        f"the name {who.name!r} was last registered for {existing.repo_path}, "
+        f"not {who.repo_path}. If both repos are in use they share one "
+        "inbox and will take each other's mail — give one a different name "
+        "(a `.agent-bus-name` file, then re-run `agent-bus init`)."
+    ]
 
 
 def build_server(
@@ -33,14 +68,16 @@ def build_server(
     name: str | None = None,
     repo_path: str | None = None,
     storage: Storage | None = None,
+    client: str | None = None,
 ) -> FastMCP:
     """Construct (but do not run) the MCP server.
 
     Pulled out of `main()` so tests can wire a Storage with a temp DB.
     """
-    agent_name = name if name is not None else _require_env("AGENT_BUS_NAME")
-    agent_repo = repo_path if repo_path is not None else _require_env("AGENT_BUS_REPO")
     store = storage or Storage()
+    who = _who_am_i(store, name, repo_path, client)
+    agent_name, agent_repo = who.name, who.repo_path
+    warnings = _startup_warnings(store, who)
     store.upsert_agent(agent_name, agent_repo)
 
     mcp = FastMCP(
@@ -50,40 +87,62 @@ def build_server(
             f"`{agent_name}`. Use `read_inbox` at the start of a turn if "
             "you suspect pending messages; the Stop/UserPromptSubmit hooks "
             "will surface them automatically when configured. "
-            "`send_message(to='*', body=...)` broadcasts to every peer "
-            "except you."
+            "Address a message to a full agent name (`repo-a/claude`) for "
+            "one agent, to a bare repo name (`repo-a`) for every agent "
+            "working in that repo, or to `*` for every peer except you."
         ),
     )
 
     @mcp.tool()
-    def whoami() -> dict:
-        """Return this server's bound identity (set in .mcp.json env)."""
+    def whoami(ctx: Context) -> dict:
+        """This server's identity: its name, its repo's group and the other
+        agents working in the same repo, plus any wiring warnings."""
         store.touch_agent(agent_name)
         row = store.get_agent(agent_name)
-        if row is None:
-            # shouldn't happen — upsert was called at boot
-            return {"name": agent_name, "repo_path": agent_repo, "registered_at": None}
+        parsed = identity.parse_or_none(agent_name)
+        group = row.group if row else agent_name
         return {
-            "name": row.name,
-            "repo_path": row.repo_path,
-            "registered_at": row.registered_at,
-            "last_seen": row.last_seen,
+            "name": agent_name,
+            "group": group,
+            "client": parsed.client if parsed else None,
+            "instance": parsed.instance if parsed else None,
+            "repo_path": row.repo_path if row else agent_repo,
+            "registered_at": row.registered_at if row else None,
+            "last_seen": row.last_seen if row else None,
+            "mcp_client": _mcp_client_name(ctx),
+            "group_members": [
+                {"name": a.name, "client": a.client, "last_seen": a.last_seen}
+                for a in store.list_agents()
+                if a.group == group
+            ],
+            "warnings": warnings,
         }
 
     @mcp.tool()
-    def list_agents() -> list[dict]:
-        """Every agent that has ever connected, plus its current unread count."""
+    def list_agents(group: str | None = None) -> list[dict]:
+        """Every agent that has ever connected, plus its current unread
+        count. Pass `group` (a bare repo name) to see one repo's agents."""
         store.touch_agent(agent_name)
-        return [a.to_dict(pending_count=c) for a, c in store.list_agents_with_counts()]
+        return [
+            a.to_dict(pending_count=c)
+            for a, c in store.list_agents_with_counts()
+            if group is None or a.group == group
+        ]
 
     @mcp.tool()
     def send_message(to: str, body: str, thread_id: str | None = None) -> dict:
-        """Send `body` to peer `to`, or broadcast with to='*'.
+        """Send `body` to one agent, to every agent in a repo, or to everyone.
 
-        Returns either {"message_id", "sent_at", "thread_id", "recipients"}
-        for unicast, or {"message_ids", "sent_at", "thread_id", "recipients"}
-        for broadcast — the schema rejects a single row addressing many
-        peers, so broadcasts fan out into N message_ids server-side.
+        `to` is a full agent name such as `repo-a/claude` (exactly that
+        agent), a bare repo name such as `repo-a` (every agent working in
+        that repo, except you), or `*` (every agent on the bus, except
+        you). `list_agents` shows the names. An unknown `to` is an error
+        and nothing is sent.
+
+        Returns {"to", "kind", "message_ids", "recipients", "thread_id",
+        "sent_at"}, plus "message_id" when exactly one agent received it.
+        `kind` is "direct", "group" or "broadcast". Each recipient gets its
+        own row and message_id, so read state is tracked per agent.
         """
         store.touch_agent(agent_name)
         return store.send_message(
@@ -129,8 +188,8 @@ def build_server(
     return mcp
 
 
-def main() -> None:  # pragma: no cover (entrypoint)
-    mcp = build_server()
+def main(client: str | None = None) -> None:  # pragma: no cover (entrypoint)
+    mcp = build_server(client=client)
     mcp.run()  # stdio transport by default
 
 
