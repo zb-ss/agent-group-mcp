@@ -12,8 +12,16 @@ from pathlib import Path
 import pytest
 
 
-def _run_cli(args, env_extra=None, input_text=None, timeout=15):
+def _run_cli(args, env_extra=None, input_text=None, timeout=15, cwd=None):
     env = os.environ.copy()
+    # some tests run the CLI from another directory, so the package must be
+    # importable without relying on a working-directory-relative path
+    import agent_bus
+
+    package_root = str(Path(agent_bus.__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (package_root, env.get("PYTHONPATH")) if p
+    )
     if env_extra:
         env.update(env_extra)
     return subprocess.run(
@@ -23,7 +31,78 @@ def _run_cli(args, env_extra=None, input_text=None, timeout=15):
         capture_output=True,
         text=True,
         timeout=timeout,
+        cwd=cwd,
     )
+
+
+def test_cli_send_as_another_agent_keeps_its_repo_path(bus_paths, tmp_path):
+    """Regression: `send --name X` rewrote X's repo_path to the caller's
+    working directory, because the repo lookup ignored the name."""
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+    from agent_bus.storage import Storage
+    s = Storage()
+    s.upsert_agent("repo-a", "/code/repo-a")
+    s.upsert_agent("repo-b", "/code/repo-b")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    r = _run_cli(["send", "--name", "repo-a", "--to", "repo-b", "hi", "--json"],
+                 env_extra=env, cwd=elsewhere)
+    assert r.returncode == 0, r.stderr
+    assert Storage().get_agent("repo-a").repo_path == "/code/repo-a"
+
+
+def test_cli_send_ignores_env_repo_that_belongs_to_another_name(bus_paths):
+    """AGENT_BUS_REPO describes AGENT_BUS_NAME, not whoever --name says."""
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+        "AGENT_BUS_NAME": "repo-b",
+        "AGENT_BUS_REPO": "/code/repo-b",
+    }
+    from agent_bus.storage import Storage
+    s = Storage()
+    s.upsert_agent("repo-a", "/code/repo-a")
+    s.upsert_agent("repo-b", "/code/repo-b")
+
+    r = _run_cli(["send", "--name", "repo-a", "--to", "repo-b", "hi", "--json"],
+                 env_extra=env)
+    assert r.returncode == 0, r.stderr
+    assert Storage().get_agent("repo-a").repo_path == "/code/repo-a"
+
+
+def test_cli_send_registers_a_new_identity_in_the_cwd(bus_paths, tmp_path):
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+    from agent_bus.storage import Storage
+    Storage().upsert_agent("repo-b", "/code/repo-b")
+
+    r = _run_cli(["send", "--name", "newcomer", "--to", "repo-b", "hi", "--json"],
+                 env_extra=env, cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert Storage().get_agent("newcomer").repo_path == str(tmp_path)
+
+
+def test_cli_send_as_own_env_identity_is_authoritative(bus_paths):
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+        "AGENT_BUS_NAME": "repo-a",
+        "AGENT_BUS_REPO": "/code/repo-a-moved",
+    }
+    from agent_bus.storage import Storage
+    s = Storage()
+    s.upsert_agent("repo-a", "/code/repo-a")
+    s.upsert_agent("repo-b", "/code/repo-b")
+
+    r = _run_cli(["send", "--to", "repo-b", "hi", "--json"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    assert Storage().get_agent("repo-a").repo_path == "/code/repo-a-moved"
 
 
 def test_cli_send_then_inbox(bus_paths):

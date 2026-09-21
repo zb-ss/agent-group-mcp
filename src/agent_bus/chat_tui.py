@@ -72,7 +72,7 @@ class ChatTUI:
         self,
         *,
         name: str,
-        repo_path: str,
+        repo_path: str | None,
         storage: Storage | None = None,
         poll_seconds: float = POLL_SECONDS,
     ):
@@ -337,7 +337,10 @@ class ChatTUI:
         return db_path().parent / "chat_history"
 
     def run(self) -> int:
-        self.store.upsert_agent(self.name, self.repo_path)
+        if self.repo_path:
+            self.store.upsert_agent(self.name, self.repo_path)
+        else:
+            self.store.ensure_agent(self.name, str(Path.cwd()))
 
         history_path = self._history_path()
         history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -379,6 +382,10 @@ class ChatTUI:
 
 
 def main(name: str | None = None, repo_path: str | None = None) -> int:
-    name = name or os.environ.get("AGENT_BUS_NAME") or "human"
-    repo_path = repo_path or os.environ.get("AGENT_BUS_REPO") or str(Path.cwd())
+    env_name = os.environ.get("AGENT_BUS_NAME")
+    name = name or env_name or "human"
+    # $AGENT_BUS_REPO describes $AGENT_BUS_NAME only; chatting as another
+    # name must not move that agent to our repo.
+    if repo_path is None and name == env_name:
+        repo_path = os.environ.get("AGENT_BUS_REPO")
     return ChatTUI(name=name, repo_path=repo_path).run()

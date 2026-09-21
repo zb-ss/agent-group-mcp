@@ -40,8 +40,18 @@ def _human_identity(explicit: str | None) -> str:
     return explicit or os.environ.get("AGENT_BUS_NAME") or "human"
 
 
-def _repo_for(name: str) -> str:
-    return os.environ.get("AGENT_BUS_REPO") or str(Path.cwd())
+def _register_speaker(store: Storage, name: str) -> None:
+    """Put whoever is speaking on the roster without moving anyone.
+
+    $AGENT_BUS_REPO describes $AGENT_BUS_NAME and nobody else, so it is only
+    authoritative when we speak as that name. Speaking as any other name
+    (`--name`) registers it if it is new and otherwise leaves its repo alone.
+    """
+    env_repo = os.environ.get("AGENT_BUS_REPO")
+    if env_repo and name == os.environ.get("AGENT_BUS_NAME"):
+        store.upsert_agent(name, env_repo)
+        return
+    store.ensure_agent(name, str(Path.cwd()))
 
 
 def _emit(fragments: list[fmt.Fragment]) -> None:
@@ -54,7 +64,7 @@ def _emit(fragments: list[fmt.Fragment]) -> None:
 def cmd_send(args: argparse.Namespace) -> int:
     store = Storage()
     identity = _human_identity(args.name)
-    store.upsert_agent(identity, _repo_for(identity))
+    _register_speaker(store, identity)
 
     target = args.to or BROADCAST
     body = args.body
