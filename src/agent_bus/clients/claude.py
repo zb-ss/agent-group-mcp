@@ -64,26 +64,16 @@ def build_hook_block(*, name: str, bin_path: str, subcommand: str) -> dict:
     }
 
 
-def _block_owners(block: object) -> set[str]:
-    if not isinstance(block, dict) or not isinstance(block.get("hooks"), list):
-        return set()
-    owners = (
-        base.hook_owner(h.get("command", ""))
-        for h in block["hooks"] if isinstance(h, dict)
-    )
-    return {o for o in owners if o is not None}
-
-
 def is_managed_hook_block(block: object) -> bool:
     """Any hook block `agent-bus init` wrote, for whichever client."""
-    return bool(_block_owners(block))
+    return bool(base.group_owners(block))
 
 
 def _is_ours(block: object) -> bool:
     """Blocks this adapter may replace: tagged for Claude Code, or untagged
     ones from before hooks carried a client tag. A block tagged for another
     client that shares this file is left alone."""
-    return bool(_block_owners(block) & {CLIENT_ID, ""})
+    return bool(base.group_owners(block) & {CLIENT_ID, ""})
 
 
 class ClaudeWiring:

@@ -8,16 +8,18 @@ and a client that follows the standard hook contract needs no dialect.
 
 from __future__ import annotations
 
-from . import agy, claude
+from . import agy, claude, codex
 from .base import ClientWiring, HookDialect, StandardHookDialect
 
 _HOOK_DIALECTS: dict[str, HookDialect] = {
     agy.CLIENT_ID: agy.AgyHookDialect(),
+    codex.CLIENT_ID: codex.CodexHookDialect(),
 }
 _STANDARD = StandardHookDialect()
 
 _WIRINGS: dict[str, ClientWiring] = {
     claude.CLIENT_ID: claude.ClaudeWiring(),
+    codex.CLIENT_ID: codex.CodexWiring(),
 }
 
 

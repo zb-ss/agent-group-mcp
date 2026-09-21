@@ -235,7 +235,7 @@ def _plan_client(repo: Path, client: str, *, force: bool) -> ClientPlan:
         return ClientPlan(client, Action.SKIP_UNREADABLE)
     if state.status is WiringStatus.ABSENT:
         return ClientPlan(client, Action.WRITE)
-    if state.status is WiringStatus.HANDWRITTEN and not force:
+    if state.status is WiringStatus.HANDWRITTEN and not (force and state.can_force):
         return ClientPlan(client, Action.SKIP_HANDWRITTEN)
     return ClientPlan(client, Action.REFRESH, previous_name=state.name)
 

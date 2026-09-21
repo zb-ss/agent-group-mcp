@@ -80,6 +80,9 @@ class UnreadableConfigError(ValueError):
 class WiringState:
     status: WiringStatus
     name: str | None = None  # the agent name currently wired, when known
+    # False when even --force cannot help: the entry is in a format we can
+    # only rewrite between our own markers, and this one has none.
+    can_force: bool = True
 
 
 class ClientWiring(Protocol):
@@ -108,14 +111,18 @@ def is_managed_server(command: object, args: object) -> bool:
     return "agent-bus" in command and bool(args) and args[0] == "serve"
 
 
-def hook_command(*, name: str, bin_path: str, subcommand: str, client: str) -> str:
-    """`--client` doubles as the owner tag: a config file shared by several
+def hook_command(
+    *, name: str | None, bin_path: str, subcommand: str, client: str
+) -> str:
+    """The shell command for one hook. With `name=None` the hook works out
+    its agent from the payload instead, which keeps the command identical
+    across repos.
+
+    `--client` doubles as the owner tag: a config file shared by several
     clients can hold one managed hook per client without them clobbering
     each other."""
-    return (
-        f"AGENT_BUS_NAME={shlex.quote(name)} {shlex.quote(bin_path)} "
-        f"{subcommand} --client {client}"
-    )
+    prefix = f"AGENT_BUS_NAME={shlex.quote(name)} " if name else ""
+    return f"{prefix}{shlex.quote(bin_path)} {subcommand} --client {client}"
 
 
 def hook_owner(command: str) -> str | None:
@@ -130,6 +137,17 @@ def hook_owner(command: str) -> str | None:
     if "--client" not in words[:-1]:
         return ""
     return words[words.index("--client") + 1]
+
+
+def group_owners(group: object) -> set[str]:
+    """Owners of the hooks in one `{"hooks": [{"command": ...}]}` group —
+    the shape Claude Code introduced and other clients reuse."""
+    if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+        return set()
+    owners = (
+        hook_owner(h.get("command", "")) for h in group["hooks"] if isinstance(h, dict)
+    )
+    return {o for o in owners if o is not None}
 
 
 def load_json_object(path: Path) -> dict:
