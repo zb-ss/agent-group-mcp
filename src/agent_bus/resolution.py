@@ -35,10 +35,22 @@ CLIENT_ENV = "AGENT_BUS_CLIENT"
 INSTANCE_ENV = "AGENT_BUS_INSTANCE"
 
 NAME_FILE = ".agent-bus-name"
+IGNORE_FILE = ".agent-bus-ignore"
 
 
 class IdentityError(ValueError):
     """The environment does not say, or contradicts, who this process is."""
+
+
+class RepoOptedOutError(IdentityError):
+    """The repo carries an `.agent-bus-ignore` marker, so no agent runs here."""
+
+    def __init__(self, repo: Path) -> None:
+        self.repo = repo
+        super().__init__(
+            f"{repo} is opted out of the bus by its {IGNORE_FILE} file. "
+            f"Remove that file to let an agent run here."
+        )
 
 
 @dataclass(frozen=True)
@@ -65,6 +77,16 @@ def find_repo_root(start: Path) -> Path:
         if (candidate / ".git").exists():
             return candidate
     return start
+
+
+def is_opted_out(repo: Path) -> bool:
+    """True when `repo` carries the marker that keeps agents out of it.
+
+    `init` skips such a repo when writing wiring; this keeps a client whose
+    config is shared across repos — a user-level MCP server or hook — from
+    joining the bus there anyway.
+    """
+    return (repo / IGNORE_FILE).exists()
 
 
 def pinned_group(repo: Path) -> str | None:
@@ -139,6 +161,10 @@ def resolve(
     explicit = env.get(NAME_ENV)
     if explicit:
         repo_path = env.get(REPO_ENV) or str(find_repo_root(Path(repo_hint or cwd)))
+        if is_opted_out(Path(repo_path)):
+            if registered_only:
+                return None
+            raise RepoOptedOutError(Path(repo_path))
         return ResolvedIdentity(_with_instance(explicit, instance), repo_path)
 
     client = client or env.get(CLIENT_ENV)
@@ -151,6 +177,10 @@ def resolve(
         raise IdentityError(f"invalid client id {client!r}")
 
     repo = find_repo_root(Path(env.get(REPO_ENV) or repo_hint or cwd))
+    if is_opted_out(repo):
+        if registered_only:
+            return None
+        raise RepoOptedOutError(repo)
     name = _registered_name(storage, str(repo), client)
     if name is None:
         if registered_only:

@@ -192,3 +192,67 @@ def test_payload_that_is_not_json_is_ignored():
     assert resolution.parse_hook_payload("") == {}
     assert resolution.parse_hook_payload("[1, 2]") == {}
     assert resolution.parse_hook_payload(json.dumps({"cwd": "/x"})) == {"cwd": "/x"}
+
+
+# --------------------------- opting a repo out ---------------------------
+
+
+def _opted_out_repo(tmp_path: Path, name: str = "repo-a") -> Path:
+    repo = _repo(tmp_path, name)
+    (repo / resolution.IGNORE_FILE).touch()
+    return repo
+
+
+def test_a_marked_repo_refuses_to_start_a_server(storage, tmp_path):
+    """A user-level MCP server config follows you into every repo; the
+    marker is how a repo says 'not here'."""
+    repo = _opted_out_repo(tmp_path)
+    with pytest.raises(resolution.RepoOptedOutError) as exc_info:
+        resolution.resolve(storage=storage, env={}, client="codex", cwd=repo)
+    assert resolution.IGNORE_FILE in str(exc_info.value)
+
+
+def test_a_marked_repo_silences_hooks_instead_of_failing(storage, tmp_path):
+    repo = _opted_out_repo(tmp_path)
+    assert resolution.resolve(
+        storage=storage, env={}, client="codex", cwd=repo, registered_only=True
+    ) is None
+
+
+def test_the_marker_wins_over_an_explicit_name(storage, tmp_path):
+    """Wiring left over from before the repo was opted out must not keep
+    an agent alive there."""
+    repo = _opted_out_repo(tmp_path)
+    env = {"AGENT_BUS_NAME": "repo-a/claude", "AGENT_BUS_REPO": str(repo)}
+    with pytest.raises(resolution.RepoOptedOutError):
+        resolution.resolve(storage=storage, env=env, cwd=tmp_path)
+    assert resolution.resolve(
+        storage=storage, env=env, cwd=tmp_path, registered_only=True
+    ) is None
+
+
+def test_the_marker_is_found_from_a_subdirectory(storage, tmp_path):
+    repo = _opted_out_repo(tmp_path)
+    deep = repo / "src" / "pkg"
+    deep.mkdir(parents=True)
+    with pytest.raises(resolution.RepoOptedOutError):
+        resolution.resolve(storage=storage, env={}, client="codex", cwd=deep)
+
+
+def test_an_unmarked_repo_is_unaffected(storage, tmp_path):
+    _opted_out_repo(tmp_path, "ignored")
+    ok = _repo(tmp_path, "fine")
+    who = resolution.resolve(storage=storage, env={}, client="codex", cwd=ok)
+    assert who.name == "fine/codex"
+
+
+def test_a_marked_repo_exits_the_server_with_a_message(storage, tmp_path, monkeypatch):
+    from agent_bus.server import build_server
+
+    repo = _opted_out_repo(tmp_path)
+    for var in ("AGENT_BUS_NAME", "AGENT_BUS_REPO", "AGENT_BUS_CLIENT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.chdir(repo)
+    with pytest.raises(SystemExit) as exc_info:
+        build_server(storage=storage, client="codex")
+    assert exc_info.value.code == 2

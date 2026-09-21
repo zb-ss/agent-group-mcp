@@ -41,10 +41,9 @@ from .clients.claude import (  # noqa: F401  (public names that lived here)
     is_managed_mcp_entry,
 )
 from .identity import MAX_GROUP_LEN, slugify
-from .resolution import NAME_FILE, pinned_group
+from .resolution import IGNORE_FILE, NAME_FILE, is_opted_out, pinned_group
 from .storage import Storage
 
-IGNORE_FILE = ".agent-bus-ignore"
 MAX_NAME_LEN = MAX_GROUP_LEN  # kept for callers that imported it from here
 DEFAULT_SCAN_DEPTH = 6
 DEFAULT_CLIENTS = ("claude",)
@@ -104,7 +103,7 @@ def is_git_repo(path: Path) -> bool:
 
 
 def has_ignore_marker(path: Path) -> bool:
-    return (path / IGNORE_FILE).exists()
+    return is_opted_out(path)
 
 
 def find_git_repos(

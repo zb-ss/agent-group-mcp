@@ -415,8 +415,11 @@ already registered for a different repo path.
 - Drop a `.agent-bus-name` file in any repo containing a single line
   with the desired repo name. `agent-bus init` will use that instead of
   the slug. Useful for keeping a name other agents already know.
-- Drop a `.agent-bus-ignore` file (empty) in any repo to opt it out of
-  bulk init entirely.
+- Drop a `.agent-bus-ignore` file (empty) in any repo to opt it out
+  entirely. `init` skips the repo, and a client whose MCP server or hooks
+  are configured once per user — so they follow you into every repo —
+  refuses to join the bus there: the server exits with a message, and the
+  hooks stay silent.
 
 **Idempotency.** Re-running `init` is safe: it detects its own previous
 output and refreshes it without duplicating hooks or allow-list
