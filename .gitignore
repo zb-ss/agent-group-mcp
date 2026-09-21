@@ -35,3 +35,8 @@ audit.log
 # Contains absolute paths to the local pipx venv; regenerate per-machine.
 .mcp.json
 .claude/settings.json
+.codex/config.toml
+.codex/hooks.json
+.agents/plugins/agent-bus/
+.opencode/opencode.json
+.opencode/plugins/agent-bus.js
