@@ -95,3 +95,19 @@ def test_hook_writes_deliver_audit_row(two_agents, bus_paths):
     assert ops.count("send") == 1
     assert ops.count("read") == 1
     assert ops.count("deliver") == 1
+
+
+def test_hooks_count_as_a_sign_of_life(two_agents):
+    """A client that only ever talks to the bus through its hooks must not
+    look idle, or group fan-out would start skipping it."""
+    import sqlite3
+
+    from agent_bus.hooks import run_hook_stop, run_hook_user_prompt
+
+    stale = "2020-01-01T00:00:00.000000Z"
+    for hook in (run_hook_user_prompt, run_hook_stop):
+        with sqlite3.connect(two_agents.path) as conn:
+            conn.execute("UPDATE agents SET last_seen = ? WHERE name = 'alpha'", (stale,))
+        hook(storage=two_agents, stdin=io.StringIO("{}"),
+             stdout=io.StringIO(), actor="alpha")
+        assert two_agents.get_agent("alpha").last_seen > stale

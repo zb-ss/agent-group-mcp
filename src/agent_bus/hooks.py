@@ -48,6 +48,13 @@ def _format_messages(msgs: Iterable[Message]) -> str:
     return "\n".join(_format_message(m) for m in msgs)
 
 
+def _drain(store: Storage, name: str) -> list[Message]:
+    # a hook firing is a sign of life: some clients never call an MCP tool
+    # between turns, and fan-out skips agents that look long gone
+    store.touch_agent(name)
+    return store.read_inbox(agent=name, mark_read=True, actor=name, also_deliver=True)
+
+
 def run_hook_user_prompt(
     *,
     storage: Storage | None = None,
@@ -65,7 +72,7 @@ def run_hook_user_prompt(
     out = stdout or sys.stdout
     _drain_stdin(stdin or sys.stdin)
 
-    msgs = store.read_inbox(agent=name, mark_read=True, actor=name, also_deliver=True)
+    msgs = _drain(store, name)
     if not msgs:
         return 0
 
@@ -93,7 +100,7 @@ def run_hook_stop(
     out = stdout or sys.stdout
     _drain_stdin(stdin or sys.stdin)
 
-    msgs = store.read_inbox(agent=name, mark_read=True, actor=name, also_deliver=True)
+    msgs = _drain(store, name)
     if not msgs:
         return 0
 
