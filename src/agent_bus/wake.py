@@ -176,13 +176,30 @@ def fire_wake(
     except (OSError, ValueError) as e:
         return False, f"fired:ERR:{type(e).__name__}"
 
-    # write the JSON payload to stdin, then immediately close. We don't
-    # wait for the process — fire-and-forget.
-    try:
-        if proc.stdin is not None:
-            proc.stdin.write(payload)
-            proc.stdin.close()
-    except (BrokenPipeError, OSError):
-        pass
-
+    # Hand the payload over without ever waiting on the child. A wake
+    # command that does not read stdin — `notify-send`, `tmux send-keys` —
+    # fills the pipe buffer, and a plain blocking write would then stall the
+    # sender for as long as that process lives. A non-blocking write puts in
+    # what fits and drops the rest; the routing metadata is on the
+    # environment anyway, so a truncated body only costs a command that
+    # bothers to read it a longer preview.
+    _hand_over_payload(proc, payload)
     return True, "fired:OK"
+
+
+def _hand_over_payload(proc: subprocess.Popen, payload: bytes) -> None:
+    if proc.stdin is None:
+        return
+    try:
+        os.set_blocking(proc.stdin.fileno(), False)
+    except (OSError, ValueError):
+        pass
+    try:
+        proc.stdin.write(payload)
+    except (BlockingIOError, BrokenPipeError, OSError, ValueError):
+        pass  # the child is slow, gone, or not listening — not our problem
+    finally:
+        try:
+            proc.stdin.close()
+        except (BlockingIOError, BrokenPipeError, OSError, ValueError):
+            pass

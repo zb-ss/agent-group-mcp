@@ -12,6 +12,7 @@ hooks are declared, and how to tell our entries from the user's
 from __future__ import annotations
 
 import json
+import os
 import shlex
 from dataclasses import dataclass
 from enum import Enum
@@ -170,10 +171,8 @@ def load_json_object(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = read_config_text(path)
         data = json.loads(raw) if raw.strip() else {}
-    except OSError as e:
-        raise UnreadableConfigError(path, str(e)) from None
     except json.JSONDecodeError as e:
         raise UnreadableConfigError(path, f"not valid JSON ({e.msg}, line {e.lineno})") from None
     if not isinstance(data, dict):
@@ -181,6 +180,34 @@ def load_json_object(path: Path) -> dict:
     return data
 
 
-def write_json_object(path: Path, data: dict) -> None:
+def read_config_text(path: Path) -> str:
+    """A config file's text. Anything we cannot read as UTF-8 is somebody
+    else's file, not ours to rewrite."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise UnreadableConfigError(path, str(e)) from None
+    except UnicodeDecodeError as e:
+        raise UnreadableConfigError(path, f"not valid UTF-8 (byte {e.start})") from None
+
+
+def write_config_text(path: Path, text: str) -> None:
+    """Write `text` to `path` without a window where the file is empty.
+
+    These are files the user maintains: a crash or a full disk partway
+    through a plain write would truncate whatever they had. Writing beside
+    the target and renaming means the file is either the old one or the new
+    one, never half of either.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp = path.with_name(f"{path.name}.agent-bus-tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def write_json_object(path: Path, data: dict) -> None:
+    write_config_text(path, json.dumps(data, indent=2) + "\n")

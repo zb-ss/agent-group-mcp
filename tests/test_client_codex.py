@@ -231,3 +231,96 @@ def test_stop_hook_uses_the_block_decision_for_codex():
     out = clients.hook_dialect("codex").stop_output("handle your mail")
     assert json.loads(out) == {"decision": "block", "reason": "handle your mail"}
     assert clients.hook_dialect("codex").stop_output(None) == ""
+
+
+# --------------------------- surprising config files ---------------------
+
+
+def test_a_non_utf8_config_is_reported_not_crashed(tmp_path, codex):
+    """It is somebody else's file if we cannot even read it as text."""
+    repo = _repo(tmp_path)
+    (repo / ".codex").mkdir()
+    original = b'command = "caf\xe9"\n'
+    (repo / ".codex" / "config.toml").write_bytes(original)
+
+    assert codex.inspect(repo).status is WiringStatus.UNREADABLE
+    plan = init_cmd.plan_for_paths([repo], scan=False, client_ids=["codex"])[0]
+    assert plan.action is init_cmd.Action.SKIP_UNREADABLE
+    assert (repo / ".codex" / "config.toml").read_bytes() == original
+
+
+def test_one_unreadable_repo_does_not_abandon_the_others(tmp_path, capsys):
+    """A --scan --apply run must not stop partway and leave the rest unwired."""
+    from agent_bus import cli
+
+    broken = _repo(tmp_path, "broken")
+    (broken / ".codex").mkdir()
+    (broken / ".codex" / "config.toml").write_bytes(b'x = "\xe9"\n')
+    healthy = _repo(tmp_path, "healthy")
+
+    rc = cli.main(["init", "--scan", str(tmp_path), "--clients", "codex",
+                   "--apply", "--bin-path", BIN])
+    capsys.readouterr()
+    assert rc == 0
+    assert clients.wiring("codex").inspect(healthy).name == "healthy/codex"
+    assert (broken / ".codex" / "config.toml").read_bytes() == b'x = "\xe9"\n'
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "stray start above the block",
+        "duplicated whole block",
+        "end before start",
+    ],
+)
+def test_confused_markers_never_swallow_user_config(tmp_path, codex, corruption):
+    """The span between markers is only meaningful when there is exactly one
+    well-formed block; otherwise replacing it would delete what is between."""
+    from agent_bus.clients.codex import BLOCK_END, BLOCK_START
+
+    repo = _repo(tmp_path)
+    codex.apply(repo, name="repo-a/codex", bin_path=BIN)
+    config = repo / ".codex" / "config.toml"
+    theirs = '[mcp_servers.myserver]\ncommand = "mine"\n'
+    text = config.read_text()
+    if corruption == "stray start above the block":
+        text = f"{BLOCK_START}\n{theirs}{text}"
+    elif corruption == "duplicated whole block":
+        text = text + "\n" + text
+    else:
+        text = f"{BLOCK_END}\n{theirs}{text}"
+    config.write_text(text)
+
+    assert codex.inspect(repo).status is WiringStatus.UNREADABLE
+    with pytest.raises(clients.base.UnreadableConfigError):
+        codex.apply(repo, name="repo-a/codex", bin_path=BIN)
+    assert config.read_text() == text
+    if corruption != "duplicated whole block":
+        assert "myserver" in config.read_text()
+
+
+def test_a_user_table_outside_our_block_is_left_alone(tmp_path, codex):
+    """Our markers being present does not make an agent-bus table ours."""
+    from agent_bus.clients.codex import BLOCK_END, BLOCK_START
+
+    repo = _repo(tmp_path)
+    (repo / ".codex").mkdir()
+    original = (
+        '[mcp_servers.agent-bus]\ncommand = "their-own-thing"\n\n'
+        f"{BLOCK_START}\n# nothing of ours here yet\n{BLOCK_END}\n"
+    )
+    (repo / ".codex" / "config.toml").write_text(original)
+
+    state = codex.inspect(repo)
+    assert (state.status, state.can_force) == (WiringStatus.HANDWRITTEN, False)
+    with pytest.raises(clients.base.UnreadableConfigError):
+        codex.apply(repo, name="repo-a/codex", bin_path=BIN)
+    assert (repo / ".codex" / "config.toml").read_text() == original
+
+
+def test_config_writes_leave_no_half_written_file(tmp_path, codex):
+    repo = _repo(tmp_path)
+    codex.apply(repo, name="repo-a/codex", bin_path=BIN)
+    leftovers = [p.name for p in (repo / ".codex").iterdir() if "tmp" in p.name]
+    assert leftovers == []

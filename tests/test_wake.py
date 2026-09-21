@@ -324,3 +324,19 @@ def test_disabling_one_client_does_not_fall_back_to_the_repo_command(
     time.sleep(0.3)
     assert not (tmp_path / "repo").exists()
     assert _wake_rows(bus_paths) == []
+
+
+def test_a_wake_command_that_ignores_stdin_does_not_stall_the_sender(
+    bus_paths, two_agents, tmp_path
+):
+    """A big body plus a child that never reads stdin used to fill the pipe
+    buffer and block the send for the life of that process."""
+    marker = tmp_path / "started"
+    wake.save_wake_config({"beta": f'touch "{marker}"; sleep 30'})
+
+    began = time.monotonic()
+    two_agents.send_message(from_agent="alpha", to="beta", body="x" * 500_000)
+    elapsed = time.monotonic() - began
+
+    assert _wait_for(marker), "the wake command never started"
+    assert elapsed < 5, f"send_message blocked for {elapsed:.1f}s on the wake child"

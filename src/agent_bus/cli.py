@@ -31,6 +31,7 @@ from . import init_cmd
 from . import wake
 from .migrations import SchemaTooNewError
 from .paths import audit_path
+from .clients.base import UnreadableConfigError
 from .storage import BROADCAST, Storage, UnknownRecipientError
 
 NAME_COL = 18
@@ -448,13 +449,22 @@ def cmd_init(args: argparse.Namespace) -> int:
         )
         return 0
 
+    written, failed = [], []
     for p in changes:
-        init_cmd.apply_plan(p, bin_path=bin_path, storage=store)
-    sys.stdout.write(f"\nApplied to {len(changes)} repo(s).\n")
+        try:
+            init_cmd.apply_plan(p, bin_path=bin_path, storage=store)
+        except UnreadableConfigError as e:
+            # one repo's surprising config must not abandon the rest half-done
+            failed.append((p, e))
+        else:
+            written.append(p)
+    sys.stdout.write(f"\nApplied to {len(written)} repo(s).\n")
+    for plan, error in failed:
+        sys.stderr.write(f"agent-bus: skipped {plan.repo} — {error}\n")
     for client_id in client_ids:
         for limitation in clients.wiring(client_id).limitations:
             sys.stdout.write(f"note ({client_id}): {limitation}\n")
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_wake_config(args: argparse.Namespace) -> int:

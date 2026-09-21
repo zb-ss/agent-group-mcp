@@ -19,6 +19,7 @@ only thing that reads their output.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from . import base
@@ -98,9 +99,12 @@ export const AgentBus = async ({ client, $, directory }) => {
 
 
 def render_plugin(*, name: str, bin_path: str) -> str:
-    # a JSON string literal is a valid JavaScript string literal
-    return PLUGIN_TEMPLATE.replace("__BIN__", json.dumps(bin_path)).replace(
-        "__NAME__", json.dumps(name)
+    # a JSON string literal is a valid JavaScript string literal. Substitute
+    # in one pass so a value that happens to contain another placeholder
+    # cannot be rewritten by a later replacement.
+    values = {"__BIN__": json.dumps(bin_path), "__NAME__": json.dumps(name)}
+    return re.sub(
+        "|".join(re.escape(k) for k in values), lambda m: values[m.group()], PLUGIN_TEMPLATE
     )
 
 
@@ -133,7 +137,7 @@ class OpencodeWiring:
         if plugin_path.exists() and PLUGIN_MARKER not in plugin_path.read_text(
             encoding="utf-8", errors="replace"
         ):
-            return WiringState(WiringStatus.HANDWRITTEN)
+            return WiringState(WiringStatus.HANDWRITTEN)  # somebody else's plugin
         servers = config.get("mcp")
         entry = servers.get(base.SERVER_KEY) if isinstance(servers, dict) else None
         if entry is None:
@@ -161,5 +165,4 @@ class OpencodeWiring:
         config["mcp"] = servers
 
         base.write_json_object(config_path, config)
-        plugin_path.parent.mkdir(parents=True, exist_ok=True)
-        plugin_path.write_text(render_plugin(name=name, bin_path=bin_path), encoding="utf-8")
+        base.write_config_text(plugin_path, render_plugin(name=name, bin_path=bin_path))

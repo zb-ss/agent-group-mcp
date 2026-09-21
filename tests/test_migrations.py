@@ -174,3 +174,37 @@ def test_concurrent_starters_migrate_exactly_once(legacy_db, bus_paths):
             "SELECT COUNT(*) FROM agents WHERE name LIKE 'starter-%'"
         ).fetchone()[0]
     assert starters == 4
+
+
+def _open_in_subprocess(db_path: str, audit_log: str) -> None:
+    os.environ["AGENT_BUS_DB"] = db_path
+    os.environ["AGENT_BUS_AUDIT_LOG"] = audit_log
+    from agent_bus.storage import Storage
+
+    store = Storage()
+    for i in range(20):
+        store.upsert_agent(f"agent-{os.getpid()}-{i}", "/repo")
+
+
+def test_many_clients_opening_a_pre_wal_database_at_once(legacy_db, bus_paths):
+    """Converting a database to WAL takes an exclusive lock. Every client
+    restarting at once after an upgrade is exactly that moment, and it used
+    to fail outright with 'database is locked'."""
+    ctx = mp.get_context("spawn")
+    procs = [
+        ctx.Process(target=_open_in_subprocess,
+                    args=(str(legacy_db), str(bus_paths["log"])))
+        for _ in range(6)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=60)
+    assert [p.exitcode for p in procs] == [0] * 6
+
+    with sqlite3.connect(legacy_db) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        written = conn.execute(
+            "SELECT COUNT(*) FROM agents WHERE name LIKE 'agent-%'"
+        ).fetchone()[0]
+    assert written == 6 * 20

@@ -417,9 +417,16 @@ open), point them at `agent-bus hook-user-prompt --client <id>` and
 
 **Name derivation.** The repo's name is the slug of its basename:
 `~/websites/acme.dev` → `acme-dev`, `~/projects/my_thing` → `my-thing`.
-Collisions within one scan are resolved by prefixing the parent dir
+Collisions **within one scan** are resolved by prefixing the parent dir
 (`projects-foo` vs `websites-foo`), and the plan warns when a name is
 already registered for a different repo path.
+
+Two repos with the same basename wired in **separate** `init` runs are the
+gap: neither run can see the other, and the warning only appears once one
+of them has actually connected. They would then share a name, and so an
+inbox. `whoami` reports it, and `agent-bus agents` shows one name against
+the wrong path. Wire such repos in a single `--scan`, or pin one with a
+`.agent-bus-name` file.
 
 **Per-repo overrides.**
 

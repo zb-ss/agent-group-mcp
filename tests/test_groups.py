@@ -244,3 +244,52 @@ def test_group_send_audits_one_row_per_recipient(shared_repo, bus_paths):
     sends = [r for r in rows if r["op"] == "send"]
     assert sorted(r["to"] for r in sends) == ["repo-a/claude", "repo-a/codex"]
     assert {r["addressed_to"] for r in sends} == {"repo-a"}
+
+
+# --------------------------- mail left by a retired name -----------------
+
+
+def test_a_broadcast_to_a_retired_legacy_name_is_not_lost(storage):
+    """Regression: `init` renaming `repo-a` to `repo-a/claude` stranded any
+    fan-out copy addressed to the old name. It stayed unread forever and
+    pending_count reported zero, so nothing showed the loss."""
+    storage.upsert_agent("repo-a", REPO_A)
+    storage.upsert_agent("repo-b", REPO_B)
+    storage.send_message(from_agent="repo-b", to="*", body="broadcast before upgrade")
+
+    storage.retire_agent("repo-a", successor="repo-a/claude")
+    storage.upsert_agent("repo-a/claude", REPO_A)
+
+    assert storage.pending_count(agent="repo-a/claude") == 1
+    assert [m.body for m in storage.read_inbox(agent="repo-a/claude")] == [
+        "broadcast before upgrade"
+    ]
+
+
+def test_the_same_fan_out_is_never_delivered_twice(storage):
+    """A send that reached both the bare name and its members leaves the
+    member a copy of its own; it must not also take the bare one."""
+    storage.upsert_agent("repo-a", REPO_A)            # legacy agent, still wired
+    storage.upsert_agent("repo-a/claude", REPO_A)     # and a client beside it
+    storage.upsert_agent("repo-b", REPO_B)
+
+    sent = storage.send_message(from_agent="repo-b", to="repo-a", body="one message")
+    assert sorted(sent["recipients"]) == ["repo-a", "repo-a/claude"]
+
+    storage.forget_agent("repo-a")  # the legacy agent goes away, its copy remains
+    assert [m.body for m in storage.read_inbox(agent="repo-a/claude")] == ["one message"]
+    assert storage.read_inbox(agent="repo-a/claude") == []
+
+
+def test_only_one_member_takes_a_retired_name_fan_out(three_agents, storage):
+    storage.upsert_agent("repo-a", REPO_A)
+    storage.upsert_agent("repo-b", REPO_B)
+    storage.send_message(from_agent="repo-b", to="*", body="for whoever is there")
+    storage.retire_agent("repo-a", successor="repo-a/claude")
+    storage.upsert_agent("repo-a/claude", REPO_A)
+    storage.upsert_agent("repo-a/codex", REPO_A)
+
+    first = storage.read_inbox(agent="repo-a/codex")
+    second = storage.read_inbox(agent="repo-a/claude")
+    assert [m.body for m in first] == ["for whoever is there"]
+    assert second == []

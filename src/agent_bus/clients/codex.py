@@ -77,12 +77,7 @@ def _server_block(*, name: str, repo: Path, bin_path: str) -> str:
 
 
 def _read_text(path: Path) -> str:
-    if not path.exists():
-        return ""
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError as e:
-        raise UnreadableConfigError(path, str(e)) from None
+    return base.read_config_text(path) if path.exists() else ""
 
 
 def _parse(path: Path, text: str) -> dict:
@@ -100,6 +95,35 @@ def _server_table(config: dict) -> dict | None:
 
 def _has_block(text: str) -> bool:
     return BLOCK_START in text and BLOCK_END in text
+
+
+def _check_markers(path: Path, text: str) -> None:
+    """Our block must appear exactly once, opened before it is closed.
+
+    Anything else — a stray marker from a hand edit, a merge, a copy-paste
+    or an interrupted write — makes "the span between the markers" mean
+    something we cannot guess, and replacing it would delete whatever the
+    user put in between.
+    """
+    starts, ends = text.count(BLOCK_START), text.count(BLOCK_END)
+    if (starts, ends) == (0, 0):
+        return
+    if starts != 1 or ends != 1 or text.index(BLOCK_START) > text.index(BLOCK_END):
+        raise UnreadableConfigError(
+            path,
+            f"its agent-bus markers are not a single well-formed block "
+            f"({starts} start, {ends} end). Tidy them up by hand, or delete "
+            f"both marker lines and the table between them, then re-run init",
+        )
+
+
+def _without_block(text: str) -> str:
+    """`text` with our managed span removed. Assumes `_check_markers` passed."""
+    if not _has_block(text):
+        return text
+    before, _, rest = text.partition(BLOCK_START)
+    _, _, after = rest.partition(BLOCK_END)
+    return before + after.removeprefix("\n")
 
 
 def _splice(text: str, block: str) -> str:
@@ -127,7 +151,11 @@ class CodexWiring:
         config_path, hooks_path = self.files(repo)
         try:
             text = _read_text(config_path)
+            _check_markers(config_path, text)
             table = _server_table(_parse(config_path, text))
+            # a table of ours lives inside our markers; one that survives
+            # their removal is the user's, even if our block is there too
+            theirs = _server_table(_parse(config_path, _without_block(text)))
             base.load_json_object(hooks_path)
         except UnreadableConfigError:
             return WiringState(WiringStatus.UNREADABLE)
@@ -135,7 +163,7 @@ class CodexWiring:
             return WiringState(WiringStatus.ABSENT)
         env = table.get("env")
         name = env.get("AGENT_BUS_NAME") if isinstance(env, dict) else None
-        if _has_block(text):
+        if _has_block(text) and theirs is None:
             return WiringState(WiringStatus.MANAGED, name)
         return WiringState(WiringStatus.HANDWRITTEN, name, can_force=False)
 
@@ -146,14 +174,14 @@ class CodexWiring:
         hooks = base.load_json_object(hooks_path)
         self._merge_hooks(hooks, bin_path=bin_path)
 
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(new_config, encoding="utf-8")
+        base.write_config_text(config_path, new_config)
         base.write_json_object(hooks_path, hooks)
 
     @staticmethod
     def _new_config(path: Path, *, name: str, repo: Path, bin_path: str) -> str:
         text = _read_text(path)
-        if _server_table(_parse(path, text)) is not None and not _has_block(text):
+        _check_markers(path, text)
+        if _server_table(_parse(path, _without_block(text))) is not None:
             raise UnreadableConfigError(
                 path, f"has its own [mcp_servers.{base.SERVER_KEY}] table; remove it "
                 "or set AGENT_BUS_NAME there yourself"

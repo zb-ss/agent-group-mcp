@@ -227,3 +227,17 @@ def test_plugin_ignores_an_idle_subagent_and_an_empty_inbox(tmp_path):
     empty = _drive_plugin(tmp_path, replies={}, session={"id": "s1"})
     assert empty["prompts"] == []
     assert empty["systems"] == [["base prompt"]] * 3
+
+
+def test_a_bin_path_containing_a_placeholder_cannot_corrupt_the_plugin(tmp_path):
+    """The template is filled in one pass, so a value that happens to look
+    like another placeholder is not rewritten by a later substitution."""
+    plugin = clients.opencode.render_plugin(
+        name="repo-a/opencode", bin_path="/usr/__NAME__/agent-bus"
+    )
+    (tmp_path / "p.mjs").write_text(plugin)
+    done = subprocess.run(["node", "--check", str(tmp_path / "p.mjs")],
+                          capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert 'const BIN = "/usr/__NAME__/agent-bus";' in plugin
+    assert 'const NAME = "repo-a/opencode";' in plugin

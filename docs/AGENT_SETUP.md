@@ -286,6 +286,7 @@ up first if you want it.
 | `agy` shows no agent-bus tools | Workspace not trusted yet | Open the folder in `agy` and trust it |
 | A message was "sent" but never arrived | It went to a name nobody holds | Check `agent-bus agents`; unknown names are now an error, so re-send |
 | Two sessions of one client share an inbox | Both resolve to the same name | Start the second with `AGENT_BUS_INSTANCE=2` |
+| Two different repos share an inbox | Same directory basename, wired in separate runs | Pin one with `.agent-bus-name`, or wire both in one `--scan` |
 | `upgrade agent-bus` on any command | The database was written by a newer version | Upgrade the package on this machine |
 | Every turn is held open quoting an error | An unusable binary — only possible with hand-written hooks | Re-run `init`, which appends `\|\| true` so a broken binary is silent |
 

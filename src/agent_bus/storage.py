@@ -72,8 +72,14 @@ def _inbox_predicate(agent_expr: str, group_expr: str) -> str:
     Its own rows, plus rows addressed to its bare group name while no agent
     is registered under exactly that name. Those are mail for a repo from
     before it had per-client identities, or written by an older agent-bus
-    that does not expand groups; the first member to read takes them. Rows
-    from a fan-out are excluded — every member already has its own copy.
+    that does not expand groups; the first member to read takes them.
+
+    A fan-out row addressed to the bare name counts too — a broadcast that
+    reached a repo back when one agent answered for it left a single copy,
+    and nobody else holds one. What must not happen is taking such a row
+    when this agent already has its own copy of the same fan-out, which is
+    the case when the send expanded to both the bare name and its members;
+    that would deliver one message twice.
 
     Both arguments are SQL expressions chosen by this module, never input.
     """
@@ -83,10 +89,14 @@ def _inbox_predicate(agent_expr: str, group_expr: str) -> str:
             OR (
                 to_agent = {group_expr}
                 AND {group_expr} != {agent_expr}
-                AND fanout_id IS NULL
                 AND NOT EXISTS (
                     SELECT 1 FROM agents AS namesake
                     WHERE namesake.name = {group_expr}
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM messages AS sibling
+                    WHERE sibling.fanout_id = messages.fanout_id
+                      AND sibling.to_agent = {agent_expr}
                 )
             )
         )
@@ -221,10 +231,20 @@ class Storage:
         conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
         try:
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
+            # busy_timeout first: converting a database to WAL needs an
+            # exclusive lock, and without a timeout already in force that
+            # conversion fails outright the moment anyone else holds the
+            # file. Several clients starting at once on a database written
+            # by an older version is exactly when that happens.
+            conn.execute("PRAGMA busy_timeout=30000")
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:
+                # someone else is mid-conversion; the mode is a property of
+                # the file, so whoever wins sets it for all of us
+                pass
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=30000")
             yield conn
         finally:
             conn.close()
@@ -340,18 +360,25 @@ class Storage:
 
         Unread mail is never orphaned. When `successor` lives in the group
         called `name` (the usual case: `repo-a` becoming `repo-a/claude`),
-        nothing is rewritten — mail for the bare name goes to the first
-        member of that group to read. Under any other rename the unread
-        rows are re-addressed to `successor`. Returns how many were.
+        nothing is rewritten — the bare name is still that repo's address,
+        so its mail goes to the first member of the group to read. Under
+        any other rename the unread rows are re-addressed to `successor`.
+        Returns how many were moved.
         """
         self.init_schema()
         if name == successor:
             return 0
+        kept_for_group = _inbox_params(successor)["group"] == name
         moved = 0
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                if _inbox_params(successor)["group"] != name:
+                waiting = conn.execute(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE to_agent = ? AND read_at IS NULL",
+                    (name,),
+                ).fetchone()[0]
+                if not kept_for_group:
                     moved = conn.execute(
                         "UPDATE messages SET to_agent = ? "
                         "WHERE to_agent = ? AND read_at IS NULL",
@@ -365,6 +392,12 @@ class Storage:
                 conn.execute("ROLLBACK")
                 raise
         if retired or moved:
+            what_happened = (
+                f"{waiting} unread message(s) left for {name!r} to be picked up "
+                f"by the first agent in that repo to read"
+                if kept_for_group
+                else f"{moved} unread message(s) re-addressed"
+            )
             audit.append_many([{
                 "ts": _utc_now_iso(),
                 "op": "retire",
@@ -373,10 +406,7 @@ class Storage:
                 "from": name,
                 "to": successor,
                 "thread_id": None,
-                "body_preview": (
-                    f"{name!r} is now wired as {successor!r}; "
-                    f"{moved} unread message(s) re-addressed"
-                ),
+                "body_preview": f"{name!r} is now wired as {successor!r}; {what_happened}",
                 "body_sha256": None,
             }])
         return moved

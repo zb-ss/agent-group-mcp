@@ -66,6 +66,24 @@ its own inbox, and one message can reach every agent in a repository.
 
 ### Fixed
 
+- **Mail addressed to a renamed agent is no longer stranded.** A broadcast
+  or repository-wide message that reached an agent under its old name
+  stayed unread forever once `init` renamed it, and the unread count
+  reported zero. Any agent in that repository now picks it up, and never
+  twice for one message.
+- **Several clients opening a pre-0.5 database at once no longer fail**
+  with `database is locked`. Converting a database to WAL takes an
+  exclusive lock, and the busy timeout was being set after that attempt —
+  so the first upgrade, with every client restarting, was the likeliest
+  moment to hit it.
+- `init` no longer crashes on a config file it cannot decode, no longer
+  abandons the remaining repositories when one repository's config is
+  surprising, and refuses to touch a Codex config whose managed markers
+  are duplicated or out of order rather than deleting what sits between
+  them. Config files are written through a temporary file and renamed, so
+  an interrupted write cannot truncate one.
+- A wake command that does not read its stdin no longer stalls the send
+  that triggered it.
 - `agent-bus send --name X` and `agent-bus chat --name X` no longer move
   agent `X` to the caller's working directory. Only the identity described
   by `AGENT_BUS_NAME` / `AGENT_BUS_REPO` is authoritative.
