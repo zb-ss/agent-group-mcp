@@ -29,7 +29,7 @@ from . import init_cmd
 from . import wake
 from .migrations import SchemaTooNewError
 from .paths import audit_path
-from .storage import BROADCAST, Storage
+from .storage import BROADCAST, Storage, UnknownRecipientError
 
 NAME_COL = 18
 TARGET_COL = 18
@@ -68,27 +68,28 @@ def cmd_send(args: argparse.Namespace) -> int:
 
     target = args.to or BROADCAST
     body = args.body
-    result = store.send_message(
-        from_agent=identity,
-        to=target,
-        body=body,
-        thread_id=args.thread,
-        actor=identity,
-    )
+    try:
+        result = store.send_message(
+            from_agent=identity,
+            to=target,
+            body=body,
+            thread_id=args.thread,
+            actor=identity,
+        )
+    except UnknownRecipientError as e:
+        sys.stderr.write(f"agent-bus: {e}\n")
+        return 1
     if args.json:
         sys.stdout.write(json.dumps(result) + "\n")
         return 0
 
     sent_at = result.get("sent_at", "")
     thread = result.get("thread_id")
-    if "message_ids" in result:
-        recipients = result.get("recipients", [])
-        if not recipients:
-            sys.stdout.write("(no peers connected — message dropped)\n")
-            return 0
-        target_label = f"all ({len(recipients)})"
-    else:
-        target_label = target
+    recipients = result.get("recipients", [])
+    if not recipients:
+        sys.stdout.write("(nobody to deliver to — message dropped)\n")
+        return 0
+    target_label = fmt.fan_out_label(target, result["kind"], len(recipients))
 
     _emit(
         fmt.fragments_for_message(

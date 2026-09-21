@@ -132,6 +132,41 @@ def test_cli_send_then_inbox(bus_paths):
     assert msgs[0]["from"] == "human"
 
 
+def test_cli_send_to_a_repo_reaches_each_client_in_it(bus_paths):
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+    from agent_bus.storage import Storage
+    s = Storage()
+    s.upsert_agent("repo-a/claude", "/code/repo-a")
+    s.upsert_agent("repo-a/codex", "/code/repo-a")
+
+    r = _run_cli(["send", "--name", "human", "--to", "repo-a", "hi both"],
+                 env_extra=env)
+    assert r.returncode == 0, r.stderr
+    assert "repo-a (2)" in r.stdout
+
+    for member in ("repo-a/claude", "repo-a/codex"):
+        r = _run_cli(["inbox", "--name", member, "--json"], env_extra=env)
+        assert [m["body"] for m in json.loads(r.stdout)] == ["hi both"]
+
+
+def test_cli_send_to_unknown_recipient_fails_cleanly(bus_paths):
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+    from agent_bus.storage import Storage
+    Storage().upsert_agent("repo-a/claude", "/code/repo-a")
+
+    r = _run_cli(["send", "--name", "human", "--to", "repo-a/cluade", "hi"],
+                 env_extra=env)
+    assert r.returncode == 1
+    assert "repo-a/claude" in r.stderr
+    assert "Traceback" not in r.stderr
+
+
 def test_cli_forget_removes_from_roster(bus_paths):
     env = {
         "AGENT_BUS_DB": str(bus_paths["db"]),

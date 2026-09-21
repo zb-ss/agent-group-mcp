@@ -193,17 +193,15 @@ class ChatTUI:
             return
         ts = result.get("sent_at", "")
         thread = result.get("thread_id")
-        is_broadcast = "message_ids" in result
-        if is_broadcast:
-            recipients = result.get("recipients", [])
-            if not recipients:
-                self._system("(no peers connected — message dropped)")
-                return
-            target_label = f"all ({len(recipients)})"
-            target_class = "broadcast"
-        else:
-            target_label = to
-            target_class = None  # use default (safe_class(to))
+        recipients = result.get("recipients", [])
+        if not recipients:
+            self._system("(nobody to deliver to — message dropped)")
+            return
+        kind = result["kind"]
+        target_label = fmt.fan_out_label(to, kind, len(recipients))
+        # a broadcast gets the neutral hue; anything else keeps the color
+        # of the name that was addressed, not of the decorated label
+        target_class = "broadcast" if kind == "broadcast" else fmt.safe_class(to)
 
         for line in fmt.fragments_for_message_block(
             sent_at=ts,
