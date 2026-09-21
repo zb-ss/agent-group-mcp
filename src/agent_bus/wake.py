@@ -10,12 +10,13 @@ The wake command is whatever the user's setup makes feasible:
   - screen:         screen -S agent -X stuff "check inbox\\n"
   - anything else:  webhook curl, custom script, ntfy push…
 
-Design constraints (see [[agent-bus-client-neutral]]):
+Design constraints:
   - Generic MCP, no Claude-Code-only features. The wake fires from the
     sender's MCP server process (or from `agent-bus send` in a shell)
     regardless of which client the *recipient* uses.
   - Opt-in per agent. No wake.json entry → no command runs → existing
-    behaviour unchanged.
+    behaviour unchanged. An entry keyed by a bare repo name covers every
+    agent in that repo that has no entry of its own.
   - Latency-sensitive: subprocess.Popen returns immediately, so the
     sender never blocks on the recipient's wake.
 
