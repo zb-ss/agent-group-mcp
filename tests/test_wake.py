@@ -223,3 +223,104 @@ def test_recipient_without_config_skipped_but_others_fire(
     ]
     wake_rows = [r for r in rows if r["op"] == "wake"]
     assert [r["to"] for r in wake_rows] == ["beta"]
+
+
+# --------------------------- groups -------------------------------------
+
+
+def _wake_rows(bus_paths) -> list[dict]:
+    return [
+        row
+        for row in (
+            json.loads(line)
+            for line in bus_paths["log"].read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if row["op"] == "wake"
+    ]
+
+
+def _make_older(storage, name: str) -> None:
+    """Seen an hour ago: less recent than its repo-mate, but nowhere near
+    idle enough for fan-out to skip it."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    an_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+    with sqlite3.connect(storage.path) as conn:
+        conn.execute(
+            "UPDATE agents SET last_seen = ? WHERE name = ?", (an_hour_ago, name)
+        )
+
+
+@pytest.fixture
+def shared_repo(storage):
+    storage.upsert_agent("repo-a/claude", "/code/repo-a")
+    storage.upsert_agent("repo-a/codex", "/code/repo-a")
+    storage.ensure_agent("human", "/home")
+    return storage
+
+
+def test_group_send_wakes_one_agent_per_repo(bus_paths, shared_repo, tmp_path):
+    """Waking every client of a repo would start four turns for one message;
+    the most recently seen client is the one most likely to be listening."""
+    wake.save_wake_config({
+        "repo-a/claude": f'touch "{tmp_path}/claude"',
+        "repo-a/codex": f'touch "{tmp_path}/codex"',
+    })
+    _make_older(shared_repo, "repo-a/claude")
+
+    shared_repo.send_message(from_agent="human", to="repo-a", body="ring")
+    assert _wait_for(tmp_path / "codex")
+    assert [r["to"] for r in _wake_rows(bus_paths)] == ["repo-a/codex"]
+    assert not (tmp_path / "claude").exists()
+
+
+def test_group_wake_falls_to_a_client_that_has_a_command(
+    bus_paths, shared_repo, tmp_path
+):
+    wake.save_wake_config({"repo-a/claude": f'touch "{tmp_path}/claude"'})
+    _make_older(shared_repo, "repo-a/claude")  # codex is fresher but unwired
+
+    shared_repo.send_message(from_agent="human", to="repo-a", body="ring")
+    assert _wait_for(tmp_path / "claude")
+    assert [r["to"] for r in _wake_rows(bus_paths)] == ["repo-a/claude"]
+
+
+def test_wake_command_keyed_by_repo_serves_every_client_in_it(
+    bus_paths, shared_repo, tmp_path
+):
+    """A wake.json written before the repo had clients is keyed by the bare
+    repo name; it keeps working and learns which client it is waking."""
+    out = tmp_path / "who"
+    wake.save_wake_config({"repo-a": f'printf "%s" "$AGENT_BUS_TO" > "{out}"'})
+
+    shared_repo.send_message(from_agent="human", to="repo-a/claude", body="ring")
+    assert _wait_for(out)
+    time.sleep(0.1)
+    assert out.read_text() == "repo-a/claude"
+
+
+def test_own_wake_command_wins_over_the_repo_one(bus_paths, shared_repo, tmp_path):
+    wake.save_wake_config({
+        "repo-a": f'touch "{tmp_path}/repo"',
+        "repo-a/claude": f'touch "{tmp_path}/own"',
+    })
+    shared_repo.send_message(from_agent="human", to="repo-a/claude", body="ring")
+    assert _wait_for(tmp_path / "own")
+    assert not (tmp_path / "repo").exists()
+
+
+def test_disabling_one_client_does_not_fall_back_to_the_repo_command(
+    bus_paths, shared_repo, tmp_path
+):
+    wake.save_wake_config({
+        "repo-a": f'touch "{tmp_path}/repo"',
+        "repo-a/claude": False,
+    })
+    shared_repo.send_message(from_agent="human", to="repo-a/claude", body="ring")
+    time.sleep(0.3)
+    assert not (tmp_path / "repo").exists()
+    assert _wake_rows(bus_paths) == []

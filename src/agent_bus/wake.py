@@ -92,6 +92,23 @@ def _resolve_command(entry: Any) -> str | None:
     return None
 
 
+def wake_command(
+    config: dict[str, Any], agent: str, group: str | None = None
+) -> tuple[str | None, str]:
+    """Find the command that wakes `agent`: its own entry, else its repo's.
+
+    Returns ``(command, status)``; the command is None when the status is
+    ``"no-config"`` or ``"disabled"``. An agent's own entry always wins, so
+    disabling one client does not fall back to the repo-wide command.
+    """
+    for key in (agent, group):
+        if key is None or key not in config:
+            continue
+        cmd = _resolve_command(config[key])
+        return (cmd, "configured") if cmd else (None, "disabled")
+    return None, "no-config"
+
+
 def fire_wake(
     agent: str,
     *,
@@ -101,11 +118,12 @@ def fire_wake(
     thread_id: str,
     message_id: str,
     config: dict[str, Any] | None = None,
+    group: str | None = None,
 ) -> tuple[bool, str]:
-    """Look up `agent` in wake.json and run the configured command.
+    """Look up `agent` (then its `group`) in wake.json and run the command.
 
     Returns ``(fired, status)``:
-      - ``(False, "no-config")``  : agent has no entry in wake.json
+      - ``(False, "no-config")``  : neither the agent nor its repo has an entry
       - ``(False, "disabled")``   : entry is explicitly null/false/empty
       - ``(True,  "fired:OK")``   : subprocess launched
       - ``(False, "fired:ERR…")`` : Popen raised before launch
@@ -118,11 +136,9 @@ def fire_wake(
     on purpose so a slow or noisy wake never floods the MCP transport).
     """
     cfg = config if config is not None else load_wake_config()
-    if agent not in cfg:
-        return False, "no-config"
-    cmd = _resolve_command(cfg[agent])
+    cmd, status = wake_command(cfg, agent, group)
     if cmd is None:
-        return False, "disabled"
+        return False, status
 
     env = os.environ.copy()
     env.update(

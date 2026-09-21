@@ -27,7 +27,7 @@ import difflib
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
@@ -134,6 +134,10 @@ class Message:
             return KIND_BROADCAST
         return KIND_GROUP
 
+    def is_claimed_by_other(self, reader: str) -> bool:
+        """True when a repo-mate of `reader` already took this message on."""
+        return self.claimed_by is not None and self.claimed_by != reader
+
     def to_dict(self) -> dict:
         return {
             "message_id": self.message_id,
@@ -141,6 +145,7 @@ class Message:
             "to": self.to_agent,
             "addressed_to": self.addressed_to,
             "kind": self.kind,
+            "claimed_by": self.claimed_by,
             "body": self.body,
             "thread_id": self.thread_id,
             "sent_at": self.sent_at,
@@ -189,8 +194,12 @@ class _Delivery:
 
     kind: str
     thread_id: str | None
-    recipients: list[str]
+    recipients: list[AgentRow]
     message_ids: list[str]
+
+    @property
+    def names(self) -> list[str]:
+        return [r.name for r in self.recipients]
 
 
 class Storage:
@@ -432,7 +441,7 @@ class Storage:
             "to": to,
             "kind": delivery.kind,
             "message_ids": delivery.message_ids,
-            "recipients": delivery.recipients,
+            "recipients": delivery.names,
             "thread_id": delivery.thread_id,
             "sent_at": sent_at,
         }
@@ -454,16 +463,11 @@ class Storage:
                 "body_preview": audit.body_preview(body),
                 "body_sha256": audit.body_sha256(body),
             }
-            for mid, name in zip(delivery.message_ids, delivery.recipients)
+            for mid, name in zip(delivery.message_ids, delivery.names)
         )
 
         self._fire_wakes(
-            recipients=delivery.recipients,
-            message_ids=delivery.message_ids,
-            from_agent=from_agent,
-            actor_name=actor_name,
-            body=body,
-            thread_id=delivery.thread_id,
+            delivery, from_agent=from_agent, actor_name=actor_name, body=body
         )
         return result
 
@@ -502,7 +506,7 @@ class Storage:
         return _Delivery(
             kind=kind,
             thread_id=thread,
-            recipients=[r.name for r in recipients],
+            recipients=recipients,
             message_ids=message_ids,
         )
 
@@ -514,81 +518,136 @@ class Storage:
         limit: int = 50,
         actor: str | None = None,
         also_deliver: bool = False,
+        actionable_only: bool = False,
     ) -> list[Message]:
         """Return unread messages for `agent`, oldest first.
 
-        Writes one op="read" audit row per delivered message. If
-        `also_deliver` is True (hook callers set this), also writes a
-        twin op="deliver" row so the audit trail shows the hook path.
+        Reading claims: the first agent of a repo to read a group or
+        broadcast message becomes its `claimed_by`, for every copy in that
+        repo. `actionable_only=True` (the Stop hook) skips copies a repo-mate
+        already claimed and leaves them unread for the next full read.
+
+        Writes one op="read" audit row per delivered message, an op="claim"
+        row when a claim took a message off repo-mates' hands, and — if
+        `also_deliver` is True (hook callers set this) — a twin op="deliver"
+        row so the audit trail shows the hook path.
 
         When `mark_read=False`, returns the next batch of unread messages
-        without flipping read_at — useful for previews and tests.
+        without flipping read_at or claiming — useful for previews and tests.
         """
         if limit <= 0:
             return []
         self.init_schema()
         now = _utc_now_iso()
-        actor_name = actor or agent
+        params = _inbox_params(agent)
+        contested: set[str] = set()
 
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                rows = conn.execute(
-                    f"""
-                    SELECT {MESSAGE_COLUMNS}
-                    FROM messages
-                    WHERE {INBOX_PREDICATE}
-                    ORDER BY sent_at ASC, message_id ASC
-                    LIMIT :limit
-                    """,
-                    {**_inbox_params(agent), "limit": limit},
-                ).fetchall()
-
-                ids = [r["message_id"] for r in rows]
-                if ids and mark_read:
-                    placeholders = ",".join("?" * len(ids))
-                    conn.execute(
-                        f"UPDATE messages SET read_at = ?, "
-                        f"delivered_at = COALESCE(delivered_at, ?) "
-                        f"WHERE message_id IN ({placeholders})",
-                        (now, now, *ids),
-                    )
+                rows = self._select_unread(conn, params, limit, actionable_only)
+                if rows and mark_read:
+                    contested = self._claim(conn, params, rows)
+                    rows = self._mark_read(conn, rows, now)
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
 
         messages = [Message.from_row(r) for r in rows]
-        if mark_read:
-            messages = [
-                replace(m, read_at=now, delivered_at=m.delivered_at or now)
-                for m in messages
-            ]
+        self._audit_reads(
+            messages, actor=actor or agent, ts=now,
+            also_deliver=also_deliver, contested=contested,
+        )
+        return messages
 
+    @staticmethod
+    def _select_unread(
+        conn: sqlite3.Connection, params: dict[str, str], limit: int,
+        actionable_only: bool,
+    ) -> list[sqlite3.Row]:
+        mine_to_act_on = (
+            "AND (fanout_id IS NULL OR claimed_by IS NULL OR claimed_by = :agent)"
+            if actionable_only else ""
+        )
+        return conn.execute(
+            f"""
+            SELECT {MESSAGE_COLUMNS}
+            FROM messages
+            WHERE {INBOX_PREDICATE} {mine_to_act_on}
+            ORDER BY sent_at ASC, message_id ASC
+            LIMIT :limit
+            """,
+            {**params, "limit": limit},
+        ).fetchall()
+
+    @staticmethod
+    def _claim(
+        conn: sqlite3.Connection, params: dict[str, str], rows: list[sqlite3.Row]
+    ) -> set[str]:
+        """Claim the still-unclaimed fan-outs among `rows` for this agent's
+        whole group. Returns the fanout_ids where that mattered, i.e. where
+        a repo-mate holds a copy too."""
+        unclaimed = [
+            r["fanout_id"] for r in rows
+            if r["fanout_id"] is not None and r["claimed_by"] is None
+        ]
+        if not unclaimed:
+            return set()
+        placeholders = ",".join("?" * len(unclaimed))
+        conn.execute(
+            f"UPDATE messages SET claimed_by = ? WHERE claimed_by IS NULL "
+            f"AND to_group = ? AND fanout_id IN ({placeholders})",
+            (params["agent"], params["group"], *unclaimed),
+        )
+        shared = conn.execute(
+            f"SELECT DISTINCT fanout_id FROM messages WHERE to_group = ? "
+            f"AND to_agent != ? AND fanout_id IN ({placeholders})",
+            (params["group"], params["agent"], *unclaimed),
+        ).fetchall()
+        return {r["fanout_id"] for r in shared}
+
+    @staticmethod
+    def _mark_read(
+        conn: sqlite3.Connection, rows: list[sqlite3.Row], now: str
+    ) -> list[sqlite3.Row]:
+        ids = [r["message_id"] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(
+            f"UPDATE messages SET read_at = ?, "
+            f"delivered_at = COALESCE(delivered_at, ?) "
+            f"WHERE message_id IN ({placeholders})",
+            (now, now, *ids),
+        )
+        return conn.execute(
+            f"SELECT {MESSAGE_COLUMNS} FROM messages "
+            f"WHERE message_id IN ({placeholders}) "
+            f"ORDER BY sent_at ASC, message_id ASC",
+            ids,
+        ).fetchall()
+
+    @staticmethod
+    def _audit_reads(
+        messages: list[Message], *, actor: str, ts: str,
+        also_deliver: bool, contested: set[str],
+    ) -> None:
         audit_rows: list[dict] = []
         for m in messages:
-            audit_rows.append(
-                {
-                    "ts": now,
-                    "op": "read",
-                    "actor": actor_name,
-                    "message_id": m.message_id,
-                    "from": m.from_agent,
-                    "to": m.to_agent,
-                    "thread_id": m.thread_id,
-                    "body_preview": audit.body_preview(m.body),
-                    "body_sha256": audit.body_sha256(m.body),
-                }
-            )
+            ops = ["read"]
             if also_deliver:
+                ops.append("deliver")
+            if m.fanout_id in contested:
+                ops.append("claim")
+            for op in ops:
                 audit_rows.append(
                     {
-                        "ts": now,
-                        "op": "deliver",
-                        "actor": actor_name,
+                        "ts": ts,
+                        "op": op,
+                        "actor": actor,
                         "message_id": m.message_id,
                         "from": m.from_agent,
                         "to": m.to_agent,
+                        "addressed_to": m.addressed_to,
                         "thread_id": m.thread_id,
                         "body_preview": audit.body_preview(m.body),
                         "body_sha256": audit.body_sha256(m.body),
@@ -596,8 +655,6 @@ class Storage:
                 )
         if audit_rows:
             audit.append_many(audit_rows)
-
-        return messages
 
     def read_thread(self, *, thread_id: str, limit: int = 100) -> list[Message]:
         if limit <= 0:
@@ -640,17 +697,37 @@ class Storage:
         msgs.reverse()  # oldest first for display
         return msgs
 
+    @staticmethod
+    def _agents_to_wake(
+        delivery: _Delivery, config: dict
+    ) -> list[tuple[str, AgentRow]]:
+        """(message_id, agent) pairs worth waking for this send.
+
+        A direct message wakes its addressee. A fan-out wakes at most one
+        agent per repo — the most recently seen one that has a wake command
+        — because whoever wakes will claim the message, and waking its
+        repo-mates too would start a turn in each of them for nothing.
+        """
+        pairs = list(zip(delivery.message_ids, delivery.recipients))
+        if delivery.kind == KIND_DIRECT:
+            return pairs
+
+        chosen: dict[str, tuple[str, AgentRow]] = {}
+        for mid, agent in sorted(pairs, key=lambda p: p[1].last_seen, reverse=True):
+            command, _status = wake.wake_command(config, agent.name, agent.group)
+            if command is not None and agent.group not in chosen:
+                chosen[agent.group] = (mid, agent)
+        return sorted(chosen.values(), key=lambda p: p[1].name)
+
     def _fire_wakes(
         self,
+        delivery: _Delivery,
         *,
-        recipients: list[str],
-        message_ids: list[str],
         from_agent: str,
         actor_name: str,
         body: str,
-        thread_id: str,
     ) -> None:
-        """Run each recipient's configured wake command. Fire-and-forget.
+        """Run the configured wake commands for this send. Fire-and-forget.
 
         Wake config is loaded once per send (cheap: file is ~hundreds of
         bytes typically) so per-call edits to wake.json take effect on
@@ -668,16 +745,17 @@ class Storage:
             return
 
         wake_rows: list[dict] = []
-        for mid, recipient in zip(message_ids, recipients):
+        for mid, agent in self._agents_to_wake(delivery, cfg):
             try:
                 fired, status = wake.fire_wake(
-                    recipient,
+                    agent.name,
                     from_agent=from_agent,
-                    to_agent=recipient,
+                    to_agent=agent.name,
                     body=body,
-                    thread_id=thread_id,
+                    thread_id=delivery.thread_id,
                     message_id=mid,
                     config=cfg,
+                    group=agent.group,
                 )
             except Exception as e:
                 fired, status = False, f"fired:ERR:{type(e).__name__}"
@@ -689,8 +767,8 @@ class Storage:
                         "actor": actor_name,
                         "message_id": mid,
                         "from": from_agent,
-                        "to": recipient,
-                        "thread_id": thread_id,
+                        "to": agent.name,
+                        "thread_id": delivery.thread_id,
                         "body_preview": audit.body_preview(body),
                         "body_sha256": audit.body_sha256(body),
                         "wake_status": status,

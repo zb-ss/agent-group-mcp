@@ -13,6 +13,7 @@ import os
 import sys
 from typing import Iterable, TextIO
 
+from .identity import KIND_BROADCAST, KIND_GROUP
 from .storage import Message, Storage
 
 
@@ -40,19 +41,59 @@ def _drain_stdin(stdin: TextIO) -> None:
         pass
 
 
+GROUP_LEGEND = (
+    "(A message to everyone in a repo is handled by the first agent there "
+    "to see it. You saw these first, so they are yours.)"
+)
+FYI_HEADER = (
+    "For your information only — a repo-mate already has these; act only "
+    "if one concerns your own work:"
+)
+
+
+def _audience(m: Message) -> str:
+    if m.kind == KIND_GROUP:
+        return f" to everyone in {m.addressed_to}"
+    if m.kind == KIND_BROADCAST:
+        return " to everyone on the bus"
+    return ""
+
+
 def _format_message(m: Message) -> str:
-    return f"- from {m.from_agent} at {m.sent_at} (thread {m.thread_id}): {m.body}"
+    return (
+        f"- from {m.from_agent}{_audience(m)} at {m.sent_at} "
+        f"(thread {m.thread_id}): {m.body}"
+    )
 
 
-def _format_messages(msgs: Iterable[Message]) -> str:
-    return "\n".join(_format_message(m) for m in msgs)
+def _format_messages(msgs: Iterable[Message], reader: str) -> str:
+    """Messages the reader must handle first, then the ones a repo-mate
+    already claimed."""
+    mine: list[Message] = []
+    taken: list[Message] = []
+    for m in msgs:
+        (taken if m.is_claimed_by_other(reader) else mine).append(m)
+
+    lines = [_format_message(m) for m in mine]
+    if any(m.kind == KIND_GROUP for m in mine):
+        lines.append(GROUP_LEGEND)
+    if taken:
+        lines.append(FYI_HEADER)
+        lines.extend(
+            f"{_format_message(m)} [already picked up by {m.claimed_by}]"
+            for m in taken
+        )
+    return "\n".join(lines)
 
 
-def _drain(store: Storage, name: str) -> list[Message]:
+def _drain(store: Storage, name: str, *, actionable_only: bool = False) -> list[Message]:
     # a hook firing is a sign of life: some clients never call an MCP tool
     # between turns, and fan-out skips agents that look long gone
     store.touch_agent(name)
-    return store.read_inbox(agent=name, mark_read=True, actor=name, also_deliver=True)
+    return store.read_inbox(
+        agent=name, mark_read=True, actor=name, also_deliver=True,
+        actionable_only=actionable_only,
+    )
 
 
 def run_hook_user_prompt(
@@ -77,7 +118,7 @@ def run_hook_user_prompt(
         return 0
 
     header = f"[agent-bus] {len(msgs)} new message(s) since last turn:"
-    out.write(header + "\n" + _format_messages(msgs) + "\n")
+    out.write(header + "\n" + _format_messages(msgs, name) + "\n")
     out.flush()
     return 0
 
@@ -100,13 +141,15 @@ def run_hook_stop(
     out = stdout or sys.stdout
     _drain_stdin(stdin or sys.stdin)
 
-    msgs = _drain(store, name)
+    # only what this agent must act on: a copy a repo-mate already claimed
+    # must not keep a second agent's turn open
+    msgs = _drain(store, name, actionable_only=True)
     if not msgs:
         return 0
 
     reason = (
         "Pending messages from peers — handle them before stopping:\n"
-        + _format_messages(msgs)
+        + _format_messages(msgs, name)
     )
     payload = {"decision": "block", "reason": reason}
     out.write(json.dumps(payload) + "\n")
