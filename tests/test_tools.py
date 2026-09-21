@@ -190,3 +190,91 @@ def test_unknown_recipient_is_a_tool_error(mcp_shared_claude, mcp_shared_codex):
     with pytest.raises(ToolError) as exc_info:
         _call(mcp_shared_claude, "send_message", {"to": "shared/cdx", "body": "hi"})
     assert "shared/codex" in str(exc_info.value)
+
+
+# --------------------------- identity on the server ----------------------
+
+
+def test_whoami_describes_the_identity_and_its_repo_mates(
+    mcp_shared_claude, mcp_shared_codex
+):
+    out = _call(mcp_shared_claude, "whoami", {})
+    assert (out["name"], out["group"], out["client"], out["instance"]) == (
+        "shared/claude", "shared", "claude", None,
+    )
+    assert [m["name"] for m in out["group_members"]] == ["shared/claude", "shared/codex"]
+    assert out["warnings"] == []
+
+
+def test_whoami_for_a_name_without_a_client(mcp_alpha):
+    out = _call(mcp_alpha, "whoami", {})
+    assert (out["group"], out["client"], out["instance"]) == ("alpha", None, None)
+    assert [m["name"] for m in out["group_members"]] == ["alpha"]
+
+
+def test_list_agents_can_be_narrowed_to_one_repo(
+    mcp_shared_claude, mcp_shared_codex, mcp_other
+):
+    everyone = _unwrap(_call(mcp_other, "list_agents", {}))
+    assert [a["name"] for a in everyone] == [
+        "other/claude", "shared/claude", "shared/codex",
+    ]
+    shared = _unwrap(_call(mcp_other, "list_agents", {"group": "shared"}))
+    assert [(a["name"], a["client"]) for a in shared] == [
+        ("shared/claude", "claude"), ("shared/codex", "codex"),
+    ]
+
+
+def test_server_derives_its_name_from_the_client_and_repo(
+    bus_paths, storage, tmp_path, monkeypatch
+):
+    from agent_bus.server import build_server
+
+    for var in ("AGENT_BUS_NAME", "AGENT_BUS_CLIENT", "AGENT_BUS_INSTANCE"):
+        monkeypatch.delenv(var, raising=False)
+    repo = tmp_path / "Repo_A"
+    (repo / ".git").mkdir(parents=True)
+    monkeypatch.setenv("AGENT_BUS_REPO", str(repo))
+
+    mcp = build_server(client="codex", storage=storage)
+    out = _call(mcp, "whoami", {})
+    assert (out["name"], out["repo_path"]) == ("repo-a/codex", str(repo))
+
+
+def test_second_session_of_a_client_gets_its_own_inbox(
+    bus_paths, storage, mcp_shared_claude, monkeypatch
+):
+    from agent_bus.server import build_server
+
+    monkeypatch.setenv("AGENT_BUS_NAME", "shared/claude")
+    monkeypatch.setenv("AGENT_BUS_REPO", SHARED_REPO)
+    monkeypatch.setenv("AGENT_BUS_INSTANCE", "2")
+    second = build_server(storage=storage)
+
+    out = _call(second, "whoami", {})
+    assert (out["name"], out["instance"]) == ("shared/claude-2", 2)
+
+    _call(mcp_shared_claude, "send_message", {"to": "shared/claude-2", "body": "hi 2"})
+    assert [m["body"] for m in _unwrap(_call(second, "read_inbox", {}))] == ["hi 2"]
+    assert _unwrap(_call(mcp_shared_claude, "read_inbox", {})) == []
+
+
+def test_whoami_warns_when_the_name_belongs_to_another_repo(bus_paths, storage):
+    """Two repos wired under one name share one mailbox; say so."""
+    from agent_bus.server import build_server
+
+    storage.upsert_agent("foo/claude", "/code/websites/foo")
+    mcp = build_server(name="foo/claude", repo_path="/code/projects/foo", storage=storage)
+    (warning,) = _call(mcp, "whoami", {})["warnings"]
+    assert "/code/websites/foo" in warning
+
+
+def test_server_without_any_identity_exits(bus_paths, storage, monkeypatch, tmp_path):
+    from agent_bus.server import build_server
+
+    for var in ("AGENT_BUS_NAME", "AGENT_BUS_CLIENT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        build_server(storage=storage)
+    assert exc_info.value.code == 2
