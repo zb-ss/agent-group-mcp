@@ -246,7 +246,7 @@ def test_an_unmarked_repo_is_unaffected(storage, tmp_path):
     assert who.name == "fine/codex"
 
 
-def test_a_marked_repo_exits_the_server_with_a_message(storage, tmp_path, monkeypatch):
+def test_a_marked_repo_exits_the_server_with_a_message(storage, tmp_path, monkeypatch, capsys):
     from agent_bus.server import build_server
 
     repo = _opted_out_repo(tmp_path)
@@ -256,3 +256,9 @@ def test_a_marked_repo_exits_the_server_with_a_message(storage, tmp_path, monkey
     with pytest.raises(SystemExit) as exc_info:
         build_server(storage=storage, client="codex")
     assert exc_info.value.code == 2
+
+    message = capsys.readouterr().err
+    assert resolution.IGNORE_FILE in message
+    # the "set it in the env block" advice belongs to a different failure
+    assert "env" not in message
+    assert ".." not in message

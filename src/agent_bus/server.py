@@ -24,6 +24,10 @@ def _who_am_i(
         return resolution.ResolvedIdentity(name, repo_path)
     try:
         who = resolution.resolve(storage=store, client=client)
+    except resolution.RepoOptedOutError as e:
+        # a deliberate choice, not a misconfiguration: say so and nothing more
+        sys.stderr.write(f"agent-bus: {e}\n")
+        raise SystemExit(2) from None
     except resolution.IdentityError as e:
         sys.stderr.write(
             f"agent-bus: {e}. Set it in the `env` block of this client's "
