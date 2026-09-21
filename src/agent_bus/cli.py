@@ -449,19 +449,19 @@ def cmd_chat(args: argparse.Namespace) -> int:
 def cmd_hook_stop(args: argparse.Namespace) -> int:
     from .hooks import run_hook_stop
 
-    return run_hook_stop()
+    return run_hook_stop(client=args.client)
 
 
 def cmd_hook_user_prompt(args: argparse.Namespace) -> int:
     from .hooks import run_hook_user_prompt
 
-    return run_hook_user_prompt()
+    return run_hook_user_prompt(client=args.client)
 
 
 def cmd_serve(args: argparse.Namespace) -> int:  # pragma: no cover
     from .server import main as server_main
 
-    server_main()
+    server_main(client=args.client)
     return 0
 
 
@@ -597,19 +597,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--repo", help="repo_path to register. Default $PWD.")
     s.set_defaults(func=cmd_chat)
 
+    client_help = (
+        "Which MCP client this is (claude, codex, agy, opencode, ...). With "
+        "no $AGENT_BUS_NAME, the agent is <repo>/<client>, found from the "
+        "repository this runs in. Default: $AGENT_BUS_CLIENT."
+    )
+
     # hook entrypoints
-    s = sub.add_parser("hook-stop", help="Claude Code Stop hook handler.")
+    s = sub.add_parser(
+        "hook-stop", help="Hook handler: keep the agent going if it has mail."
+    )
+    s.add_argument("--client", help=client_help)
     s.set_defaults(func=cmd_hook_stop)
 
     s = sub.add_parser(
-        "hook-user-prompt", help="Claude Code UserPromptSubmit hook handler."
+        "hook-user-prompt", help="Hook handler: add pending mail to the next prompt."
     )
+    s.add_argument("--client", help=client_help)
     s.set_defaults(func=cmd_hook_user_prompt)
 
     # optional serve helper (so `agent-bus serve` works besides python -m)
     s = sub.add_parser(
         "serve", help="Run the MCP stdio server (same as python -m agent_bus.server)."
     )
+    s.add_argument("--client", help=client_help)
     s.set_defaults(func=cmd_serve)
 
     return p

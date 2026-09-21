@@ -111,3 +111,108 @@ def test_hooks_count_as_a_sign_of_life(two_agents):
         hook(storage=two_agents, stdin=io.StringIO("{}"),
              stdout=io.StringIO(), actor="alpha")
         assert two_agents.get_agent("alpha").last_seen > stale
+
+
+# --------------------------- identity from --client ----------------------
+
+
+def _wired_repo(tmp_path, storage, name: str):
+    repo = tmp_path / "repo-a"
+    (repo / ".git").mkdir(parents=True)
+    storage.upsert_agent(name, str(repo))
+    storage.ensure_agent("human", "/home")
+    return repo
+
+
+def _run_hook(hook, storage, *, payload: dict, client: str | None = None) -> str:
+    out = io.StringIO()
+    rc = hook(storage=storage, stdin=io.StringIO(json.dumps(payload)),
+              stdout=out, client=client)
+    assert rc == 0
+    return out.getvalue()
+
+
+def test_client_hook_finds_its_agent_from_the_payload_cwd(
+    storage, tmp_path, monkeypatch
+):
+    """One hook command per client, shared by every repo: the payload says
+    which repo this session is in."""
+    from agent_bus.hooks import run_hook_stop
+
+    monkeypatch.delenv("AGENT_BUS_NAME", raising=False)
+    repo = _wired_repo(tmp_path, storage, "repo-a/codex")
+    storage.send_message(from_agent="human", to="repo-a/codex", body="for codex")
+
+    text = _run_hook(run_hook_stop, storage, client="codex",
+                     payload={"cwd": str(repo / "src"), "hook_event_name": "Stop"})
+    assert "for codex" in json.loads(text)["reason"]
+
+
+def test_client_hook_is_silent_in_a_repo_that_is_not_on_the_bus(
+    storage, tmp_path, monkeypatch
+):
+    from agent_bus.hooks import run_hook_stop, run_hook_user_prompt
+
+    monkeypatch.delenv("AGENT_BUS_NAME", raising=False)
+    unwired = tmp_path / "unwired"
+    (unwired / ".git").mkdir(parents=True)
+
+    for hook in (run_hook_stop, run_hook_user_prompt):
+        assert _run_hook(hook, storage, client="codex",
+                         payload={"cwd": str(unwired)}) == ""
+    assert storage.list_agents() == []
+
+
+def test_hook_without_any_identity_fails_loudly(storage, monkeypatch):
+    import pytest
+
+    from agent_bus.hooks import run_hook_stop
+
+    monkeypatch.delenv("AGENT_BUS_NAME", raising=False)
+    monkeypatch.delenv("AGENT_BUS_CLIENT", raising=False)
+    with pytest.raises(SystemExit) as exc_info:
+        run_hook_stop(storage=storage, stdin=io.StringIO("{}"), stdout=io.StringIO())
+    assert exc_info.value.code == 2
+
+
+# --------------------------- agy dialect ---------------------------------
+
+
+def test_agy_hooks_always_answer_in_json(storage, tmp_path, monkeypatch):
+    from agent_bus.hooks import run_hook_stop, run_hook_user_prompt
+
+    monkeypatch.delenv("AGENT_BUS_NAME", raising=False)
+    repo = _wired_repo(tmp_path, storage, "repo-a/agy")
+    payload = {"workspacePaths": [str(repo)], "conversationId": "c-1"}
+
+    # nothing pending: still a JSON object made only of fields agy knows
+    assert json.loads(_run_hook(run_hook_user_prompt, storage, client="agy",
+                                payload=payload)) == {"injectSteps": []}
+    assert json.loads(_run_hook(run_hook_stop, storage, client="agy",
+                                payload=payload)) == {"decision": "stop"}
+
+    storage.send_message(from_agent="human", to="repo-a/agy", body="first")
+    injected = json.loads(_run_hook(run_hook_user_prompt, storage, client="agy",
+                                    payload=payload))
+    (step,) = injected["injectSteps"]
+    assert "first" in step["ephemeralMessage"]
+
+    storage.send_message(from_agent="human", to="repo-a/agy", body="second")
+    decision = json.loads(_run_hook(run_hook_stop, storage, client="agy",
+                                    payload=payload))
+    assert decision["decision"] == "continue"
+    assert "second" in decision["reason"]
+
+
+def test_dialect_follows_the_client_part_of_an_explicit_name(
+    storage, tmp_path, monkeypatch
+):
+    """Per-repo agy wiring names the agent outright; the hook still has to
+    answer in agy's JSON."""
+    from agent_bus.hooks import run_hook_stop
+
+    _wired_repo(tmp_path, storage, "repo-a/agy")
+    monkeypatch.setenv("AGENT_BUS_NAME", "repo-a/agy")
+    assert json.loads(_run_hook(run_hook_stop, storage, payload={})) == {
+        "decision": "stop"
+    }

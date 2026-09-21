@@ -363,3 +363,23 @@ def test_cli_hook_user_prompt_outputs_pending(bus_paths):
     # inbox now empty
     r = _run_cli(["inbox", "--name", "alpha", "--json"], env_extra=env)
     assert json.loads(r.stdout) == []
+
+
+def test_cli_hook_with_client_reads_the_repo_from_stdin(bus_paths, tmp_path):
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+        "AGENT_BUS_NAME": "",
+    }
+    repo = tmp_path / "repo-a"
+    (repo / ".git").mkdir(parents=True)
+    from agent_bus.storage import Storage
+    s = Storage()
+    s.upsert_agent("repo-a/codex", str(repo))
+    s.ensure_agent("human", "/home")
+    s.send_message(from_agent="human", to="repo-a/codex", body="via payload")
+
+    r = _run_cli(["hook-user-prompt", "--client", "codex"], env_extra=env,
+                 input_text=json.dumps({"cwd": str(repo)}), cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "via payload" in r.stdout
