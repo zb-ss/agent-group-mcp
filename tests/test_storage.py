@@ -279,3 +279,42 @@ def test_concurrent_writers_no_loss_no_dup(bus_paths):
         if line.strip()
     ]
     assert sum(1 for r in sends if r["op"] == "send") == 100
+
+
+# --------- retiring a renamed agent ---------------------------------------
+
+
+def test_retire_within_the_same_group_rewrites_nothing(two_agents):
+    """`alpha` becoming `alpha/claude`: the bare name stays the repo's
+    address, so its unread mail is left for the first member to read."""
+    two_agents.send_message(from_agent="beta", to="alpha", body="waiting")
+    assert two_agents.retire_agent("alpha", successor="alpha/claude") == 0
+    assert two_agents.get_agent("alpha") is None
+
+    two_agents.upsert_agent("alpha/claude", "/repo/alpha")
+    (msg,) = two_agents.read_inbox(agent="alpha/claude")
+    assert (msg.body, msg.to_agent) == ("waiting", "alpha")
+
+
+def test_retire_into_another_group_moves_only_unread_mail(two_agents):
+    two_agents.send_message(from_agent="beta", to="alpha", body="already read")
+    two_agents.read_inbox(agent="alpha")
+    two_agents.send_message(from_agent="beta", to="alpha", body="still unread")
+
+    assert two_agents.retire_agent("alpha", successor="renamed/claude") == 1
+    two_agents.upsert_agent("renamed/claude", "/repo/alpha")
+    assert [m.body for m in two_agents.read_inbox(agent="renamed/claude")] == [
+        "still unread"
+    ]
+    # history keeps the name it was sent to
+    thread_targets = {
+        m.to_agent for m in two_agents.recent_messages(limit=10) if m.body == "already read"
+    }
+    assert thread_targets == {"alpha"}
+
+
+def test_retire_is_a_noop_for_an_unchanged_or_unknown_name(two_agents, bus_paths):
+    assert two_agents.retire_agent("alpha", successor="alpha") == 0
+    assert two_agents.get_agent("alpha") is not None
+    assert two_agents.retire_agent("nobody", successor="nobody/claude") == 0
+    assert not bus_paths["log"].exists()

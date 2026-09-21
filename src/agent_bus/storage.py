@@ -335,6 +335,52 @@ class Storage:
             cur = conn.execute("DELETE FROM agents WHERE name = ?", (name,))
             return cur.rowcount > 0
 
+    def retire_agent(self, name: str, *, successor: str) -> int:
+        """Take `name` off the roster because its wiring now says `successor`.
+
+        Unread mail is never orphaned. When `successor` lives in the group
+        called `name` (the usual case: `repo-a` becoming `repo-a/claude`),
+        nothing is rewritten — mail for the bare name goes to the first
+        member of that group to read. Under any other rename the unread
+        rows are re-addressed to `successor`. Returns how many were.
+        """
+        self.init_schema()
+        if name == successor:
+            return 0
+        moved = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if _inbox_params(successor)["group"] != name:
+                    moved = conn.execute(
+                        "UPDATE messages SET to_agent = ? "
+                        "WHERE to_agent = ? AND read_at IS NULL",
+                        (successor, name),
+                    ).rowcount
+                retired = conn.execute(
+                    "DELETE FROM agents WHERE name = ?", (name,)
+                ).rowcount
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        if retired or moved:
+            audit.append_many([{
+                "ts": _utc_now_iso(),
+                "op": "retire",
+                "actor": "agent-bus init",
+                "message_id": None,
+                "from": name,
+                "to": successor,
+                "thread_id": None,
+                "body_preview": (
+                    f"{name!r} is now wired as {successor!r}; "
+                    f"{moved} unread message(s) re-addressed"
+                ),
+                "body_sha256": None,
+            }])
+        return moved
+
     # ----------------------------- messages ---------------------------------
 
     @staticmethod
