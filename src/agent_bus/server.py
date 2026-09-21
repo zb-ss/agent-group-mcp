@@ -50,8 +50,9 @@ def build_server(
             f"`{agent_name}`. Use `read_inbox` at the start of a turn if "
             "you suspect pending messages; the Stop/UserPromptSubmit hooks "
             "will surface them automatically when configured. "
-            "`send_message(to='*', body=...)` broadcasts to every peer "
-            "except you."
+            "Address a message to a full agent name (`repo-a/claude`) for "
+            "one agent, to a bare repo name (`repo-a`) for every agent "
+            "working in that repo, or to `*` for every peer except you."
         ),
     )
 
@@ -78,12 +79,18 @@ def build_server(
 
     @mcp.tool()
     def send_message(to: str, body: str, thread_id: str | None = None) -> dict:
-        """Send `body` to peer `to`, or broadcast with to='*'.
+        """Send `body` to one agent, to every agent in a repo, or to everyone.
 
-        Returns either {"message_id", "sent_at", "thread_id", "recipients"}
-        for unicast, or {"message_ids", "sent_at", "thread_id", "recipients"}
-        for broadcast — the schema rejects a single row addressing many
-        peers, so broadcasts fan out into N message_ids server-side.
+        `to` is a full agent name such as `repo-a/claude` (exactly that
+        agent), a bare repo name such as `repo-a` (every agent working in
+        that repo, except you), or `*` (every agent on the bus, except
+        you). `list_agents` shows the names. An unknown `to` is an error
+        and nothing is sent.
+
+        Returns {"to", "kind", "message_ids", "recipients", "thread_id",
+        "sent_at"}, plus "message_id" when exactly one agent received it.
+        `kind` is "direct", "group" or "broadcast". Each recipient gets its
+        own row and message_id, so read state is tracked per agent.
         """
         store.touch_agent(agent_name)
         return store.send_message(

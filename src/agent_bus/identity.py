@@ -21,6 +21,13 @@ import re
 from dataclasses import dataclass
 
 SEPARATOR = "/"
+BROADCAST = "*"
+
+# How a message was addressed: to one agent by name, to a repo's group by
+# its bare name, or to everyone.
+KIND_DIRECT = "direct"
+KIND_GROUP = "group"
+KIND_BROADCAST = "broadcast"
 
 MAX_GROUP_LEN = 40
 MAX_CLIENT_LEN = 12

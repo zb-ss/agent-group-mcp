@@ -7,35 +7,102 @@ OS reclaims file descriptors promptly when callers go away.
 Schema (created and versioned by `migrations.py`):
   agents(name PK, repo_path, registered_at, last_seen, group_name, client)
   messages(message_id PK, from_agent, to_agent, body, thread_id,
-           sent_at, read_at, delivered_at)
+           sent_at, read_at, delivered_at,
+           addressed_to, fanout_id, to_group, claimed_by)
 
 An agent named `<group>/<client>` belongs to `<group>`; any other name is
 a group of one (see `identity.py`).
 
-A "broadcast" send (to="*") fans out into N message rows, one per
-non-sender peer, each with its own unique message_id. We never expand
-to="*" into a single row — that would require per-recipient read state
-on the same row, which the schema deliberately rejects.
+Addressing: `to` is "*" (everyone but the sender), a full agent name
+(exactly that agent), or a bare name (every agent in that group but the
+sender). Group and broadcast sends fan out into N message rows, one per
+recipient, each with its own message_id, sharing one `fanout_id`. We never
+store a single row for many recipients — that would require per-recipient
+read state on the same row, which the schema deliberately rejects.
 """
 
 from __future__ import annotations
 
+import difflib
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
-from . import audit, identity, migrations, wake
+from . import audit, identity, migrations, settings, wake
+from .identity import BROADCAST, KIND_BROADCAST, KIND_DIRECT, KIND_GROUP
 from .paths import db_path, ensure_parents
 
-BROADCAST = "*"
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+MAX_SUGGESTIONS = 3
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
+
+
+class UnknownRecipientError(ValueError):
+    """`to` names neither a registered agent nor a group with members."""
+
+    def __init__(self, to: str, *, members: list[str], close: list[str]) -> None:
+        self.to = to
+        hint = ""
+        if members:
+            hint = f" Agents in that repo: {', '.join(members)}."
+        elif close:
+            hint = f" Did you mean: {', '.join(close)}?"
+        super().__init__(
+            f"no agent or group named {to!r} is on the bus.{hint} "
+            "Nothing was sent; list the agents to see who is reachable."
+        )
+
+
+MESSAGE_COLUMNS = (
+    "message_id, from_agent, to_agent, body, thread_id, sent_at, read_at, "
+    "delivered_at, addressed_to, fanout_id, to_group, claimed_by"
+)
+
+
+def _inbox_predicate(agent_expr: str, group_expr: str) -> str:
+    """WHERE clause for the unread rows an agent may drain.
+
+    Its own rows, plus rows addressed to its bare group name while no agent
+    is registered under exactly that name. Those are mail for a repo from
+    before it had per-client identities, or written by an older agent-bus
+    that does not expand groups; the first member to read takes them. Rows
+    from a fan-out are excluded — every member already has its own copy.
+
+    Both arguments are SQL expressions chosen by this module, never input.
+    """
+    return f"""
+        read_at IS NULL AND (
+            to_agent = {agent_expr}
+            OR (
+                to_agent = {group_expr}
+                AND {group_expr} != {agent_expr}
+                AND fanout_id IS NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM agents AS namesake
+                    WHERE namesake.name = {group_expr}
+                )
+            )
+        )
+    """
+
+
+INBOX_PREDICATE = _inbox_predicate(":agent", ":group")
+ROSTER_INBOX_PREDICATE = _inbox_predicate(
+    "agents.name", "COALESCE(agents.group_name, agents.name)"
+)
+
+
+def _inbox_params(agent: str) -> dict[str, str]:
+    parsed = identity.parse_or_none(agent)
+    has_client = parsed is not None and parsed.client is not None
+    return {"agent": agent, "group": parsed.group if has_client else agent}
 
 
 @dataclass
@@ -48,12 +115,32 @@ class Message:
     sent_at: str
     read_at: str | None
     delivered_at: str | None
+    # All NULL on rows written before group addressing, or by an older
+    # agent-bus sharing this database.
+    addressed_to: str | None = None
+    fanout_id: str | None = None
+    to_group: str | None = None
+    claimed_by: str | None = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Message":
+        return cls(**{column: row[column] for column in row.keys()})
+
+    @property
+    def kind(self) -> str:
+        if self.fanout_id is None:
+            return KIND_DIRECT
+        if self.addressed_to == BROADCAST:
+            return KIND_BROADCAST
+        return KIND_GROUP
 
     def to_dict(self) -> dict:
         return {
             "message_id": self.message_id,
             "from": self.from_agent,
             "to": self.to_agent,
+            "addressed_to": self.addressed_to,
+            "kind": self.kind,
             "body": self.body,
             "thread_id": self.thread_id,
             "sent_at": self.sent_at,
@@ -94,6 +181,16 @@ class AgentRow:
         if pending_count is not None:
             out["pending_count"] = pending_count
         return out
+
+
+@dataclass(frozen=True)
+class _Delivery:
+    """What one send turned into: who got it, under which ids."""
+
+    kind: str
+    thread_id: str | None
+    recipients: list[str]
+    message_ids: list[str]
 
 
 class Storage:
@@ -194,10 +291,8 @@ class Storage:
             rows = conn.execute(
                 f"""
                 SELECT {AGENT_COLUMNS},
-                       COALESCE((
-                         SELECT COUNT(*) FROM messages m
-                         WHERE m.to_agent = agents.name AND m.read_at IS NULL
-                       ), 0) AS pending_count
+                       (SELECT COUNT(*) FROM messages
+                        WHERE {ROSTER_INBOX_PREDICATE}) AS pending_count
                 FROM agents ORDER BY name
                 """
             ).fetchall()
@@ -233,15 +328,65 @@ class Storage:
 
     # ----------------------------- messages ---------------------------------
 
-    def _expand_recipients(self, from_agent: str, to: str) -> list[str]:
-        if to != BROADCAST:
-            return [to]
-        with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT name FROM agents WHERE name != ? ORDER BY name",
-                (from_agent,),
-            ).fetchall()
-        return [r["name"] for r in rows]
+    @staticmethod
+    def _drop_idle_members(candidates: list[AgentRow]) -> list[AgentRow]:
+        """Trim clients nobody has seen for a while from a fan-out.
+
+        A stale client is dropped only when a fresher one shares its group,
+        so the cutoff thins out a repo's roster but never silences a repo.
+        """
+        max_idle_days = settings.fanout_max_idle_days()
+        if max_idle_days <= 0:
+            return candidates
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max_idle_days)
+        ).strftime(TIMESTAMP_FORMAT)
+
+        by_group: dict[str, list[AgentRow]] = {}
+        for agent in candidates:
+            by_group.setdefault(agent.group, []).append(agent)
+        kept: list[AgentRow] = []
+        for members in by_group.values():
+            fresh = [m for m in members if m.last_seen >= cutoff]
+            kept.extend(fresh or members)
+        return sorted(kept, key=lambda a: a.name)
+
+    @staticmethod
+    def _unknown_recipient(to: str, agents: list[AgentRow]) -> UnknownRecipientError:
+        group = to.partition(identity.SEPARATOR)[0]
+        members = [a.name for a in agents if a.group == group]
+        known = sorted({a.name for a in agents} | {a.group for a in agents})
+        close = difflib.get_close_matches(to, known, n=MAX_SUGGESTIONS)
+        return UnknownRecipientError(to, members=members, close=close)
+
+    def _resolve_recipients(
+        self, conn: sqlite3.Connection, *, from_agent: str, to: str
+    ) -> tuple[str, list[AgentRow]]:
+        """Turn `to` into (kind, recipients). Runs inside the send
+        transaction so the roster it reads is the roster it writes for."""
+        agents = [
+            AgentRow(**dict(r))
+            for r in conn.execute(f"SELECT {AGENT_COLUMNS} FROM agents ORDER BY name")
+        ]
+        others = [a for a in agents if a.name != from_agent]
+
+        if to == BROADCAST:
+            return KIND_BROADCAST, self._drop_idle_members(others)
+
+        if identity.SEPARATOR in to:
+            exact = [a for a in agents if a.name == to]
+            if not exact:
+                raise self._unknown_recipient(to, agents)
+            return KIND_DIRECT, exact
+
+        members = [a for a in agents if a.group == to]
+        if not members:
+            raise self._unknown_recipient(to, agents)
+        if len(members) == 1 and members[0].name == to:
+            return KIND_DIRECT, members
+        return KIND_GROUP, self._drop_idle_members(
+            [m for m in members if m.name != from_agent]
+        )
 
     def send_message(
         self,
@@ -254,11 +399,13 @@ class Storage:
     ) -> dict:
         """Insert one row per recipient. Writes audit rows BEFORE returning.
 
-        Return shape:
-          - unicast: {"message_id": "...", "sent_at": ts,
-                      "thread_id": ..., "recipients": [name]}
-          - broadcast (to="*"): {"message_ids": [...], "sent_at": ts,
-                                 "thread_id": ..., "recipients": [...]}
+        Always returns {"to", "kind", "message_ids", "recipients",
+        "thread_id", "sent_at"}; "message_id" is added whenever exactly one
+        agent received it and `to` was not a broadcast. `kind` is "direct",
+        "group" or "broadcast". A group or broadcast with nobody to receive
+        it is not an error — the lists are simply empty.
+
+        Raises UnknownRecipientError when `to` names nobody on the bus.
         """
         if not body:
             raise ValueError("body must be non-empty")
@@ -266,81 +413,98 @@ class Storage:
             raise ValueError("to must be non-empty (use '*' to broadcast)")
 
         self.init_schema()
-        recipients = self._expand_recipients(from_agent, to)
-        if not recipients:
-            # broadcast with no peers — nothing to send, but not an error
-            return {
-                "message_ids": [],
-                "sent_at": _utc_now_iso(),
-                "thread_id": thread_id,
-                "recipients": [],
-            }
-
         sent_at = _utc_now_iso()
-        thread = thread_id or str(uuid.uuid4())
         actor_name = actor or from_agent
-
-        rows: list[tuple[str, str, str, str, str, str]] = []
-        message_ids: list[str] = []
-        audit_rows: list[dict] = []
-        for recipient in recipients:
-            mid = str(uuid.uuid4())
-            message_ids.append(mid)
-            rows.append((mid, from_agent, recipient, body, thread, sent_at))
-            audit_rows.append(
-                {
-                    "ts": sent_at,
-                    "op": "send",
-                    "actor": actor_name,
-                    "message_id": mid,
-                    "from": from_agent,
-                    "to": recipient,
-                    "thread_id": thread,
-                    "body_preview": audit.body_preview(body),
-                    "body_sha256": audit.body_sha256(body),
-                }
-            )
 
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.executemany(
-                    """
-                    INSERT INTO messages
-                        (message_id, from_agent, to_agent, body, thread_id, sent_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    rows,
+                delivery = self._deliver(
+                    conn, from_agent=from_agent, to=to, body=body,
+                    thread_id=thread_id, sent_at=sent_at,
                 )
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
 
-        audit.append_many(audit_rows)
+        result = {
+            "to": to,
+            "kind": delivery.kind,
+            "message_ids": delivery.message_ids,
+            "recipients": delivery.recipients,
+            "thread_id": delivery.thread_id,
+            "sent_at": sent_at,
+        }
+        if not delivery.recipients:
+            return result
+        if len(delivery.message_ids) == 1 and to != BROADCAST:
+            result["message_id"] = delivery.message_ids[0]
+
+        audit.append_many(
+            {
+                "ts": sent_at,
+                "op": "send",
+                "actor": actor_name,
+                "message_id": mid,
+                "from": from_agent,
+                "to": name,
+                "addressed_to": to,
+                "thread_id": delivery.thread_id,
+                "body_preview": audit.body_preview(body),
+                "body_sha256": audit.body_sha256(body),
+            }
+            for mid, name in zip(delivery.message_ids, delivery.recipients)
+        )
 
         self._fire_wakes(
-            recipients=recipients,
-            message_ids=message_ids,
+            recipients=delivery.recipients,
+            message_ids=delivery.message_ids,
             from_agent=from_agent,
             actor_name=actor_name,
             body=body,
-            thread_id=thread,
+            thread_id=delivery.thread_id,
         )
+        return result
 
-        if to == BROADCAST:
-            return {
-                "message_ids": message_ids,
-                "sent_at": sent_at,
-                "thread_id": thread,
-                "recipients": recipients,
-            }
-        return {
-            "message_id": message_ids[0],
-            "sent_at": sent_at,
-            "thread_id": thread,
-            "recipients": recipients,
-        }
+    def _deliver(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        from_agent: str,
+        to: str,
+        body: str,
+        thread_id: str | None,
+        sent_at: str,
+    ) -> "_Delivery":
+        """Resolve `to` and insert one row per recipient, inside the
+        caller's transaction."""
+        kind, recipients = self._resolve_recipients(conn, from_agent=from_agent, to=to)
+        thread = thread_id or (str(uuid.uuid4()) if recipients else None)
+        is_fan_out = kind != KIND_DIRECT
+        fanout_id = str(uuid.uuid4()) if is_fan_out else None
+        message_ids = [str(uuid.uuid4()) for _ in recipients]
+        conn.executemany(
+            """
+            INSERT INTO messages
+                (message_id, from_agent, to_agent, body, thread_id,
+                 sent_at, addressed_to, fanout_id, to_group)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    mid, from_agent, recipient.name, body, thread, sent_at,
+                    to, fanout_id, recipient.group if is_fan_out else None,
+                )
+                for mid, recipient in zip(message_ids, recipients)
+            ],
+        )
+        return _Delivery(
+            kind=kind,
+            thread_id=thread,
+            recipients=[r.name for r in recipients],
+            message_ids=message_ids,
+        )
 
     def read_inbox(
         self,
@@ -370,15 +534,14 @@ class Storage:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 rows = conn.execute(
-                    """
-                    SELECT message_id, from_agent, to_agent, body, thread_id,
-                           sent_at, read_at, delivered_at
+                    f"""
+                    SELECT {MESSAGE_COLUMNS}
                     FROM messages
-                    WHERE to_agent = ? AND read_at IS NULL
+                    WHERE {INBOX_PREDICATE}
                     ORDER BY sent_at ASC, message_id ASC
-                    LIMIT ?
+                    LIMIT :limit
                     """,
-                    (agent, limit),
+                    {**_inbox_params(agent), "limit": limit},
                 ).fetchall()
 
                 ids = [r["message_id"] for r in rows]
@@ -395,19 +558,12 @@ class Storage:
                 conn.execute("ROLLBACK")
                 raise
 
-        messages = [
-            Message(
-                message_id=r["message_id"],
-                from_agent=r["from_agent"],
-                to_agent=r["to_agent"],
-                body=r["body"],
-                thread_id=r["thread_id"],
-                sent_at=r["sent_at"],
-                read_at=now if mark_read else r["read_at"],
-                delivered_at=(r["delivered_at"] or now) if mark_read else r["delivered_at"],
-            )
-            for r in rows
-        ]
+        messages = [Message.from_row(r) for r in rows]
+        if mark_read:
+            messages = [
+                replace(m, read_at=now, delivered_at=m.delivered_at or now)
+                for m in messages
+            ]
 
         audit_rows: list[dict] = []
         for m in messages:
@@ -449,9 +605,8 @@ class Storage:
         self.init_schema()
         with self.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT message_id, from_agent, to_agent, body, thread_id,
-                       sent_at, read_at, delivered_at
+                f"""
+                SELECT {MESSAGE_COLUMNS}
                 FROM messages
                 WHERE thread_id = ?
                 ORDER BY sent_at ASC, message_id ASC
@@ -459,19 +614,7 @@ class Storage:
                 """,
                 (thread_id, limit),
             ).fetchall()
-        return [
-            Message(
-                message_id=r["message_id"],
-                from_agent=r["from_agent"],
-                to_agent=r["to_agent"],
-                body=r["body"],
-                thread_id=r["thread_id"],
-                sent_at=r["sent_at"],
-                read_at=r["read_at"],
-                delivered_at=r["delivered_at"],
-            )
-            for r in rows
-        ]
+        return [Message.from_row(r) for r in rows]
 
     def recent_messages(self, *, limit: int = 10) -> list[Message]:
         """Return the N most-recent messages across the bus, oldest first.
@@ -485,28 +628,15 @@ class Storage:
         self.init_schema()
         with self.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT message_id, from_agent, to_agent, body, thread_id,
-                       sent_at, read_at, delivered_at
+                f"""
+                SELECT {MESSAGE_COLUMNS}
                 FROM messages
                 ORDER BY sent_at DESC, message_id DESC
                 LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
-        msgs = [
-            Message(
-                message_id=r["message_id"],
-                from_agent=r["from_agent"],
-                to_agent=r["to_agent"],
-                body=r["body"],
-                thread_id=r["thread_id"],
-                sent_at=r["sent_at"],
-                read_at=r["read_at"],
-                delivered_at=r["delivered_at"],
-            )
-            for r in rows
-        ]
+        msgs = [Message.from_row(r) for r in rows]
         msgs.reverse()  # oldest first for display
         return msgs
 
@@ -573,7 +703,7 @@ class Storage:
         self.init_schema()
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND read_at IS NULL",
-                (agent,),
+                f"SELECT COUNT(*) AS c FROM messages WHERE {INBOX_PREDICATE}",
+                _inbox_params(agent),
             ).fetchone()
         return int(row["c"]) if row else 0
