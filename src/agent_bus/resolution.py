@@ -67,17 +67,21 @@ def find_repo_root(start: Path) -> Path:
     return start
 
 
+def pinned_group(repo: Path) -> str | None:
+    """The group name a `.agent-bus-name` file pins for `repo`, if any."""
+    name_file = repo / NAME_FILE
+    if not name_file.exists():
+        return None
+    try:
+        raw = name_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return identity.slugify(raw) if raw else None
+
+
 def group_for_repo(repo: Path) -> str:
     """The repo's group name: its `.agent-bus-name` file, else its slug."""
-    name_file = repo / NAME_FILE
-    if name_file.exists():
-        try:
-            raw = name_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            raw = ""
-        if raw:
-            return identity.slugify(raw)
-    return identity.slugify(repo.name)
+    return pinned_group(repo) or identity.slugify(repo.name)
 
 
 def _instance(env: Mapping[str, str]) -> int | None:

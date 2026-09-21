@@ -383,3 +383,62 @@ def test_cli_hook_with_client_reads_the_repo_from_stdin(bus_paths, tmp_path):
                  input_text=json.dumps({"cwd": str(repo)}), cwd=tmp_path)
     assert r.returncode == 0, r.stderr
     assert "via payload" in r.stdout
+
+
+# --------------------------- init ----------------------------------------
+
+
+def _scratch_repo(tmp_path, name="acme.dev"):
+    repo = tmp_path / name
+    (repo / ".git").mkdir(parents=True)
+    return repo
+
+
+def test_cli_init_json_lists_each_client(bus_paths, tmp_path):
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+    repo = _scratch_repo(tmp_path)
+    r = _run_cli(["init", str(repo), "--json"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    (plan,) = json.loads(r.stdout)
+    assert plan["name"] == "acme-dev"
+    assert plan["clients"] == [{
+        "client": "claude", "name": "acme-dev/claude",
+        "action": "write", "previous_name": None,
+    }]
+    assert not (repo / ".mcp.json").exists()  # --json never writes
+
+
+def test_cli_init_rejects_a_client_it_cannot_wire(bus_paths, tmp_path):
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+    r = _run_cli(["init", str(_scratch_repo(tmp_path)), "--clients", "nonesuch"],
+                 env_extra=env)
+    assert r.returncode == 2
+    assert "nonesuch" in r.stderr and "claude" in r.stderr
+
+
+def test_cli_init_upgrade_retires_the_old_name(bus_paths, tmp_path):
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+    from agent_bus import init_cmd
+    from agent_bus.storage import Storage
+
+    repo = _scratch_repo(tmp_path)
+    (repo / ".mcp.json").write_text(json.dumps({"mcpServers": {
+        "agent-bus": init_cmd.build_mcp_entry(
+            name="acme-dev", repo=repo, bin_path="/old/agent-bus"),
+    }}))
+    Storage().upsert_agent("acme-dev", str(repo))
+
+    r = _run_cli(["init", str(repo), "--bin-path", "/new/agent-bus"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    assert "renaming from 'acme-dev' to 'acme-dev/claude'" in r.stdout
+    assert "[claude]" in r.stdout
+    assert Storage().get_agent("acme-dev") is None

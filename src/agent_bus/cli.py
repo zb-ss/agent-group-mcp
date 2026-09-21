@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 from . import audit
+from . import clients
 from . import formatting as fmt
 from . import init_cmd
 from . import wake
@@ -286,8 +287,64 @@ def cmd_forget(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_clients(raw: str | None) -> list[str]:
+    """`--clients a,b` as a list, checked against what init can wire."""
+    if not raw:
+        return list(init_cmd.DEFAULT_CLIENTS)
+    wanted = [c.strip() for c in raw.split(",") if c.strip()]
+    known = clients.wirable_clients()
+    unknown = [c for c in wanted if c not in known]
+    if unknown or not wanted:
+        raise ValueError(
+            f"unknown client(s): {', '.join(unknown) or '(none given)'}. "
+            f"init can wire: {', '.join(known)}"
+        )
+    return list(dict.fromkeys(wanted))
+
+
+def _plan_as_json(plan: init_cmd.InitPlan) -> dict:
+    return {
+        "repo": str(plan.repo),
+        "name": plan.name,
+        "action": plan.action.value,
+        "previous_name": plan.previous_name,
+        "notes": plan.notes,
+        "clients": [
+            {
+                "client": c.client,
+                "name": plan.agent_name(c.client) if plan.name else None,
+                "action": c.action.value,
+                "previous_name": c.previous_name,
+            }
+            for c in plan.clients
+        ],
+    }
+
+
+def _print_plan_table(plans: list[init_cmd.InitPlan]) -> None:
+    width_name = max((len(p.name) for p in plans if p.name), default=8)
+    width_name = max(width_name, 8)
+    width_action = max(len(a.value) for a in init_cmd.Action)
+    for p in plans:
+        repo_short = str(p.repo)
+        try:
+            repo_short = "~/" + str(p.repo.relative_to(Path.home()))
+        except ValueError:
+            pass
+        wired = ",".join(c.client for c in p.clients if c.is_change)
+        line = (
+            f"  {p.action.value:<{width_action}}  "
+            f"{p.name:<{width_name}}  {repo_short}"
+        )
+        if wired:
+            line += f"   [{wired}]"
+        if p.notes:
+            line += f"   ({'; '.join(p.notes)})"
+        sys.stdout.write(line + "\n")
+
+
 def cmd_init(args: argparse.Namespace) -> int:
-    """Wire `.mcp.json` + `.claude/settings.json` for one or many repos."""
+    """Wire each requested MCP client into one or many repos."""
     paths = [Path(p) for p in (args.paths or [Path.cwd()])]
     bin_path = init_cmd.detect_agent_bus_bin(args.bin_path)
 
@@ -297,7 +354,13 @@ def cmd_init(args: argparse.Namespace) -> int:
             "(omit --scan and pass exactly one path)\n"
         )
         return 2
+    try:
+        client_ids = _parse_clients(args.clients)
+    except ValueError as e:
+        sys.stderr.write(f"agent-bus: {e}\n")
+        return 2
 
+    store = Storage()
     plans = init_cmd.plan_for_paths(
         paths,
         scan=args.scan,
@@ -305,52 +368,27 @@ def cmd_init(args: argparse.Namespace) -> int:
         override=args.name,
         force=args.force,
         bin_path=bin_path,
+        client_ids=client_ids,
+        storage=store,
     )
 
     if args.json:
-        out = [
-            {
-                "repo": str(p.repo),
-                "name": p.name,
-                "action": p.action.value,
-                "previous_name": p.previous_name,
-                "notes": p.notes,
-            }
-            for p in plans
-        ]
-        sys.stdout.write(json.dumps(out, indent=2) + "\n")
+        sys.stdout.write(json.dumps([_plan_as_json(p) for p in plans], indent=2) + "\n")
         return 0
 
-    # Render the plan table.
     if not plans:
         sys.stdout.write("(no repos found)\n")
         return 0
 
-    width_name = max((len(p.name) for p in plans if p.name), default=8)
-    width_name = max(width_name, 8)
-    width_action = max(len(a.value) for a in init_cmd.Action)
-
-    for p in plans:
-        repo_short = str(p.repo)
-        try:
-            repo_short = "~/" + str(p.repo.relative_to(Path.home()))
-        except ValueError:
-            pass
-        line = (
-            f"  {p.action.value:<{width_action}}  "
-            f"{p.name:<{width_name}}  {repo_short}"
-        )
-        if p.notes:
-            line += f"   ({'; '.join(p.notes)})"
-        sys.stdout.write(line + "\n")
-
+    _print_plan_table(plans)
     counts = init_cmd.summarise(plans)
     changes = [p for p in plans if p.is_change]
     sys.stdout.write(
-        f"\n{len(plans)} repo(s) scanned · "
+        f"\n{len(plans)} repo(s) scanned · clients={','.join(client_ids)} · "
         f"write={counts['write']} refresh={counts['refresh']} "
         f"renamed={counts['rename']} "
         f"handwritten-skip={counts['skip-handwritten']} "
+        f"unreadable-skip={counts['skip-unreadable']} "
         f"ignored={counts['skip-ignored']} "
         f"not-repo={counts['skip-not-repo']}\n"
     )
@@ -370,12 +408,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         )
         return 0
 
-    written = 0
-    for p in plans:
-        if p.is_change:
-            init_cmd.apply_plan(p, bin_path=bin_path)
-            written += 1
-    sys.stdout.write(f"\nApplied to {written} repo(s).\n")
+    for p in changes:
+        init_cmd.apply_plan(p, bin_path=bin_path, storage=store)
+    sys.stdout.write(f"\nApplied to {len(changes)} repo(s).\n")
+    for client_id in client_ids:
+        for limitation in clients.wiring(client_id).limitations:
+            sys.stdout.write(f"note ({client_id}): {limitation}\n")
     return 0
 
 
@@ -528,7 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
     # init
     s = sub.add_parser(
         "init",
-        help="Wire .mcp.json and .claude/settings.json into one or many repos.",
+        help="Wire agent-bus into one or many repos, once per MCP client.",
         description=(
             "Single-repo (no --scan): writes immediately. "
             "Bulk (--scan): dry-run by default; pass --apply to commit. "
@@ -562,7 +600,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument(
         "--name",
-        help="Explicit agent name (single-repo init only).",
+        help="Explicit group name for the repo (single-repo init only). "
+             "Each client is wired as <name>/<client>.",
+    )
+    s.add_argument(
+        "--clients",
+        help="Comma-separated MCP clients to wire "
+             f"({', '.join(clients.wirable_clients())}). Default: "
+             f"{','.join(init_cmd.DEFAULT_CLIENTS)}.",
     )
     s.add_argument(
         "--bin-path",

@@ -182,7 +182,7 @@ def test_apply_writes_mcp_and_settings(tmp_path):
     init_cmd.apply_plan(plan, bin_path="/usr/local/bin/agent-bus")
 
     mcp = json.loads((repo / ".mcp.json").read_text())
-    assert mcp["mcpServers"]["agent-bus"]["env"]["AGENT_BUS_NAME"] == "acme-dev"
+    assert mcp["mcpServers"]["agent-bus"]["env"]["AGENT_BUS_NAME"] == "acme-dev/claude"
     assert mcp["mcpServers"]["agent-bus"]["env"]["AGENT_BUS_REPO"] == str(repo)
     assert mcp["mcpServers"]["agent-bus"]["args"] == ["serve"]
 
@@ -198,7 +198,8 @@ def test_apply_writes_mcp_and_settings(tmp_path):
     )
     assert "hook-user-prompt" in hook_cmds
     assert "hook-stop" in hook_cmds
-    assert "AGENT_BUS_NAME=acme-dev" in hook_cmds
+    assert "AGENT_BUS_NAME=acme-dev/claude " in hook_cmds
+    assert "--client claude" in hook_cmds
 
 
 def test_apply_is_idempotent(tmp_path):
@@ -261,7 +262,7 @@ def test_apply_preserves_unrelated_hooks_and_perms(tmp_path):
 
 def test_refresh_renames_existing_managed_entry(tmp_path):
     """Migration case: a managed entry whose custom name no longer
-    matches the slug should refresh to the slug-derived name."""
+    matches the slug should refresh to the slug-derived group."""
     repo = _make_repo(tmp_path, "acme.dev")
     (repo / ".mcp.json").write_text(json.dumps({
         "mcpServers": {
@@ -280,7 +281,7 @@ def test_refresh_renames_existing_managed_entry(tmp_path):
     init_cmd.apply_plan(plan, bin_path="/new/path/agent-bus")
     mcp = json.loads((repo / ".mcp.json").read_text())
     entry = mcp["mcpServers"]["agent-bus"]
-    assert entry["env"]["AGENT_BUS_NAME"] == "acme-dev"
+    assert entry["env"]["AGENT_BUS_NAME"] == "acme-dev/claude"
     assert entry["command"] == "/new/path/agent-bus"
 
 
@@ -321,3 +322,172 @@ def test_per_repo_name_file_respected(tmp_path):
     repo = _make_repo(tmp_path, "acme.dev", name_file="legacy-agent-name")
     plan = init_cmd.plan_for_repo(repo)
     assert plan.name == "legacy-agent-name"
+
+
+# --------------------------- per-client identities -------------------
+
+
+def _wired_name(repo: Path) -> str:
+    mcp = json.loads((repo / ".mcp.json").read_text())
+    return mcp["mcpServers"]["agent-bus"]["env"]["AGENT_BUS_NAME"]
+
+
+def _hook_commands(repo: Path, event: str) -> list[str]:
+    settings = json.loads((repo / ".claude" / "settings.json").read_text())
+    return [h["command"] for block in settings["hooks"][event] for h in block["hooks"]]
+
+
+def _wire_the_old_way(repo: Path, name: str) -> None:
+    """What `agent-bus init` wrote before per-client identities: the bare
+    repo name as the agent, and hooks with no client tag."""
+    (repo / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {"agent-bus": init_cmd.build_mcp_entry(
+            name=name, repo=repo, bin_path="/old/agent-bus")}
+    }))
+    settings = repo / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"hooks": {
+        event: [{"matcher": "", "hooks": [{
+            "type": "command",
+            "command": f"AGENT_BUS_NAME={name} /old/agent-bus {sub}",
+        }]}]
+        for event, sub in (("UserPromptSubmit", "hook-user-prompt"), ("Stop", "hook-stop"))
+    }}))
+
+
+def test_default_init_wires_claude_code_only(tmp_path):
+    repo = _make_repo(tmp_path, "acme.dev")
+    plan = init_cmd.plan_for_repo(repo)
+    assert [c.client for c in plan.clients] == ["claude"]
+    assert plan.name == "acme-dev"
+    assert plan.agent_name("claude") == "acme-dev/claude"
+
+
+def test_old_wiring_is_upgraded_in_place(tmp_path):
+    repo = _make_repo(tmp_path, "acme.dev")
+    _wire_the_old_way(repo, "acme-dev")
+
+    plan = init_cmd.plan_for_paths([repo], scan=False)[0]
+    assert plan.action == init_cmd.Action.REFRESH
+    assert plan.previous_name == "acme-dev"
+    assert plan.renames() == [("acme-dev", "acme-dev/claude")]
+    assert "renaming from 'acme-dev' to 'acme-dev/claude'" in plan.notes
+
+    init_cmd.apply_plan(plan, bin_path="/new/agent-bus")
+    assert _wired_name(repo) == "acme-dev/claude"
+    for event in ("UserPromptSubmit", "Stop"):
+        (command,) = _hook_commands(repo, event)  # replaced, not appended to
+        assert command.startswith("AGENT_BUS_NAME=acme-dev/claude /new/agent-bus")
+
+    again = init_cmd.plan_for_paths([repo], scan=False)[0]
+    assert again.renames() == []
+    assert init_cmd.summarise([again])["rename"] == 0
+
+
+def test_pinned_name_becomes_the_group(tmp_path):
+    repo = _make_repo(tmp_path, "acme.dev", name_file="legacy-agent-name")
+    _wire_the_old_way(repo, "legacy-agent-name")
+    plan = init_cmd.plan_for_paths([repo], scan=False)[0]
+    init_cmd.apply_plan(plan, bin_path="/new/agent-bus")
+    assert _wired_name(repo) == "legacy-agent-name/claude"
+
+
+def test_hook_tagged_for_another_client_survives(tmp_path):
+    """One managed block per client may share a file; refreshing ours must
+    not take the other one with it."""
+    repo = _make_repo(tmp_path, "ok")
+    foreign = "AGENT_BUS_NAME=ok/other /bin/agent-bus hook-stop --client other"
+    settings = repo / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"hooks": {"Stop": [
+        {"matcher": "", "hooks": [{"type": "command", "command": foreign}]},
+    ]}}))
+
+    for _ in range(2):
+        init_cmd.apply_plan(init_cmd.plan_for_repo(repo), bin_path="/bin/agent-bus")
+    commands = _hook_commands(repo, "Stop")
+    assert foreign in commands
+    assert len(commands) == 2
+
+
+def test_config_that_cannot_be_parsed_is_never_overwritten(tmp_path):
+    repo = _make_repo(tmp_path, "ok")
+    original = '{\n  // my servers\n  "mcpServers": {}\n}\n'
+    (repo / ".mcp.json").write_text(original)
+
+    plan = init_cmd.plan_for_paths([repo], scan=False)[0]
+    assert plan.action == init_cmd.Action.SKIP_UNREADABLE
+    assert not plan.is_change
+    init_cmd.apply_plan(plan, bin_path="/bin/agent-bus")
+    assert (repo / ".mcp.json").read_text() == original
+    assert not (repo / ".claude").exists()
+
+    forced = init_cmd.plan_for_paths([repo], scan=False, force=True)[0]
+    assert forced.action == init_cmd.Action.SKIP_UNREADABLE
+
+
+def test_unknown_client_is_rejected(tmp_path):
+    repo = _make_repo(tmp_path, "ok")
+    with pytest.raises(KeyError):
+        init_cmd.plan_for_repo(repo, client_ids=["nonesuch"])
+
+
+# --------------------------- roster follows the wiring ---------------
+
+
+def test_apply_retires_the_old_name_and_keeps_its_mail(tmp_path, storage):
+    repo = _make_repo(tmp_path, "acme.dev")
+    _wire_the_old_way(repo, "acme-dev")
+    storage.upsert_agent("acme-dev", str(repo))
+    storage.upsert_agent("other", "/code/other")
+    storage.send_message(from_agent="other", to="acme-dev", body="before the upgrade")
+
+    plan = init_cmd.plan_for_paths([repo], scan=False, storage=storage)[0]
+    init_cmd.apply_plan(plan, bin_path="/bin/agent-bus", storage=storage)
+
+    assert storage.get_agent("acme-dev") is None
+    # the client that comes up under the new name finds the old mail
+    storage.upsert_agent("acme-dev/claude", str(repo))
+    inbox = storage.read_inbox(agent="acme-dev/claude")
+    assert [m.body for m in inbox] == ["before the upgrade"]
+    # and the bare name still works as the repo's address
+    sent = storage.send_message(from_agent="other", to="acme-dev", body="after")
+    assert sent["recipients"] == ["acme-dev/claude"]
+
+
+def test_rename_to_another_group_moves_unread_mail(tmp_path, storage, bus_paths):
+    repo = _make_repo(tmp_path, "acme.dev")
+    _wire_the_old_way(repo, "legacy-agent-name")
+    storage.upsert_agent("legacy-agent-name", str(repo))
+    storage.upsert_agent("other", "/code/other")
+    storage.send_message(from_agent="other", to="legacy-agent-name", body="do not lose me")
+
+    plan = init_cmd.plan_for_paths([repo], scan=False, storage=storage)[0]
+    init_cmd.apply_plan(plan, bin_path="/bin/agent-bus", storage=storage)
+
+    storage.upsert_agent("acme-dev/claude", str(repo))
+    assert [m.body for m in storage.read_inbox(agent="acme-dev/claude")] == [
+        "do not lose me"
+    ]
+    retired = [json.loads(line) for line in bus_paths["log"].read_text().splitlines()
+               if '"retire"' in line]
+    assert [(r["from"], r["to"]) for r in retired] == [
+        ("legacy-agent-name", "acme-dev/claude")
+    ]
+
+
+def test_plan_warns_when_the_group_is_registered_for_another_repo(tmp_path, storage):
+    repo = _make_repo(tmp_path / "projects", "foo")
+    storage.upsert_agent("foo/claude", "/code/websites/foo")
+    plan = init_cmd.plan_for_paths([repo], scan=False, storage=storage)[0]
+    assert any("/code/websites/foo" in note for note in plan.notes)
+
+
+def test_planning_without_a_storage_never_opens_the_database(tmp_path, monkeypatch):
+    """The suite (and `--json` previews) must not touch anyone's real bus."""
+    monkeypatch.setenv("AGENT_BUS_DB", str(tmp_path / "must-not-exist.db"))
+    repo = _make_repo(tmp_path, "acme.dev")
+    _wire_the_old_way(repo, "acme-dev")
+    plan = init_cmd.plan_for_paths([repo], scan=False)[0]
+    init_cmd.apply_plan(plan, bin_path="/bin/agent-bus")
+    assert not (tmp_path / "must-not-exist.db").exists()
