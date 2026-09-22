@@ -13,7 +13,9 @@ hook commands are driven by a small generated plugin instead:
     follow-up turn with it.
 
 The hook commands themselves speak the standard dialect; the plugin is the
-only thing that reads their output.
+only thing that reads their output. Every call is bounded by a timeout: a
+hook that never returns would otherwise hold the turn open forever, which
+is exactly what an agent-bus older than this plugin used to do.
 """
 
 from __future__ import annotations
@@ -32,20 +34,44 @@ PLUGIN_MARKER = "// Managed by `agent-bus init` — regenerated on every run; ed
 PLUGIN_TEMPLATE = PLUGIN_MARKER + """
 const BIN = __BIN__;
 const NAME = __NAME__;
+// A hook runs inside the turn: opencode waits for it before asking the
+// model. Anything slower than this is not worth the turn.
+const TIMEOUT_MS = Number(process.env.AGENT_BUS_HOOK_TIMEOUT_MS) || 10000;
 
 export const AgentBus = async ({ client, $, directory }) => {
   // mail already taken from the inbox, kept until the turn ends
   const shownThisTurn = new Map();
   const checkingIdle = new Set();
+  // hook calls that outlived their timeout and have not finished yet
+  const stillRunning = new Set();
 
   const hook = async (subcommand) => {
-    const out = await $`${BIN} ${subcommand} --client opencode`
+    // One that is still running past its timeout is stuck, not slow. Starting
+    // another would add a process and a full timeout to every model request;
+    // skipping costs only this round of mail, which the next call picks up.
+    if (stillRunning.has(subcommand)) return "";
+    const running = $`${BIN} ${subcommand} --client opencode`
       .cwd(directory)
       .env({ ...process.env, AGENT_BUS_NAME: NAME })
       .quiet()
       .nothrow()
       .text();
-    return out.trim();
+    // An agent-bus older than this plugin waits for a payload that never
+    // arrives, and awaiting it would hold the request open for the life of
+    // the session. Losing a message is recoverable; a stalled turn is not.
+    let timer;
+    const giveUp = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        stillRunning.add(subcommand);
+        running.then(() => stillRunning.delete(subcommand), () => stillRunning.delete(subcommand));
+        resolve("");
+      }, TIMEOUT_MS);
+    });
+    try {
+      return (await Promise.race([running, giveUp])).trim();
+    } finally {
+      clearTimeout(timer);
+    }
   };
 
   const isIdle = (event) =>
