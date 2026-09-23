@@ -3,7 +3,7 @@
 Notable changes per release. This project is pre-1.0: minor versions may
 change behaviour, and each release says what to expect.
 
-## Unreleased
+## 0.5.1
 
 ### Fixed
 
