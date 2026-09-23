@@ -3,6 +3,23 @@
 Notable changes per release. This project is pre-1.0: minor versions may
 change behaviour, and each release says what to expect.
 
+## Unreleased
+
+### Fixed
+
+- **opencode turns no longer hang.** The generated opencode plugin runs the
+  hooks without redirecting their input, so they inherited opencode's
+  terminal — which never signals end-of-input — and waited on it forever,
+  holding every model request. A hook now reads nothing from a terminal and
+  waits at most `AGENT_BUS_HOOK_PAYLOAD_TIMEOUT` seconds (default 5) for a
+  payload on a pipe. This protects every client, and upgrading the package is
+  enough: existing opencode plugins do not need regenerating.
+- The opencode plugin now also bounds each hook call
+  (`AGENT_BUS_HOOK_TIMEOUT_MS`, default 10000) and does not start a hook again
+  while an earlier call is still stuck, so a broken or outdated `agent-bus`
+  costs one delay instead of a hung session. Re-run
+  `agent-bus init --clients opencode` to pick this up.
+
 ## 0.5.0
 
 Several MCP clients can now work in the same repository at once, each with

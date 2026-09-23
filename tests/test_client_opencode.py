@@ -131,7 +131,10 @@ const $ = (strings, ...values) => {
     nothrow() { return chain; },
     async text() {
       const sub = command.split(" ")[1];
-      return (replies[sub] ?? []).shift() ?? "";
+      const reply = (replies[sub] ?? []).shift() ?? "";
+      // stands in for a hook that never returns
+      if (reply === "__HANG__") return new Promise(() => {});
+      return reply;
     },
   };
   return chain;
@@ -241,3 +244,60 @@ def test_a_bin_path_containing_a_placeholder_cannot_corrupt_the_plugin(tmp_path)
     assert done.returncode == 0, done.stderr
     assert 'const BIN = "/usr/__NAME__/agent-bus";' in plugin
     assert 'const NAME = "repo-a/opencode";' in plugin
+
+
+@needs_node
+def test_a_hook_that_never_returns_does_not_hold_up_the_request(tmp_path):
+    """Regression: a hook waiting on input it will never get used to stall
+    every model request. The plugin now gives up on the hook, not the turn."""
+    import os
+    import time
+
+    (tmp_path / "plugin.mjs").write_text(
+        clients.opencode.render_plugin(name="repo-a/opencode", bin_path=BIN)
+    )
+    (tmp_path / "harness.mjs").write_text(HARNESS)
+    began = time.monotonic()
+    result = subprocess.run(
+        ["node", "harness.mjs", json.dumps({"hook-user-prompt": ["__HANG__"]}),
+         json.dumps({"id": "s1"})],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env={**os.environ, "AGENT_BUS_HOOK_TIMEOUT_MS": "300"},
+    )
+    took = time.monotonic() - began
+    assert result.returncode == 0, result.stderr
+    assert took < 15, f"the harness took {took:.1f}s — the hang was not bounded"
+    # the request still went ahead, just without the mail
+    assert json.loads(result.stdout)["systems"][0] == ["base prompt"]
+
+
+@needs_node
+def test_a_stuck_hook_is_not_started_again_on_every_request(tmp_path):
+    """A turn makes several model requests. Re-running a hook that is still
+    stuck from the last one would pay the full timeout each time and leave
+    one more process hanging per request."""
+    import os
+    import time
+
+    (tmp_path / "plugin.mjs").write_text(
+        clients.opencode.render_plugin(name="repo-a/opencode", bin_path=BIN)
+    )
+    (tmp_path / "harness.mjs").write_text(HARNESS)
+    # every call would hang: a binary that is broken for good, not just slow
+    replies = {"hook-user-prompt": ["__HANG__"] * 4, "hook-stop": ["__HANG__"] * 2}
+    began = time.monotonic()
+    result = subprocess.run(
+        ["node", "harness.mjs", json.dumps(replies), json.dumps({"id": "s1"})],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env={**os.environ, "AGENT_BUS_HOOK_TIMEOUT_MS": "1000"},
+    )
+    took = time.monotonic() - began
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+
+    spawned = [c["command"].split()[1] for c in out["calls"]]
+    assert spawned.count("hook-user-prompt") == 1, "the stuck hook was started again"
+    assert out["systems"] == [["base prompt"]] * 3
+    # the harness makes four model requests and two idle checks; waiting out
+    # the timeout on each would take six seconds or more
+    assert took < 4.5, f"took {took:.1f}s"

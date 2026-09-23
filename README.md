@@ -677,6 +677,8 @@ recovery requires SQLite + audit cross-reference.
 | `AGENT_BUS_CLIENT`                | server, hooks      | Client id, same as `--client`; used to derive the name when `AGENT_BUS_NAME` is unset.   |
 | `AGENT_BUS_INSTANCE`              | server, hooks      | `2`..`99`: this is another session of the same client in the same repo.                  |
 | `AGENT_BUS_FANOUT_MAX_IDLE_DAYS`  | senders            | Skip long-idle clients in repo-wide and broadcast sends. Default `14`, `0` disables.     |
+| `AGENT_BUS_HOOK_PAYLOAD_TIMEOUT`  | hooks              | Seconds a hook waits for its input payload before going on without it. Default `5`.     |
+| `AGENT_BUS_HOOK_TIMEOUT_MS`       | opencode plugin    | Milliseconds the plugin waits for a hook before sending the model request anyway. Default `10000`. |
 | `AGENT_BUS_DB`                    | everything         | Database path. Default `~/.claude-agent-bus/bus.db`.                                     |
 | `AGENT_BUS_AUDIT_LOG`             | everything         | Audit log path. Default `~/.claude-agent-bus/audit.log`.                                 |
 | `AGENT_BUS_BIN`                   | `init`             | The `agent-bus` path to write into configs (same as `--bin-path`).                       |

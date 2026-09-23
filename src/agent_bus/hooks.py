@@ -11,10 +11,12 @@ message gets a sibling `deliver` audit row so the log shows the hook path.
 from __future__ import annotations
 
 import os
+import select
 import sys
+import time
 from typing import Iterable, TextIO
 
-from . import clients, identity, resolution
+from . import clients, identity, resolution, settings
 from .clients.base import HookDialect
 from .identity import KIND_BROADCAST, KIND_GROUP
 from .storage import Message, Storage
@@ -24,10 +26,58 @@ def _read_payload(stdin: TextIO) -> dict:
     """Consume the hook payload. Always read it, even when the name comes
     from the environment, so the client's pipe never blocks."""
     try:
-        return resolution.parse_hook_payload(stdin.read())
+        return resolution.parse_hook_payload(_read_available(stdin))
     except Exception:
         # Hook input is best-effort; never block on a bad pipe.
         return {}
+
+
+def _read_available(stdin: TextIO) -> str:
+    """Whatever payload is actually coming, and never more than a moment's wait.
+
+    A hook runs inside the agent's turn: a client waits for it before making
+    its next model request. Reading to end-of-input is therefore only safe
+    when end-of-input is certain to arrive. It is not when the hook inherited
+    a terminal, which never sends one, and not when it inherited a pipe the
+    client keeps open — either way `read()` would hold the turn open forever.
+
+    So: nothing at all from a terminal, and otherwise only what arrives
+    within `settings.hook_payload_timeout_seconds()`. Losing a slow payload
+    costs at worst the repo hint, which resolution recovers from the working
+    directory; hanging the agent costs the whole session.
+    """
+    try:
+        if stdin.isatty():
+            return ""
+    except (AttributeError, ValueError, OSError):
+        pass
+
+    fd = None
+    if os.name == "posix":  # select() on a pipe is POSIX-only
+        try:
+            fd = stdin.fileno()
+        except (AttributeError, ValueError, OSError):
+            fd = None
+    if fd is None:
+        return stdin.read()  # an in-memory stream, as the tests use
+
+    deadline = time.monotonic() + settings.hook_payload_timeout_seconds()
+    chunks: list[bytes] = []
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            ready, _, _ = select.select([fd], [], [], remaining)
+        except (OSError, ValueError):
+            break
+        if not ready:
+            break  # nobody is writing; take what we have
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break  # end of input, the normal case
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", "replace")
 
 
 def _client_of(name: str | None) -> str | None:
