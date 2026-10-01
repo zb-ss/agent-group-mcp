@@ -101,8 +101,10 @@ Useful flags: `--name` pins a repository's name (single repo only),
 `--prefix` prepends a slug to every derived name, `--force` overwrites a
 hand-written `agent-bus` entry, `--json` prints the plan without applying.
 
-**Names.** Each agent is `<repo>/<client>` — `my-repo/claude`,
-`my-repo/codex`. The repo part is the slug of the directory name. To pin
+**Names.** Each client is `<repo>/<client>` — `my-repo/claude`,
+`my-repo/codex` — and each running session of it gets an address of its
+own, `my-repo/claude-1`, `my-repo/claude-2`, or a label it picks
+(`my-repo/claude-frontend`). The repo part is the slug of the directory name. To pin
 it, put one line in `.agent-bus-name` in that repository. To keep a
 repository off the bus entirely, create an empty `.agent-bus-ignore`
 there: `init` skips it, the server refuses to start, and hooks stay quiet.
@@ -179,7 +181,8 @@ for row in json.load(sys.stdin):
 ```
 
 Expect one row per client per repository, e.g. `my-repo/claude`,
-`my-repo/codex`.
+`my-repo/codex`, and once a client has run, a session row under it such as
+`my-repo/claude-1`.
 
 ```bash
 # 8c. end-to-end delivery, using a scratch database so the real one is untouched
@@ -195,7 +198,8 @@ reported instead of queued forever.
 
 ```bash
 # 8d. inside a client session, ask the agent to run the MCP tool
-#     whoami   -> its own name, its repo, and the other agents in that repo
+#     whoami   -> its session address, its client address, its repo,
+#                 and the other agents in that repo
 #     list_agents -> everyone on the bus
 ```
 
@@ -286,7 +290,8 @@ up first if you want it.
 | Codex hook reports "Failed" | It got output that is not valid JSON | Make sure the hook command has `--client codex` |
 | `agy` shows no agent-bus tools | Workspace not trusted yet | Open the folder in `agy` and trust it |
 | A message was "sent" but never arrived | It went to a name nobody holds | Check `agent-bus agents`; unknown names are now an error, so re-send |
-| Two sessions of one client share an inbox | Both resolve to the same name | Start the second with `AGENT_BUS_INSTANCE=2` |
+| Two sessions of one client share an inbox | Their MCP servers were started by one process that gives no session ids, so the bus cannot tell them apart | Start each with its own `AGENT_BUS_SESSION=<label>`; or check `AGENT_BUS_SESSIONS` is not `0` |
+| A session's hook surfaces only `to any <repo>/<client> session` mail | The hook could not tell which session it runs for (e.g. a wrapper script between the client and `agent-bus serve`) | Start the server with `exec`, or call `read_inbox` for the session's own mail |
 | Two different repos share an inbox | Same directory basename, wired in separate runs | Pin one with `.agent-bus-name`, or wire both in one `--scan` |
 | `upgrade agent-bus` on any command | The database was written by a newer version | Upgrade the package on this machine |
 | Every turn is held open quoting an error | An unusable binary — only possible with hand-written hooks | Re-run `init`, which appends `\|\| true` so a broken binary is silent |
@@ -295,7 +300,7 @@ Diagnostics:
 
 ```bash
 agent-bus agents --json     # who is registered, and each unread count
-agent-bus tail --limit 20   # the audit log: send, read, deliver, claim, wake, retire
+agent-bus tail --limit 20   # the audit log: send, read, deliver, claim, wake, retire, session
 agent-bus tail -f           # follow it live
 agent-bus init --json --clients <c>   # what the wiring should say, without writing
 ```
