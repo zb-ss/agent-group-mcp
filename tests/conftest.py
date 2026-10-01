@@ -96,3 +96,50 @@ def three_agents(storage):
     storage.upsert_agent("beta", "/repo/beta")
     storage.upsert_agent("gamma", "/repo/gamma")
     return storage
+
+
+class FakeProcesses:
+    """Stand-in processes, so one test process can play several sessions.
+
+    A session is a client process that started an MCP server. `session()`
+    makes both; `kill()` ends one. Real processes are still looked up for
+    real, so a server built without stand-ins keeps working alongside."""
+
+    def __init__(self, alive: set) -> None:
+        import itertools
+
+        self._alive = alive
+        self._pids = itertools.count(900_001)
+
+    def proc(self, name: str = "client"):
+        from agent_bus.procs import Proc
+
+        pid = next(self._pids)
+        p = Proc(pid, f"fake-{pid}", name)
+        self._alive.add(p)
+        return p
+
+    def session(self):
+        """(server process, its ancestry): a fresh client and its server."""
+        client = self.proc()
+        return self.proc(), [client]
+
+    def kill(self, *procs) -> None:
+        for p in procs:
+            self._alive.discard(p)
+
+
+@pytest.fixture
+def fake_procs(monkeypatch: pytest.MonkeyPatch) -> FakeProcesses:
+    from agent_bus import procs
+
+    alive: set = set()
+    real_gone = procs.gone
+
+    def gone(candidates):
+        fakes = {p for p in candidates if p.started.startswith("fake-")}
+        real = [p for p in candidates if p not in fakes]
+        return real_gone(real) | (fakes - alive)
+
+    monkeypatch.setattr(procs, "gone", gone)
+    return FakeProcesses(alive)

@@ -41,9 +41,39 @@ def test_instance_is_appended_to_an_explicit_client_name(storage, tmp_path):
     assert resolution.resolve(storage=storage, env=env, cwd=tmp_path).name == "repo-a/claude-2"
 
 
-def test_first_instance_is_the_plain_name(storage, tmp_path):
+def test_instance_one_asks_for_session_one(storage, tmp_path):
+    """The plain name is the address a client's sessions share, so even the
+    first session has a number of its own."""
     env = {"AGENT_BUS_NAME": "repo-a/claude", "AGENT_BUS_REPO": "/r", "AGENT_BUS_INSTANCE": "1"}
-    assert resolution.resolve(storage=storage, env=env, cwd=tmp_path).name == "repo-a/claude"
+    assert resolution.resolve(storage=storage, env=env, cwd=tmp_path).name == "repo-a/claude-1"
+
+
+def test_session_label_asks_for_a_named_session(storage, tmp_path):
+    env = {"AGENT_BUS_NAME": "repo-a/claude", "AGENT_BUS_REPO": "/r",
+           "AGENT_BUS_SESSION": "Release Notes", "AGENT_BUS_INSTANCE": "2"}
+    assert resolution.resolve(storage=storage, env=env, cwd=tmp_path).name == (
+        "repo-a/claude-release-notes"
+    )
+
+
+@pytest.mark.parametrize("label", ["2fa", "--"])
+def test_bad_session_label_is_an_error(storage, tmp_path, label):
+    env = {"AGENT_BUS_NAME": "repo-a/claude", "AGENT_BUS_REPO": "/r",
+           "AGENT_BUS_SESSION": label}
+    with pytest.raises(IdentityError):
+        resolution.resolve(storage=storage, env=env, cwd=tmp_path)
+
+
+def test_registered_sessions_resolve_to_their_client_address(storage, tmp_path):
+    """A hook asks whose mail this is; the session it belongs to is settled
+    later, from the session registry."""
+    repo = tmp_path / "repo-a"
+    (repo / ".git").mkdir(parents=True)
+    storage.upsert_agent("repo-a/claude-frontend", str(repo))
+    who = resolution.resolve(
+        storage=storage, env={}, client="claude", cwd=repo, registered_only=True,
+    )
+    assert who is not None and who.name == "repo-a/claude"
 
 
 @pytest.mark.parametrize("instance", ["0", "100", "two", "-3"])

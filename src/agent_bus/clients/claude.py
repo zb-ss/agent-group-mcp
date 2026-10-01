@@ -3,6 +3,8 @@
 MCP servers live in the repo's `.mcp.json`; hooks and tool permissions in
 `.claude/settings.json`. Hooks follow the standard contract, fire on
 `UserPromptSubmit` and `Stop`, and inherit Claude Code's environment.
+Claude Code tells its MCP servers and hooks which session they serve in
+`CLAUDE_CODE_SESSION_ID`.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from . import base
 from .base import UnreadableConfigError, WiringState, WiringStatus
 
 CLIENT_ID = "claude"
+SESSION_KEY_ENV = "CLAUDE_CODE_SESSION_ID"
 
 HOOK_EVENTS = (
     ("UserPromptSubmit", "hook-user-prompt"),
@@ -26,6 +29,7 @@ ALLOW_TOOLS = (
     "mcp__agent-bus__read_inbox",
     "mcp__agent-bus__read_thread",
     "mcp__agent-bus__tail_audit",
+    "mcp__agent-bus__set_session",
 )
 
 

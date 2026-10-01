@@ -5,20 +5,28 @@ short-lived connection so the module is safe from any thread, and so the
 OS reclaims file descriptors promptly when callers go away.
 
 Schema (created and versioned by `migrations.py`):
-  agents(name PK, repo_path, registered_at, last_seen, group_name, client)
+  agents(name PK, repo_path, registered_at, last_seen, group_name, client,
+         topic)
   messages(message_id PK, from_agent, to_agent, body, thread_id,
            sent_at, read_at, delivered_at,
            addressed_to, fanout_id, to_group, claimed_by)
+  sessions(server_pid, server_started, name, client_address, ...) — see
+           `sessions.py`
 
 An agent named `<group>/<client>` belongs to `<group>`; any other name is
-a group of one (see `identity.py`).
+a group of one (see `identity.py`). A session, `<group>/<client>-<handle>`,
+belongs to the same group and also reads the mail addressed to its client,
+`<group>/<client>`: that address is shared by every session of the client,
+and the first of them to read a message there takes it.
 
 Addressing: `to` is "*" (everyone but the sender), a full agent name
-(exactly that agent), or a bare name (every agent in that group but the
-sender). Group and broadcast sends fan out into N message rows, one per
-recipient, each with its own message_id, sharing one `fanout_id`. We never
-store a single row for many recipients — that would require per-recipient
-read state on the same row, which the schema deliberately rejects.
+(exactly that agent, or for a client address, whichever of its sessions
+reads first), or a bare name (every agent in that group but the sender).
+Group and broadcast sends fan out into N message rows, one per recipient,
+each with its own message_id, sharing one `fanout_id`; a client with
+sessions counts as one recipient, its client address. We never store a
+single row for many recipients — that would require per-recipient read
+state on the same row, which the schema deliberately rejects.
 """
 
 from __future__ import annotations
@@ -66,10 +74,12 @@ MESSAGE_COLUMNS = (
 )
 
 
-def _inbox_predicate(agent_expr: str, group_expr: str) -> str:
+def _inbox_predicate(agent_expr: str, group_expr: str, address_expr: str) -> str:
     """WHERE clause for the unread rows an agent may drain.
 
-    Its own rows, plus rows addressed to its bare group name while no agent
+    Its own rows; for a session, the rows addressed to its client address
+    that it did not send itself (the first session to read one takes it);
+    plus rows addressed to its bare group name while no agent
     is registered under exactly that name. Those are mail for a repo from
     before it had per-client identities, or written by an older agent-bus
     that does not expand groups; the first member to read takes them.
@@ -79,13 +89,25 @@ def _inbox_predicate(agent_expr: str, group_expr: str) -> str:
     and nobody else holds one. What must not happen is taking such a row
     when this agent already has its own copy of the same fan-out, which is
     the case when the send expanded to both the bare name and its members;
-    that would deliver one message twice.
+    that would deliver one message twice. The same holds for a client
+    address: an older agent-bus may have fanned a message out to a session
+    and to its client address alike.
 
-    Both arguments are SQL expressions chosen by this module, never input.
+    All arguments are SQL expressions chosen by this module, never input.
     """
     return f"""
         read_at IS NULL AND (
             to_agent = {agent_expr}
+            OR (
+                to_agent = {address_expr}
+                AND {address_expr} != {agent_expr}
+                AND from_agent != {agent_expr}
+                AND NOT EXISTS (
+                    SELECT 1 FROM messages AS sibling
+                    WHERE sibling.fanout_id = messages.fanout_id
+                      AND sibling.to_agent = {agent_expr}
+                )
+            )
             OR (
                 to_agent = {group_expr}
                 AND {group_expr} != {agent_expr}
@@ -103,16 +125,23 @@ def _inbox_predicate(agent_expr: str, group_expr: str) -> str:
     """
 
 
-INBOX_PREDICATE = _inbox_predicate(":agent", ":group")
+INBOX_PREDICATE = _inbox_predicate(":agent", ":group", ":address")
+# The roster counts what is waiting at each address: shared client mail
+# under the client address, not once more under every one of its sessions.
 ROSTER_INBOX_PREDICATE = _inbox_predicate(
-    "agents.name", "COALESCE(agents.group_name, agents.name)"
+    "agents.name", "COALESCE(agents.group_name, agents.name)", "agents.name"
 )
 
 
 def _inbox_params(agent: str) -> dict[str, str]:
     parsed = identity.parse_or_none(agent)
-    has_client = parsed is not None and parsed.client is not None
-    return {"agent": agent, "group": parsed.group if has_client else agent}
+    if parsed is None or parsed.client is None:
+        return {"agent": agent, "group": agent, "address": agent}
+    return {
+        "agent": agent,
+        "group": parsed.group,
+        "address": parsed.client_address or agent,
+    }
 
 
 @dataclass
@@ -164,7 +193,13 @@ class Message:
         }
 
 
-AGENT_COLUMNS = "name, repo_path, registered_at, last_seen, group_name, client"
+AGENT_COLUMNS = (
+    "name, repo_path, registered_at, last_seen, group_name, client, topic"
+)
+
+KIND_AGENT = "agent"
+KIND_CLIENT = "client"
+KIND_SESSION = "session"
 
 
 @dataclass
@@ -177,6 +212,7 @@ class AgentRow:
     # agent-bus that predates these columns.
     group_name: str | None = None
     client: str | None = None
+    topic: str | None = None
 
     @property
     def group(self) -> str:
@@ -184,11 +220,37 @@ class AgentRow:
         part is a group of one, named after itself."""
         return self.group_name or self.name
 
+    @property
+    def client_id(self) -> str | None:
+        """The client this agent is, sessions included (their `client`
+        column is NULL, see `register_in`)."""
+        if self.client:
+            return self.client
+        parsed = identity.parse_or_none(self.name)
+        return parsed.client if parsed is not None else None
+
+    @property
+    def client_address(self) -> str | None:
+        """For a session, the address it shares with its client's other
+        sessions; None for anything else."""
+        parsed = identity.parse_or_none(self.name)
+        if parsed is None or not parsed.is_session:
+            return None
+        return parsed.client_address
+
+    @property
+    def kind(self) -> str:
+        if self.client_address is not None:
+            return KIND_SESSION
+        return KIND_CLIENT if self.client else KIND_AGENT
+
     def to_dict(self, *, pending_count: int | None = None) -> dict:
         out = {
             "name": self.name,
+            "kind": self.kind,
             "group": self.group,
-            "client": self.client,
+            "client": self.client_id,
+            "topic": self.topic,
             "repo_path": self.repo_path,
             "registered_at": self.registered_at,
             "last_seen": self.last_seen,
@@ -210,6 +272,44 @@ class _Delivery:
     @property
     def names(self) -> list[str]:
         return [r.name for r in self.recipients]
+
+
+def register_in(
+    conn: sqlite3.Connection, name: str, repo_path: str, *,
+    overwrite_repo: bool, now: str,
+) -> AgentRow:
+    """Insert or refresh the roster row for `name` on `conn`. A session
+    brings its client address along: that is where mail for "any session
+    of this client" goes, so it must exist whenever a session does."""
+    parsed = identity.parse_or_none(name)
+    if parsed is not None and parsed.is_session and parsed.client_address:
+        register_in(
+            conn, parsed.client_address, repo_path,
+            overwrite_repo=overwrite_repo, now=now,
+        )
+    has_client = parsed is not None and parsed.client is not None
+    group_name = parsed.group if has_client else None
+    # a session's client is in its name; the column stays NULL because
+    # 0.5.x parses every name it finds there strictly
+    client = parsed.client if has_client and not parsed.is_session else None
+    repo_update = "repo_path = excluded.repo_path," if overwrite_repo else ""
+    conn.execute(
+        f"""
+        INSERT INTO agents
+            (name, repo_path, registered_at, last_seen, group_name, client)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            {repo_update}
+            group_name = excluded.group_name,
+            client = excluded.client,
+            last_seen = excluded.last_seen
+        """,
+        (name, repo_path, now, now, group_name, client),
+    )
+    row = conn.execute(
+        f"SELECT {AGENT_COLUMNS} FROM agents WHERE name = ?", (name,)
+    ).fetchone()
+    return AgentRow(**dict(row))
 
 
 class Storage:
@@ -271,31 +371,10 @@ class Storage:
 
     def _register(self, name: str, repo_path: str, *, overwrite_repo: bool) -> AgentRow:
         self.init_schema()
-        now = _utc_now_iso()
-        parsed = identity.parse_or_none(name)
-        has_client = parsed is not None and parsed.client is not None
-        group_name = parsed.group if has_client else None
-        client = parsed.client if has_client else None
-        repo_update = "repo_path = excluded.repo_path," if overwrite_repo else ""
         with self.connect() as conn:
-            conn.execute(
-                f"""
-                INSERT INTO agents
-                    (name, repo_path, registered_at, last_seen, group_name, client)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    {repo_update}
-                    group_name = excluded.group_name,
-                    client = excluded.client,
-                    last_seen = excluded.last_seen
-                """,
-                (name, repo_path, now, now, group_name, client),
+            return register_in(
+                conn, name, repo_path, overwrite_repo=overwrite_repo, now=_utc_now_iso()
             )
-            row = conn.execute(
-                f"SELECT {AGENT_COLUMNS} FROM agents WHERE name = ?",
-                (name,),
-            ).fetchone()
-        return AgentRow(**dict(row))
 
     def get_agent(self, name: str) -> AgentRow | None:
         self.init_schema()
@@ -333,11 +412,25 @@ class Storage:
         return agents
 
     def touch_agent(self, name: str) -> None:
+        """Bump `last_seen` — for a session, its client address's too, so
+        repo-wide sends do not treat a client in use as idle."""
+        self.init_schema()
+        names = [name]
+        address = _inbox_params(name)["address"]
+        if address != name:
+            names.append(address)
+        with self.connect() as conn:
+            conn.executemany(
+                "UPDATE agents SET last_seen = ? WHERE name = ?",
+                [(_utc_now_iso(), n) for n in names],
+            )
+
+    def set_topic(self, name: str, topic: str | None) -> None:
+        """What the agent says it is working on, shown in the roster."""
         self.init_schema()
         with self.connect() as conn:
             conn.execute(
-                "UPDATE agents SET last_seen = ? WHERE name = ?",
-                (_utc_now_iso(), name),
+                "UPDATE agents SET topic = ? WHERE name = ?", (topic, name)
             )
 
     def forget_agent(self, name: str) -> bool:
@@ -463,18 +556,27 @@ class Storage:
         return UnknownRecipientError(to, members=members, close=close)
 
     def _resolve_recipients(
-        self, conn: sqlite3.Connection, *, from_agent: str, to: str
+        self, conn: sqlite3.Connection, *, from_agent: str, to: str,
+        skip: frozenset[str] = frozenset(),
     ) -> tuple[str, list[AgentRow]]:
         """Turn `to` into (kind, recipients). Runs inside the send
-        transaction so the roster it reads is the roster it writes for."""
+        transaction so the roster it reads is the roster it writes for.
+        `skip` names addresses a fan-out leaves out besides the sender."""
         agents = [
             AgentRow(**dict(r))
             for r in conn.execute(f"SELECT {AGENT_COLUMNS} FROM agents ORDER BY name")
         ]
-        others = [a for a in agents if a.name != from_agent]
+        # a client's sessions share one copy of a fan-out, at their client
+        # address, so a repo-wide message costs one turn per client
+        addresses = {a.name for a in agents}
+        fan_out_targets = [
+            a for a in agents
+            if a.name != from_agent and a.name not in skip
+            and a.client_address not in addresses
+        ]
 
         if to == BROADCAST:
-            return KIND_BROADCAST, self._drop_idle_members(others)
+            return KIND_BROADCAST, self._drop_idle_members(fan_out_targets)
 
         if identity.SEPARATOR in to:
             exact = [a for a in agents if a.name == to]
@@ -488,7 +590,7 @@ class Storage:
         if len(members) == 1 and members[0].name == to:
             return KIND_DIRECT, members
         return KIND_GROUP, self._drop_idle_members(
-            [m for m in members if m.name != from_agent]
+            [m for m in fan_out_targets if m.group == to]
         )
 
     def send_message(
@@ -499,8 +601,14 @@ class Storage:
         body: str,
         thread_id: str | None = None,
         actor: str | None = None,
+        skip: frozenset[str] = frozenset(),
     ) -> dict:
         """Insert one row per recipient. Writes audit rows BEFORE returning.
+
+        `skip` leaves those addresses out of a group or broadcast — a
+        session passes its own client address when no other session of
+        its client is running, which would otherwise get its own message
+        back later.
 
         Always returns {"to", "kind", "message_ids", "recipients",
         "thread_id", "sent_at"}; "message_id" is added whenever exactly one
@@ -524,7 +632,7 @@ class Storage:
             try:
                 delivery = self._deliver(
                     conn, from_agent=from_agent, to=to, body=body,
-                    thread_id=thread_id, sent_at=sent_at,
+                    thread_id=thread_id, sent_at=sent_at, skip=skip,
                 )
                 conn.execute("COMMIT")
             except Exception:
@@ -574,10 +682,13 @@ class Storage:
         body: str,
         thread_id: str | None,
         sent_at: str,
+        skip: frozenset[str] = frozenset(),
     ) -> "_Delivery":
         """Resolve `to` and insert one row per recipient, inside the
         caller's transaction."""
-        kind, recipients = self._resolve_recipients(conn, from_agent=from_agent, to=to)
+        kind, recipients = self._resolve_recipients(
+            conn, from_agent=from_agent, to=to, skip=skip
+        )
         thread = thread_id or (str(uuid.uuid4()) if recipients else None)
         is_fan_out = kind != KIND_DIRECT
         fanout_id = str(uuid.uuid4()) if is_fan_out else None
@@ -643,6 +754,7 @@ class Storage:
                 if rows and mark_read:
                     contested = self._claim(conn, params, rows)
                     rows = self._mark_read(conn, rows, now)
+                    self._settle_client_copies(conn, params, rows, now)
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -694,12 +806,38 @@ class Storage:
             f"AND to_group = ? AND fanout_id IN ({placeholders})",
             (params["agent"], params["group"], *unclaimed),
         )
+        # the reader's own copy, and for a session the client address it
+        # read from, are not someone else holding the message too
         shared = conn.execute(
             f"SELECT DISTINCT fanout_id FROM messages WHERE to_group = ? "
-            f"AND to_agent != ? AND fanout_id IN ({placeholders})",
-            (params["group"], params["agent"], *unclaimed),
+            f"AND to_agent NOT IN (?, ?) AND fanout_id IN ({placeholders})",
+            (params["group"], params["agent"], params["address"], *unclaimed),
         ).fetchall()
         return {r["fanout_id"] for r in shared}
+
+    @staticmethod
+    def _settle_client_copies(
+        conn: sqlite3.Connection, params: dict[str, str], rows: list[sqlite3.Row],
+        now: str,
+    ) -> None:
+        """An older agent-bus fans a repo send out to every session and to
+        their client address alike. Once a session has read its own copy,
+        the one at the client address is a duplicate nobody needs: mark it
+        read rather than leave it pending forever."""
+        if params["address"] == params["agent"]:
+            return
+        fanouts = sorted({
+            r["fanout_id"] for r in rows
+            if r["fanout_id"] is not None and r["to_agent"] == params["agent"]
+        })
+        if not fanouts:
+            return
+        placeholders = ",".join("?" * len(fanouts))
+        conn.execute(
+            f"UPDATE messages SET read_at = ?, delivered_at = COALESCE(delivered_at, ?) "
+            f"WHERE to_agent = ? AND read_at IS NULL AND fanout_id IN ({placeholders})",
+            (now, now, params["address"], *fanouts),
+        )
 
     @staticmethod
     def _mark_read(

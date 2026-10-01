@@ -552,3 +552,29 @@ def test_version_is_the_same_in_both_places():
     root = Path(__file__).resolve().parents[1]
     declared = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
     assert declared == __version__
+
+
+def test_cli_agents_lists_sessions_under_their_client(bus_paths, fake_procs):
+    from agent_bus.sessions import SessionRegistry
+
+    s, env = _shared_bus(bus_paths)
+    registry = SessionRegistry(s)
+    server, lineage = fake_procs.session()
+    registry.claim(client_address="repo-a/claude", repo_path="/code/repo-a",
+                   server=server, lineage=lineage, pinned="frontend")
+    s.set_topic("repo-a/claude-frontend", "login form")
+    # the CLI runs in a subprocess that cannot see the stand-in processes,
+    # so to it this session has ended
+    r = _run_cli(["agents"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    line = next(l for l in r.stdout.splitlines() if "repo-a/claude-frontend" in l)
+    assert line.startswith("    repo-a/claude-frontend")
+    assert "ended" in line and "login form" in line
+    assert "2 agents" in r.stdout  # sessions are not counted as agents
+
+    rows = json.loads(_run_cli(["agents", "--json"], env_extra=env).stdout)
+    by_name = {r["name"]: r for r in rows}
+    assert (by_name["repo-a/claude-frontend"]["kind"], by_name["repo-a/claude-frontend"]["live"]) == (
+        "session", False,
+    )
+    assert by_name["repo-a/claude"]["live"] is None

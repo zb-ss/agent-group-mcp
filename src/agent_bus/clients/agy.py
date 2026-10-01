@@ -37,6 +37,10 @@ class AgyHookDialect:
         first = paths[0]
         return first if isinstance(first, str) and first else None
 
+    def session_from_payload(self, payload: dict) -> str | None:
+        session = payload.get("conversationId")
+        return session if isinstance(session, str) and session else None
+
     def prompt_output(self, context: str | None) -> str:
         steps = [{"ephemeralMessage": context}] if context else []
         return json.dumps({"injectSteps": steps}) + "\n"
