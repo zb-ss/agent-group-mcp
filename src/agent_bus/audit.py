@@ -16,7 +16,7 @@ from typing import Iterable, Iterator, Literal
 
 from .paths import audit_path, ensure_parents
 
-AuditOp = Literal["send", "read", "deliver", "claim", "wake", "retire"]
+AuditOp = Literal["send", "read", "deliver", "claim", "wake", "retire", "session"]
 
 PREVIEW_LIMIT = 200
 

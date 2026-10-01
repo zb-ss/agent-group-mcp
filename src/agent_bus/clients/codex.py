@@ -37,7 +37,9 @@ HOOK_EVENTS = (
     ("UserPromptSubmit", "hook-user-prompt"),
     ("Stop", "hook-stop"),
 )
-PASSED_THROUGH_ENV = ("AGENT_BUS_INSTANCE", "AGENT_BUS_DB", "AGENT_BUS_AUDIT_LOG")
+PASSED_THROUGH_ENV = (
+    "AGENT_BUS_SESSION", "AGENT_BUS_INSTANCE", "AGENT_BUS_DB", "AGENT_BUS_AUDIT_LOG",
+)
 
 BLOCK_START = "# >>> agent-bus: managed by `agent-bus init`, regenerated on every run >>>"
 BLOCK_END = "# <<< agent-bus <<<"

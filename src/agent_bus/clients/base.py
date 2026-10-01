@@ -24,6 +24,9 @@ class HookDialect(Protocol):
     def repo_from_payload(self, payload: dict) -> str | None:
         """The session's working directory, if the payload carries one."""
 
+    def session_from_payload(self, payload: dict) -> str | None:
+        """The client's id for the session, if the payload carries one."""
+
     def prompt_output(self, context: str | None) -> str:
         """Stdout for the hook that runs before the model sees a prompt.
         `context` is the text to inject, or None when the inbox was empty."""
@@ -41,6 +44,10 @@ class StandardHookDialect:
     def repo_from_payload(self, payload: dict) -> str | None:
         cwd = payload.get("cwd")
         return cwd if isinstance(cwd, str) and cwd else None
+
+    def session_from_payload(self, payload: dict) -> str | None:
+        session = payload.get("session_id")
+        return session if isinstance(session, str) and session else None
 
     def prompt_output(self, context: str | None) -> str:
         return f"{context}\n" if context else ""

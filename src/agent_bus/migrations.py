@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from . import identity
+
 EPOCH_SIZE = 1000
 SCHEMA_EPOCH = 1
 
@@ -111,9 +113,52 @@ def _add_group_addressing_columns(conn: sqlite3.Connection) -> None:
     )
 
 
+def _add_sessions(conn: sqlite3.Connection) -> None:
+    """One row per MCP server that holds (or recently held) a session
+    address, plus a free-text topic per agent. Also files rows whose names
+    only became valid with session handles (`repo/codex-docs`) under their
+    repo. Their `client` stays NULL, as on every session row: 0.5.x parses
+    the names of a client's rows strictly and would reject theirs."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            server_pid      INTEGER NOT NULL,
+            server_started  TEXT NOT NULL,
+            name            TEXT NOT NULL,
+            client_address  TEXT NOT NULL,
+            repo_path       TEXT NOT NULL,
+            lineage         TEXT NOT NULL,
+            session_key     TEXT,
+            boot_id         TEXT,
+            pid_ns          TEXT,
+            started_at      TEXT NOT NULL,
+            last_seen       TEXT NOT NULL,
+            ended_at        TEXT,
+            PRIMARY KEY (server_pid, server_started, client_address)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_address "
+        "ON sessions (client_address)"
+    )
+    _add_column_if_missing(conn, "agents", "topic", "TEXT")
+    unfiled = conn.execute(
+        "SELECT name FROM agents WHERE client IS NULL"
+    ).fetchall()
+    for (name,) in unfiled:
+        parsed = identity.parse_or_none(name)
+        if parsed is not None and parsed.is_session:
+            conn.execute(
+                "UPDATE agents SET group_name = ? WHERE name = ?",
+                (parsed.group, name),
+            )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "base tables (0.4.x schema)", _create_base_tables),
     Migration(2, "group addressing columns", _add_group_addressing_columns),
+    Migration(3, "sessions table and agent topics", _add_sessions),
 )
 
 

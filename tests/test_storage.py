@@ -32,7 +32,10 @@ def test_upsert_records_group_and_client_from_the_name(storage):
     assert (row.group_name, row.client, row.group) == ("repo-a", "claude", "repo-a")
 
     second = storage.upsert_agent("repo-a/claude-2", "/code/repo-a")
-    assert (second.group, second.client) == ("repo-a", "claude")
+    assert (second.group, second.client_id, second.kind) == ("repo-a", "claude", "session")
+    # 0.5.x parses every name in the client column strictly, and would
+    # reject a session's
+    assert second.client is None
 
 
 def test_bare_name_is_its_own_group(storage):

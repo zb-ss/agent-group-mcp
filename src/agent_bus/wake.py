@@ -38,6 +38,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from . import identity
 from .paths import db_path, ensure_parents
 
 WAKE_CONFIG_FILENAME = "wake.json"
@@ -96,13 +97,16 @@ def _resolve_command(entry: Any) -> str | None:
 def wake_command(
     config: dict[str, Any], agent: str, group: str | None = None
 ) -> tuple[str | None, str]:
-    """Find the command that wakes `agent`: its own entry, else its repo's.
+    """Find the command that wakes `agent`: its own entry, else — for a
+    session — its client's, else its repo's.
 
     Returns ``(command, status)``; the command is None when the status is
-    ``"no-config"`` or ``"disabled"``. An agent's own entry always wins, so
-    disabling one client does not fall back to the repo-wide command.
+    ``"no-config"`` or ``"disabled"``. The most specific entry always wins,
+    so disabling one client does not fall back to the repo-wide command.
     """
-    for key in (agent, group):
+    parsed = identity.parse_or_none(agent)
+    client_address = parsed.client_address if parsed and parsed.is_session else None
+    for key in (agent, client_address, group):
         if key is None or key not in config:
             continue
         cmd = _resolve_command(config[key])

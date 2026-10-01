@@ -89,17 +89,19 @@ knows its identity. The hook commands use the same rule:
    The name is `<repo>/<client>`. This lets a client whose hooks are
    configured once per user drain the right inbox in every repo, and stay
    silent in repos that are not on the bus.
-3. **`AGENT_BUS_INSTANCE=2`** appends `-2`, for a second session of the
-   same client in the same repo (see below).
+3. **`AGENT_BUS_SESSION=<label>`** (or **`AGENT_BUS_INSTANCE=<n>`**) asks
+   for a particular session address (see [Sessions](#several-sessions-of-one-client)).
 
-The server exits with an error if none of this identifies it.
+The server exits with an error if none of this identifies it. A server that
+speaks for a client then claims a **session address** of its own, so that
+two sessions of the same client in the same repo never share an inbox.
 
 ### Names
 
 | Form | Meaning |
 | --- | --- |
-| `repo-a/claude` | one client working in `repo-a` |
-| `repo-a/claude-2` | a second concurrent session of that client |
+| `repo-a/claude-1`, `repo-a/claude-frontend` | one session of a client in `repo-a`: numbered by the bus, or labelled |
+| `repo-a/claude` | that client in `repo-a`: the address all of its sessions share |
 | `repo-a` | the repo: every agent working in it (or an agent wired under the bare name, see [Upgrading](#upgrading-an-existing-install)) |
 | `human`, `alex` | anyone without a client part — the CLI, the chat TUI |
 
@@ -107,7 +109,9 @@ The repo part is the slug of the repo's basename (`~/websites/acme.dev` →
 `acme-dev`, at most 40 characters). A client id is lowercase letters and
 digits, at most 12 characters. `/` can never appear in a repo slug, so a
 repo literally called `tools-claude` cannot collide with client `claude`
-in repo `tools`.
+in repo `tools`. A session handle is a number from 1 to 99, or a label of
+lowercase letters, digits and single dashes that starts with a letter, at
+most 24 characters.
 
 ---
 
@@ -117,20 +121,22 @@ All tools are auto-attributed to the server's identity.
 
 | Tool                                         | Returns                                                                                                                                |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `whoami()`                                   | `{name, group, client, instance, repo_path, registered_at, last_seen, mcp_client, group_members, warnings}`                             |
-| `list_agents(group=None)`                    | `[{name, group, client, repo_path, last_seen, pending_count}, …]`; pass a bare repo name as `group` to see one repo                     |
-| `send_message(to, body, thread_id=None)`     | `{to, kind, message_ids, recipients, thread_id, sent_at}`, plus `message_id` when exactly one agent received it                        |
-| `read_inbox(mark_read=True, limit=50)`       | Unread messages for self, oldest first: `[{message_id, from, to, addressed_to, kind, claimed_by, body, sent_at, thread_id, read_at, delivered_at}]` |
+| `whoami()`                                   | `{name, group, client, client_address, session, instance, topic, repo_path, registered_at, last_seen, mcp_client, group_members, warnings}` |
+| `list_agents(group=None)`                    | `[{name, kind, group, client, topic, repo_path, last_seen, pending_count, live}, …]`; pass a bare repo name as `group` to see one repo; `kind` is `session`, `client` or `agent`, and `live` says whether a running server holds a session |
+| `send_message(to, body, thread_id=None)`     | `{to, kind, message_ids, recipients, thread_id, sent_at}`, plus `message_id` when exactly one agent received it and `note` when no running session is there to read it |
+| `read_inbox(mark_read=True, limit=50)`       | Unread messages for this session — its own, plus any sent to its client address that no other session took — oldest first: `[{message_id, from, to, addressed_to, kind, claimed_by, body, sent_at, thread_id, read_at, delivered_at}]` |
+| `set_session(label=None, topic=None)`        | Renames this session to `<repo>/<client>-<label>` and/or sets the topic shown in `list_agents`: `{name, client_address, topic}`         |
 | `read_thread(thread_id, limit=100)`          | Full conversation across participants, ordered by `sent_at`.                                                                           |
 | `tail_audit(limit=50)`                       | Last N audit-log entries (any agent).                                                                                                  |
 
 ### Addressing
 
-| `to`            | Reaches                                         | `kind`      |
-| --------------- | ----------------------------------------------- | ----------- |
-| `repo-a/codex`  | exactly that agent                              | `direct`    |
-| `repo-a`        | every agent in `repo-a`, except the sender      | `group`     |
-| `*`             | every agent on the bus, except the sender       | `broadcast` |
+| `to`                 | Reaches                                                                 | `kind`      |
+| -------------------- | ----------------------------------------------------------------------- | ----------- |
+| `repo-a/codex-frontend` | exactly that session                                                    | `direct`    |
+| `repo-a/codex`       | whichever session of that client reads it first (never the sender)     | `direct`    |
+| `repo-a`             | every client in `repo-a`, except the sender                            | `group`     |
+| `*`                  | every agent on the bus, except the sender                              | `broadcast` |
 
 A name nobody holds is an **error**, not a dead letter: nothing is sent and
 the message lists the agents of that repo (or close matches). A group or
@@ -167,12 +173,48 @@ when a more recently seen client shares its repo, so a repo where everyone
 has been away still gets its mail. Direct messages are never skipped. Use
 `agent-bus forget` for a client you have stopped using.
 
-A **second session of the same client** in the same repo reads the same
-config file, so it would share a name — and an inbox — with the first.
-Start it with `AGENT_BUS_INSTANCE=2` in its environment and it becomes
-`repo-a/claude-2`. `whoami` warns when a name was last registered for a
-different repo path, which is the other way two processes end up sharing
-one mailbox.
+`whoami` warns when a name was last registered for a different repo path,
+which is the way two repos end up sharing one mailbox.
+
+### Several sessions of one client
+
+Every session of a client in a repo reads the same config file, so the
+config can only say *which client* it is. The session address comes from
+the bus: each MCP server claims one when it starts.
+
+- The first session is `repo-a/claude-1`, the next `repo-a/claude-2`, and
+  so on — the lowest number no running session holds.
+- A session can be named after its work instead: `set_session(label=
+  "frontend", topic="login form")` makes it `repo-a/claude-frontend`, and its
+  unread mail moves with it. To start with a name, set
+  `AGENT_BUS_SESSION=frontend` in the client's environment.
+- `repo-a/claude` is shared by all of them. A message sent there is taken
+  by whichever session reads it first, so it suits "any Claude in this
+  repo, please"; a session never receives what it sent there itself.
+  Address a session by its own name when it has to be that one.
+- A repo-wide or broadcast message costs one copy per client, delivered
+  at its shared address, and the claiming rules above apply unchanged.
+- The hooks find their session through the client process that started
+  both them and its MCP server (and, for Claude Code, its session id). A
+  hook that cannot tell which session it runs for surfaces only the shared
+  address's mail — never another session's own.
+- A session ends with its server process. A numbered address is then given
+  up and its unread mail moves to the shared address; a labelled one is
+  kept, mail included, for whichever session takes that label next. For
+  `AGENT_BUS_SESSION_RESUME_HOURS` (default 1) the address also stays
+  reserved for the same client process or session id, so a restarted MCP
+  server or a resumed conversation gets its old address back.
+- Whether a session's process has ended is decided on evidence only. If
+  the process table cannot be read, or the process lives in another PID
+  namespace, the session counts as running.
+- Servers that cannot be told apart — one process starting several with
+  no session ids to separate them — share one session address, which is
+  how every session of a client behaved before. Such an address can carry
+  a topic but not a label, since a label would rename all of them.
+
+`list_agents` and `agent-bus agents` show each session under its client,
+with whether it is running and its topic. Set `AGENT_BUS_SESSIONS=0` to go
+back to one shared identity per client and repo.
 
 ---
 
@@ -180,12 +222,14 @@ one mailbox.
 
 ```sql
 agents(name PK, repo_path, registered_at, last_seen,
-       group_name NULL, client NULL)
+       group_name NULL, client NULL, topic NULL)
 messages(message_id PK, from_agent, to_agent, body, thread_id,
          sent_at, read_at NULL, delivered_at NULL,
          addressed_to NULL, fanout_id NULL, to_group NULL, claimed_by NULL)
+sessions(server_pid, server_started, client_address,   -- PK
+         name, repo_path, lineage, session_key NULL, started_at, last_seen)
 -- Indices on (to_agent, read_at), (thread_id, sent_at),
--- agents(group_name) and messages(fanout_id).
+-- agents(group_name), messages(fanout_id) and sessions(client_address).
 -- Startup: PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
 ```
 
@@ -219,7 +263,7 @@ one JSON-lines record to `audit.log` **before returning**. Row shape:
 ```json
 {
   "ts": "<ISO8601 UTC>",
-  "op": "send" | "read" | "deliver" | "claim" | "wake" | "retire",
+  "op": "send" | "read" | "deliver" | "claim" | "wake" | "retire" | "session",
   "actor": "<agent or 'human'>",
   "message_id": "...",
   "from": "...",
@@ -235,8 +279,9 @@ The full body lives only in SQLite — the log keeps a preview + hash so
 it stays grep-friendly while remaining tamper-evident. Hook deliveries
 write a paired `read` + `deliver` row so the log shows the hook path.
 `claim` marks the agent that took a repo-wide message on, `wake` a wake
-command that was launched, and `retire` a name that `agent-bus init`
-replaced.
+command that was launched, `retire` a name that `agent-bus init`
+replaced, and `session` a session address being claimed, renamed or given
+up (with how much unread mail moved).
 
 ---
 
@@ -384,8 +429,10 @@ What differs per client:
   server table sits between two marker comments and only that span is ever
   rewritten; a `[mcp_servers.agent-bus]` table of your own is left alone,
   even with `--force`. Codex starts MCP servers with a minimal
-  environment, so `AGENT_BUS_INSTANCE`, `AGENT_BUS_DB` and
-  `AGENT_BUS_AUDIT_LOG` are passed through with `env_vars`.
+  environment, so `AGENT_BUS_SESSION`, `AGENT_BUS_INSTANCE`, `AGENT_BUS_DB`
+  and `AGENT_BUS_AUDIT_LOG` are passed through with `env_vars`. When one
+  Codex process starts the MCP servers of several sessions, the bus cannot
+  tell those sessions apart and they share one session address.
 - **Antigravity CLI** — only starts MCP servers configured per user or
   bundled with a plugin, so the repo is wired as a workspace plugin of its
   own; nothing of yours under `.agents/` is touched. The plugin loads once
@@ -588,7 +635,8 @@ into the same `.claude/settings.json`:
       "mcp__agent-bus__send_message",
       "mcp__agent-bus__read_inbox",
       "mcp__agent-bus__read_thread",
-      "mcp__agent-bus__tail_audit"
+      "mcp__agent-bus__tail_audit",
+      "mcp__agent-bus__set_session"
     ]
   }
 }
@@ -675,7 +723,11 @@ recovery requires SQLite + audit cross-reference.
 | `AGENT_BUS_NAME`                  | server, hooks, CLI | The agent's full name. Wins over everything else.                                        |
 | `AGENT_BUS_REPO`                  | server, hooks      | The repo this agent works in.                                                            |
 | `AGENT_BUS_CLIENT`                | server, hooks      | Client id, same as `--client`; used to derive the name when `AGENT_BUS_NAME` is unset.   |
-| `AGENT_BUS_INSTANCE`              | server, hooks      | `2`..`99`: this is another session of the same client in the same repo.                  |
+| `AGENT_BUS_SESSION`               | server, hooks      | A label this session asks for: it becomes `<repo>/<client>-<label>`.                    |
+| `AGENT_BUS_INSTANCE`              | server, hooks      | `1`..`99`: the session number this session asks for.                                     |
+| `AGENT_BUS_SESSIONS`              | server, hooks      | `0` turns session addresses off: every session of a client shares `<repo>/<client>`.     |
+| `AGENT_BUS_SESSION_RESUME_HOURS`  | server             | How long an ended session's address stays reserved for its own comeback. Default `1`, `0` disables. |
+| `AGENT_BUS_PROCESS_LOOKUP_TIMEOUT`| server, hooks      | Seconds to wait for `ps` where there is no `/proc` (macOS). Default `2`.                 |
 | `AGENT_BUS_FANOUT_MAX_IDLE_DAYS`  | senders            | Skip long-idle clients in repo-wide and broadcast sends. Default `14`, `0` disables.     |
 | `AGENT_BUS_HOOK_PAYLOAD_TIMEOUT`  | hooks              | Seconds a hook waits for its input payload before going on without it. Default `5`.     |
 | `AGENT_BUS_HOOK_TIMEOUT_MS`       | opencode plugin    | Milliseconds the plugin waits for a hook before sending the model request anyway. Default `10000`. |

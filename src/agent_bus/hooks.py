@@ -3,7 +3,10 @@
 Exposed as `agent-bus hook-user-prompt` (before the model sees a prompt)
 and `agent-bus hook-stop` (when the agent is about to stop). Whose inbox to
 drain comes from `resolution.resolve` — $AGENT_BUS_NAME, or `--client` plus
-the repo the hook payload reports. What to print is the client's business
+the repo the hook payload reports — narrowed to the session this hook runs
+for (`sessions.SessionRegistry.for_hook`). A hook that cannot tell which
+session it belongs to drains only the address the client's sessions share,
+never another session's own mail. What to print is the client's business
 (`clients.hook_dialect`); draining and formatting are shared. Each delivered
 message gets a sibling `deliver` audit row so the log shows the hook path.
 """
@@ -19,6 +22,7 @@ from typing import Iterable, TextIO
 from . import clients, identity, resolution, settings
 from .clients.base import HookDialect
 from .identity import KIND_BROADCAST, KIND_GROUP
+from .sessions import SessionRegistry
 from .storage import Message, Storage
 
 
@@ -107,7 +111,24 @@ def _identify(
     except resolution.IdentityError as e:
         sys.stderr.write(f"agent-bus hook: {e}\n")
         raise SystemExit(2) from None
-    return (who.name if who else None), dialect
+    if who is None:
+        return None, dialect
+    return _session_of(store, who.name, payload, dialect), dialect
+
+
+def _session_of(store: Storage, name: str, payload: dict, dialect: HookDialect) -> str:
+    """The session address this hook runs for, when this one can be told;
+    otherwise the client address all its sessions share. Never a session
+    address merely asked for (`AGENT_BUS_SESSION`): another session may
+    hold it."""
+    parsed = identity.parse_or_none(name)
+    if not settings.sessions_enabled() or parsed is None or parsed.client_address is None:
+        return name
+    key = dialect.session_from_payload(payload) or clients.session_key(
+        parsed.client, os.environ
+    )
+    found = SessionRegistry(store).for_hook(parsed.client_address, session_key=key)
+    return found or parsed.client_address
 
 
 GROUP_LEGEND = (
@@ -120,17 +141,20 @@ FYI_HEADER = (
 )
 
 
-def _audience(m: Message) -> str:
+def _audience(m: Message, reader: str) -> str:
     if m.kind == KIND_GROUP:
         return f" to everyone in {m.addressed_to}"
     if m.kind == KIND_BROADCAST:
         return " to everyone on the bus"
+    parsed = identity.parse_or_none(reader)
+    if parsed is not None and parsed.is_session and m.to_agent == parsed.client_address:
+        return f" to any {m.to_agent} session"
     return ""
 
 
-def _format_message(m: Message) -> str:
+def _format_message(m: Message, reader: str) -> str:
     return (
-        f"- from {m.from_agent}{_audience(m)} at {m.sent_at} "
+        f"- from {m.from_agent}{_audience(m, reader)} at {m.sent_at} "
         f"(thread {m.thread_id}): {m.body}"
     )
 
@@ -143,13 +167,13 @@ def _format_messages(msgs: Iterable[Message], reader: str) -> str:
     for m in msgs:
         (taken if m.is_claimed_by_other(reader) else mine).append(m)
 
-    lines = [_format_message(m) for m in mine]
+    lines = [_format_message(m, reader) for m in mine]
     if any(m.kind == KIND_GROUP for m in mine):
         lines.append(GROUP_LEGEND)
     if taken:
         lines.append(FYI_HEADER)
         lines.extend(
-            f"{_format_message(m)} [already picked up by {m.claimed_by}]"
+            f"{_format_message(m, reader)} [already picked up by {m.claimed_by}]"
             for m in taken
         )
     return "\n".join(lines)

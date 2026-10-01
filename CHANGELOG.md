@@ -3,6 +3,68 @@
 Notable changes per release. This project is pre-1.0: minor versions may
 change behaviour, and each release says what to expect.
 
+## Unreleased
+
+Several sessions of the same client can now work in the same repository
+at once without sharing an inbox, and can message each other.
+
+### Added
+
+- **Session addresses.** Each MCP server claims an address of its own when
+  it starts: `my-repo/claude-1`, `my-repo/claude-2`, … The hooks find
+  their session through the client process that started both them and the
+  server (and, for Claude Code, its session id), so each session surfaces
+  its own mail. A hook that cannot tell which session it belongs to
+  surfaces only mail for the client's shared address — never another
+  session's.
+- **`set_session(label, topic)`** names a session after its work
+  (`my-repo/claude-frontend`) and sets a topic shown in the roster. Unread
+  mail moves with it. `AGENT_BUS_SESSION=<label>` asks for a label at
+  start-up.
+- A labelled session that ends keeps its address and unread mail, so a
+  session that takes the same label again picks up where it left off. Any
+  ended session's address stays reserved for an hour
+  (`AGENT_BUS_SESSION_RESUME_HOURS`) for the same client process or
+  session id, so a restarted MCP server keeps its address.
+- `list_agents` and `agent-bus agents` show sessions under their client,
+  with whether each is running and its topic. `send_message` adds a `note`
+  when no running session is there to read the message.
+- `AGENT_BUS_SESSIONS=0` turns session addresses off.
+- New audit operation: `session`.
+
+### Changed
+
+- **`my-repo/claude` is now the address every session of that client
+  shares:** a message sent there is taken by whichever session reads it
+  first, and a session never receives what it sent there itself. With one
+  session running this behaves as before.
+- A repo-wide or broadcast message costs one copy per client, at that
+  shared address, rather than one per session.
+- A session sends as its session address, so replies reach that session.
+- Session numbers start at 1: `my-repo/claude-1` is the first session, not
+  another name for `my-repo/claude`. `AGENT_BUS_INSTANCE=1` now asks for
+  session 1.
+- Session handles may be labels (`-frontend`, `-release-notes`) as well as
+  numbers. A name such as `my-repo/codex-docs`, previously filed as a repo of
+  its own, now belongs to `my-repo`; the database migration files existing
+  rows accordingly.
+- Re-run `agent-bus init` to pre-approve the new `set_session` tool for
+  Claude Code and to pass `AGENT_BUS_SESSION` through to Codex.
+
+### Compatibility
+
+- The database gains a `sessions` table and an `agents.topic` column; the
+  migration is additive, and older versions keep working against it. An
+  older version sharing the database sends to `my-repo/claude` as before,
+  which the sessions now share, and the duplicate copies its repo-wide
+  sends leave are cleared once a session reads its own.
+- Until every MCP server has restarted on the new version, an older
+  server answering as `my-repo/claude` can miss a repo-wide message sent
+  by a session of the same client while no other session is running.
+- A name with a dash after the client, such as `my-repo/claude-desktop`
+  set by hand, is now read as a session of `claude`: it shares mail sent
+  to `my-repo/claude`. Rename such an agent if that is not what it is.
+
 ## 0.5.1
 
 ### Fixed

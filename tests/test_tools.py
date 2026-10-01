@@ -48,6 +48,13 @@ def mcp_other(bus_paths, storage):
     return build_server(name="other/claude", repo_path="/repo/other", storage=storage)
 
 
+def _session(fake_procs) -> dict:
+    """build_server arguments for a session of its own: a fresh client
+    process and its server."""
+    server, lineage = fake_procs.session()
+    return {"process": server, "lineage": lineage}
+
+
 def _unwrap(out):
     """FastMCP wraps list results as {"result": [...]}."""
     if isinstance(out, dict) and "result" in out:
@@ -150,7 +157,8 @@ def test_clients_in_one_repo_can_message_each_other(
                  {"to": "shared/codex", "body": "are you touching storage.py?"})
     assert sent["recipients"] == ["shared/codex"]
     (msg,) = _unwrap(_call(mcp_shared_codex, "read_inbox", {}))
-    assert msg["from"] == "shared/claude"
+    # sent from the session, so a reply reaches exactly that session
+    assert msg["from"] == "shared/claude-1"
 
 
 def test_bare_repo_name_reaches_both_clients(
@@ -172,6 +180,7 @@ def test_group_send_from_a_member_skips_itself(
     mcp_shared_claude, mcp_shared_codex
 ):
     sent = _call(mcp_shared_claude, "send_message", {"to": "shared", "body": "team?"})
+    # no other claude session is running, so its client address is skipped too
     assert sent["recipients"] == ["shared/codex"]
     assert _unwrap(_call(mcp_shared_claude, "read_inbox", {})) == []
 
@@ -200,9 +209,15 @@ def test_whoami_describes_the_identity_and_its_repo_mates(
 ):
     out = _call(mcp_shared_claude, "whoami", {})
     assert (out["name"], out["group"], out["client"], out["instance"]) == (
-        "shared/claude", "shared", "claude", None,
+        "shared/claude-1", "shared", "claude", 1,
     )
-    assert [m["name"] for m in out["group_members"]] == ["shared/claude", "shared/codex"]
+    assert (out["client_address"], out["session"]) == ("shared/claude", "1")
+    assert [(m["name"], m["kind"], m["live"]) for m in out["group_members"]] == [
+        ("shared/claude", "client", None),
+        ("shared/claude-1", "session", True),
+        ("shared/codex", "client", None),
+        ("shared/codex-1", "session", True),
+    ]
     assert out["warnings"] == []
 
 
@@ -217,11 +232,15 @@ def test_list_agents_can_be_narrowed_to_one_repo(
 ):
     everyone = _unwrap(_call(mcp_other, "list_agents", {}))
     assert [a["name"] for a in everyone] == [
-        "other/claude", "shared/claude", "shared/codex",
+        "other/claude", "other/claude-1", "shared/claude", "shared/claude-1",
+        "shared/codex", "shared/codex-1",
     ]
     shared = _unwrap(_call(mcp_other, "list_agents", {"group": "shared"}))
-    assert [(a["name"], a["client"]) for a in shared] == [
-        ("shared/claude", "claude"), ("shared/codex", "codex"),
+    assert [(a["name"], a["client"], a["kind"]) for a in shared] == [
+        ("shared/claude", "claude", "client"),
+        ("shared/claude-1", "claude", "session"),
+        ("shared/codex", "codex", "client"),
+        ("shared/codex-1", "codex", "session"),
     ]
 
 
@@ -238,25 +257,27 @@ def test_server_derives_its_name_from_the_client_and_repo(
 
     mcp = build_server(client="codex", storage=storage)
     out = _call(mcp, "whoami", {})
-    assert (out["name"], out["repo_path"]) == ("repo-a/codex", str(repo))
+    assert (out["name"], out["repo_path"]) == ("repo-a/codex-1", str(repo))
 
 
-def test_second_session_of_a_client_gets_its_own_inbox(
-    bus_paths, storage, mcp_shared_claude, monkeypatch
+def test_a_pinned_instance_is_the_session_address_asked_for(
+    bus_paths, storage, fake_procs, monkeypatch
 ):
     from agent_bus.server import build_server
 
     monkeypatch.setenv("AGENT_BUS_NAME", "shared/claude")
     monkeypatch.setenv("AGENT_BUS_REPO", SHARED_REPO)
-    monkeypatch.setenv("AGENT_BUS_INSTANCE", "2")
-    second = build_server(storage=storage)
+    first = build_server(storage=storage, **_session(fake_procs))
+    monkeypatch.setenv("AGENT_BUS_INSTANCE", "5")
+    second = build_server(storage=storage, **_session(fake_procs))
 
+    assert _call(first, "whoami", {})["name"] == "shared/claude-1"
     out = _call(second, "whoami", {})
-    assert (out["name"], out["instance"]) == ("shared/claude-2", 2)
+    assert (out["name"], out["instance"]) == ("shared/claude-5", 5)
 
-    _call(mcp_shared_claude, "send_message", {"to": "shared/claude-2", "body": "hi 2"})
-    assert [m["body"] for m in _unwrap(_call(second, "read_inbox", {}))] == ["hi 2"]
-    assert _unwrap(_call(mcp_shared_claude, "read_inbox", {})) == []
+    _call(first, "send_message", {"to": "shared/claude-5", "body": "hi 5"})
+    assert [m["body"] for m in _unwrap(_call(second, "read_inbox", {}))] == ["hi 5"]
+    assert _unwrap(_call(first, "read_inbox", {})) == []
 
 
 def test_whoami_warns_when_the_name_belongs_to_another_repo(bus_paths, storage):

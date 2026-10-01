@@ -32,7 +32,8 @@ from . import wake
 from .migrations import SchemaTooNewError
 from .paths import audit_path
 from .clients.base import UnreadableConfigError
-from .storage import BROADCAST, Storage, UnknownRecipientError
+from .sessions import SessionRegistry
+from .storage import BROADCAST, KIND_SESSION, Storage, UnknownRecipientError
 
 NAME_COL = 18
 TARGET_COL = 18
@@ -156,16 +157,20 @@ def cmd_inbox(args: argparse.Namespace) -> int:
 def cmd_agents(args: argparse.Namespace) -> int:
     store = Storage()
     rows = store.list_agents_with_counts()
+    live = SessionRegistry(store).live_names()
     if args.json:
-        sys.stdout.write(
-            json.dumps([a.to_dict(pending_count=c) for a, c in rows]) + "\n"
-        )
+        out = []
+        for a, c in rows:
+            row = a.to_dict(pending_count=c)
+            row["live"] = (a.name in live) if a.kind == KIND_SESSION else None
+            out.append(row)
+        sys.stdout.write(json.dumps(out) + "\n")
         return 0
     if not rows:
         sys.stdout.write("(no agents registered yet)\n")
         return 0
-    # indented members are two columns in, so leave room for them
-    name_col = max(NAME_COL, max(len(a.name) for a, _ in rows) + 2)
+    # sessions sit four columns in, so leave room for them
+    name_col = max(NAME_COL, max(len(a.name) for a, _ in rows) + 4)
     by_group: dict[str, list] = {}
     for agent, count in rows:
         by_group.setdefault(agent.group, []).append((agent, count))
@@ -174,20 +179,29 @@ def cmd_agents(args: argparse.Namespace) -> int:
         if not rest and first.name == group:
             _emit(_agent_line(first, _count, name_col=name_col, show_repo=True))
             continue
+        agents = sum(1 for a, _ in members if a.kind != KIND_SESSION)
         _emit([
             (f"class:agent-{fmt.safe_class(group)}", group.ljust(name_col)),
             ("", "  "),
             ("class:system", f"repo={first.repo_path}"),
             ("", "  "),
-            ("class:ts", f"{len(members)} agents" if rest else "1 agent"),
+            ("class:ts", f"{agents} agents" if agents != 1 else "1 agent"),
         ])
         for agent, count in members:
-            _emit(_agent_line(agent, count, name_col=name_col, show_repo=False, indent=2))
+            if agent.kind == KIND_SESSION:
+                state = "running" if agent.name in live else "ended"
+                _emit(_agent_line(
+                    agent, count, name_col=name_col, show_repo=False, indent=4,
+                    state=state,
+                ))
+            else:
+                _emit(_agent_line(agent, count, name_col=name_col, show_repo=False, indent=2))
     return 0
 
 
 def _agent_line(
-    agent, count: int, *, name_col: int, show_repo: bool, indent: int = 0
+    agent, count: int, *, name_col: int, show_repo: bool, indent: int = 0,
+    state: str | None = None,
 ) -> list[fmt.Fragment]:
     line: list[fmt.Fragment] = [
         ("", " " * indent),
@@ -195,12 +209,16 @@ def _agent_line(
     ]
     if show_repo:
         line += [("", "  "), ("class:system", f"repo={agent.repo_path}")]
+    if state is not None:
+        line += [("", "  "), ("class:system" if state == "running" else "class:ts", state)]
     line += [
         ("", "  "),
         ("class:ts", f"seen {fmt.humanize_relative(agent.last_seen)}"),
         ("", "  "),
         ("class:thread" if count == 0 else "class:op-send", f"pending={count}"),
     ]
+    if agent.topic:
+        line += [("", "  "), ("class:system", agent.topic)]
     return line
 
 
