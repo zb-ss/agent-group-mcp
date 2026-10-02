@@ -249,7 +249,7 @@ def test_a_non_utf8_config_is_reported_not_crashed(tmp_path, codex):
     assert (repo / ".codex" / "config.toml").read_bytes() == original
 
 
-def test_one_unreadable_repo_does_not_abandon_the_others(tmp_path, capsys):
+def test_one_unreadable_repo_does_not_abandon_the_others(tmp_path, capsys, bus_paths):
     """A --scan --apply run must not stop partway and leave the rest unwired."""
     from agent_bus import cli
 
