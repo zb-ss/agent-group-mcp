@@ -9,6 +9,19 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _never_the_real_bus(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Point every test at a throwaway database and audit log, including
+    the ones that do not ask for `bus_paths`. A test that reaches the
+    default paths opens the user's real bus — and runs any pending schema
+    migration on it."""
+    root = tmp_path_factory.mktemp("bus")
+    monkeypatch.setenv("AGENT_BUS_DB", str(root / "bus.db"))
+    monkeypatch.setenv("AGENT_BUS_AUDIT_LOG", str(root / "audit.log"))
+
+
 @pytest.fixture
 def bus_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     db = tmp_path / "bus.db"
