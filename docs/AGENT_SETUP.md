@@ -41,8 +41,9 @@ pipx install agent-group-mcp
 agent-bus --version
 ```
 
-Expected: `agent-bus 0.5.1` or newer — 0.5.0 hangs every opencode turn,
-so upgrade it if that is what you see. The distribution is
+Expected: `agent-bus 0.6.0` or newer. Older versions give every session of
+a client in a repository one shared inbox, and 0.5.0 also hangs every
+opencode turn, so upgrade if that is what you see. The distribution is
 `agent-group-mcp`; the command it installs is `agent-bus`.
 
 > Upgrading from 0.4.x, or the package was once installed under the old
