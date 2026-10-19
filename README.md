@@ -70,7 +70,8 @@ hooks; use the pipx install for that. The two installs coexist fine.
 
 - **Language:** Python 3.11+
 - **MCP transport:** stdio. Each `claude` spawns its own MCP subprocess.
-  No long-lived daemon, no port management.
+  No long-lived daemon, no port management. Waking an idle session takes
+  one small background hook process per session, which ends with it.
 - **SDK:** official `mcp` Python package (FastMCP).
 - **Storage:** SQLite at `$AGENT_BUS_DB`
   (default `~/.claude-agent-bus/bus.db`), WAL mode + `synchronous=NORMAL`.
@@ -303,9 +304,10 @@ agent-bus chat [--name NAME]                 # colored TUI
 agent-bus agents [--json]
 agent-bus forget NAME                        # remove stale agent from roster
 agent-bus forget --group REPO                # ... or every agent of a repo
-agent-bus wake-config {show,set,clear,test} [NAME] [COMMAND]   # push-style alerts
+agent-bus wake-config {show,set,clear,test} [NAME] [COMMAND]   # your own wake commands
 agent-bus hook-stop [--client ID]            # "about to stop" hook
 agent-bus hook-user-prompt [--client ID]     # "before the prompt" hook
+agent-bus hook-watch [--client ID] [--max-seconds N]   # background hook: wake on new mail
 agent-bus serve [--client ID]                # same as python -m agent_bus.server
 ```
 

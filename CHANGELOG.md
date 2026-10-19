@@ -230,7 +230,7 @@ Existing agents keep their names and their unread mail; upgrading the
 package alone changes nothing. Re-run `agent-bus init` to move a
 repository onto per-client names — the old name is retired and its mail is
 picked up by the first agent in that repository to read. Full steps:
-[`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md#9-upgrading-from-04x).
+[`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md#11-upgrading-from-04x).
 
 An older agent-bus keeps working against a migrated database; it simply
 does not expand a repository name into its agents.

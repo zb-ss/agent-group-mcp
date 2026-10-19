@@ -8,6 +8,17 @@ it too.
 Scope: one machine, one user. Everything is local — SQLite plus an
 append-only log under `~/.claude-agent-bus/`. No network calls, no daemon.
 
+What a finished setup gives every wired repository:
+
+- an inbox per client and per running session, and addressing by session,
+  by client, by repository or to everyone;
+- mail shown to the agent at its next turn, and a Stop hook that keeps the
+  turn open until the agent has handled it;
+- **an idle agent woken when mail arrives** — natively for Claude Code,
+  Codex and opencode, or by a command of your own (`wake.json`) for any
+  client;
+- an audit log of every send, read, claim and wake.
+
 ---
 
 ## Rules for the agent running this
@@ -20,6 +31,9 @@ append-only log under `~/.claude-agent-bus/`. No network calls, no daemon.
    one machine. Step 7 covers ignoring it.
 4. Steps 5 and 6 need a human: two of the four clients ask for trust or
    approval interactively, and neither can be granted from a script.
+5. **Only message sessions the user started for the check.** Step 8's wake
+   test makes the receiving agent take a turn. Ask the user which session
+   to use; never send test mail to an agent somebody is working with.
 
 ---
 
@@ -49,7 +63,8 @@ opencode turn, so upgrade if that is what you see. The distribution is
 > Upgrading from 0.4.x, or the package was once installed under the old
 > name `agent-bus`? Run `pipx uninstall agent-bus` first so only one
 > package owns the command, then install as above. Read
-> [Upgrading](#9-upgrading-from-04x) before wiring anything.
+> [Upgrading](#11-upgrading-from-04x) before wiring anything. Already on
+> 0.5.x or 0.6.x? Follow [step 10](#10-upgrading-from-05x-or-06x).
 
 To install from a source checkout instead:
 
@@ -62,12 +77,12 @@ pipx install /path/to/agent-group-mcp --force
 `init` writes config for the clients you name. Pick from what is actually
 installed:
 
-| Client | `--clients` value | Detect with |
-| --- | --- | --- |
-| Claude Code | `claude` | `command -v claude` |
-| Codex CLI | `codex` | `command -v codex` |
-| Antigravity CLI | `agy` | `command -v agy` |
-| opencode | `opencode` | `command -v opencode` |
+| Client | `--clients` value | Detect with | Woken when idle |
+| --- | --- | --- | --- |
+| Claude Code | `claude` | `command -v claude` | yes, from 2.1.290: `claude --version` |
+| Codex CLI | `codex` | `command -v codex` | yes, where `codex queue --help` works |
+| Antigravity CLI | `agy` | `command -v agy` | only with a `wake.json` command (step 9) |
+| opencode | `opencode` | `command -v opencode` | yes |
 
 ```bash
 agent-bus init --help | grep -A2 -- --clients
@@ -75,6 +90,18 @@ agent-bus init --help | grep -A2 -- --clients
 
 If only one client is installed, wire only that one. Wiring a client you
 do not use is harmless but leaves unused files in the repo.
+
+An older Claude Code still gets mail at every turn; it just is not woken
+while idle. If the user wants that, upgrade Claude Code **before** step 4:
+`init` decides whether to write the wake hook from the version it finds
+then.
+
+**Settings.** Defaults suit most setups; every value is an environment
+variable listed in the README's *Environment variables*. Most are read by
+the MCP servers and hooks, so they must be in the environment the clients
+start from — the shell profile, not a single terminal.
+`AGENT_BUS_WATCH_HOURS` and `AGENT_BUS_NATIVE_WAKE` are also read by
+`init` and take effect when it next runs.
 
 ## 4. Wire your repositories
 
@@ -135,7 +162,8 @@ hooks have run for it, that is after its first turn.
 when asked. The workspace plugin loads immediately after that; no restart
 needed.
 
-Claude Code and opencode need no approval step.
+Claude Code and opencode need no approval step beyond Claude Code's
+folder-trust prompt on first start.
 
 ## 6. Restart the clients
 
@@ -244,7 +272,59 @@ agent-bus tail --json --limit 50 | grep '"op": "wake"'
 A Claude Code or opencode session that is waiting shows as `watch`; a
 Codex session that has had a turn as `push`, with state `idle` or `busy`.
 
-## 9. Upgrading from 0.4.x
+**8g. The wake test, per client.** Ask the user to start one session of the
+client in a wired repository and leave it at its prompt (for Codex: after
+one turn, so its hooks have run). Then, from a shell:
+
+```bash
+agent-bus send --to my-repo/claude "agent-bus wake test: reply with the word PONG"
+# a few seconds later:
+agent-bus tail --json --limit 20 | grep '"op": "wake"'
+```
+
+| Client | Pass looks like |
+| --- | --- |
+| Claude Code | Within a few seconds the session starts a turn on its own, shows `agent-bus: new mail`, and answers. The audit has a `wake` row with `"wake_status": "woke"`. |
+| Codex | Within about ten seconds a turn starts with `[agent-bus] New mail from peers has arrived` and the agent answers. The `wake` row says `"wake_status": "fired:OK"`. |
+| opencode | Within a few seconds a turn starts with the mail and the agent answers. The `wake` row says `"wake_status": "woke"`. |
+
+Nothing happens? Work through the wake rows of the troubleshooting table.
+A `claude -p` run is never woken, by design.
+
+## 9. Optional: commands of your own (`wake.json`)
+
+For a client without native wake (Antigravity CLI), or to do something
+else when mail arrives — a desktop notification, a terminal multiplexer
+pane, a webhook — set a command per agent or per repository:
+
+```bash
+agent-bus wake-config set my-repo/agy 'notify-send "agent-bus" "$AGENT_BUS_BODY_PREVIEW"'
+agent-bus wake-config test my-repo/agy     # fires it once
+agent-bus wake-config show
+```
+
+An entry replaces native wake for that agent, so do not add one for a
+client that wakes natively unless the user wants it replaced;
+`agent-bus wake-config set <name> false` turns waking off for an agent.
+Always quote the variables in a command: message bodies are written by
+other agents.
+
+## 10. Upgrading from 0.5.x or 0.6.x
+
+1. Upgrade on this machine: `pipx upgrade agent-group-mcp`, then
+   `agent-bus --version`. The database migrates on first use, after saving
+   a copy beside it; sessions still running the old version keep working.
+2. Re-run `init` with the roots and `--clients` used before (step 4). This
+   adds the Claude Code wake hook to `.claude/settings.json` and
+   regenerates the opencode plugin. The Codex hook commands are unchanged,
+   so Codex does not ask for approval again.
+3. Restart the client sessions (step 6), then run 8f and 8g.
+
+A `wake.json` entry written before keeps working, and now also replaces
+native wake for its agent: remove entries that only drove a terminal pane
+if native wake should take over.
+
+## 11. Upgrading from 0.4.x
 
 Before 0.5.0 each repository had a single agent named after the repository
 (`my-repo`). Those names still work: an agent with no client part is a
@@ -260,6 +340,7 @@ repository with one agent in it.
    name is now the repository's address, and the first agent there to read
    picks it up.
 4. Restart the clients (step 6). Re-approve Codex hooks (step 5).
+5. Run the checks in step 8, including the wake test (8g).
 
 `.agent-bus-name` and `.agent-bus-ignore` files keep working unchanged, as
 do `wake.json` entries keyed by the old name — those now apply to every
@@ -271,7 +352,7 @@ yourself: set `AGENT_BUS_NAME` to `<repo>/<client>`, and add
 format that client expects, which matters — Codex in particular discards a
 hook whose output starts with `[` but is not JSON.
 
-## 10. More than one machine
+## 12. More than one machine
 
 The generated wiring is per-machine: it contains absolute paths to a
 `pipx` venv. If you sync dotfiles or repositories between machines:
@@ -283,8 +364,12 @@ The generated wiring is per-machine: it contains absolute paths to a
   or an older binary will reject the arguments.
 - The database and audit log are per-machine too. Agents on different
   machines cannot see each other; the bus is local by design.
+- Repeat on each machine: upgrade the package, check the client versions
+  (step 3), run `init`, restart the clients, and run the wake test (8g).
+  A Codex config synced between machines needs no change; it works once
+  each machine has the new package.
 
-## 11. Removing it
+## 13. Removing it
 
 ```bash
 agent-bus forget <name>            # one agent off the roster
@@ -295,7 +380,9 @@ Message history is kept either way; a forgotten agent reappears if its
 client reconnects.
 
 To unwire a repository, delete the generated files listed in step 7 from
-it. To remove everything, `pipx uninstall agent-group-mcp` and delete
+it. To keep everything but the waking, re-run `init` with
+`AGENT_BUS_NATIVE_WAKE=0`, and set the same variable where the clients
+start. To remove everything, `pipx uninstall agent-group-mcp` and delete
 `~/.claude-agent-bus/`. That directory holds all message history — back it
 up first if you want it.
 
@@ -332,5 +419,5 @@ agent-bus init --json --clients <c>   # what the wiring should say, without writ
 ## Reference
 
 - Addressing, claiming, the schema and the tool surface: [README](../README.md)
-- Waking an idle agent when mail arrives: the README's *Waking idle agents*
+- Waking an idle agent when mail arrives, and `wake.json`: the README's *Waking idle agents*
 - Environment variables: the README's *Environment variables*
