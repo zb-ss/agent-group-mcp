@@ -351,15 +351,20 @@ def _spawn_watch(bus_paths, *, max_seconds: float):
         "AGENT_BUS_WATCH_POLL_SECONDS": "0.1",
         "CLAUDE_CODE_ENTRYPOINT": "cli",
     }
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "agent_bus.cli", "hook-watch", "--client", "claude",
-         "--max-seconds", str(max_seconds)],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        env=env, text=True,
-    )
-    proc.stdin.write(PAYLOAD)
-    proc.stdin.close()
-    return proc
+    # the payload goes in through a pipe of our own, already closed at our
+    # end, so that communicate() has no stdin to flush
+    read_end, write_end = os.pipe()
+    os.write(write_end, PAYLOAD.encode())
+    os.close(write_end)
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-m", "agent_bus.cli", "hook-watch", "--client", "claude",
+             "--max-seconds", str(max_seconds)],
+            stdin=read_end, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, text=True,
+        )
+    finally:
+        os.close(read_end)
 
 
 def _wait_for_route(store, timeout: float = 10.0) -> None:
