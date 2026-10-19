@@ -113,6 +113,13 @@ there: `init` skips it, the server refuses to start, and hooks stay quiet.
 **Read the notes `init` prints at the end.** They state what each client
 cannot do, and steps 5 and 6 follow from them.
 
+**Waking idle agents is on by default.** `init` also wires each client's
+own way of starting a turn when mail arrives: a background hook for Claude
+Code, a queued turn for Codex, the plugin for opencode. For Claude Code it
+first runs `claude --version`; a version older than 2.1.290, or no answer,
+leaves that hook out and `init` prints a note saying so. To wire without
+it, run `init` with `AGENT_BUS_NATIVE_WAKE=0`.
+
 ## 5. Activate the clients that ask for it
 
 Two clients deliberately ignore repository-local config until a human
@@ -121,7 +128,8 @@ approves it. Neither can be scripted; ask the user to do it.
 **Codex** — open the repository with `codex`, accept the prompt to trust
 the project, then run `/hooks` and approve the two `agent-bus` entries.
 Codex ties approval to the exact hook command, so it asks again whenever
-the wiring changes.
+the wiring changes. A Codex session can be woken by mail only once those
+hooks have run for it, that is after its first turn.
 
 **Antigravity CLI** — open the repository with `agy` and trust the folder
 when asked. The workspace plugin loads immediately after that; no restart
@@ -222,7 +230,19 @@ send_message(to="other-repo", body="are you there?")
 ```
 
 The other agent sees it at the start of its next turn, and its Stop hook
-keeps the turn open until it has handled it.
+keeps the turn open until it has handled it. If the other session is idle
+at its prompt, it wakes up and starts that turn by itself — within a few
+seconds for Claude Code and opencode, within about ten for Codex.
+
+```bash
+# 8f. the wake path, after the real test: which sessions can be woken,
+#     and the wakes that happened
+sqlite3 ~/.claude-agent-bus/bus.db 'SELECT client, address, driver, state FROM wake_routes'
+agent-bus tail --json --limit 50 | grep '"op": "wake"'
+```
+
+A Claude Code or opencode session that is waiting shows as `watch`; a
+Codex session that has had a turn as `push`, with state `idle` or `busy`.
 
 ## 9. Upgrading from 0.4.x
 
@@ -296,6 +316,9 @@ up first if you want it.
 | Two different repos share an inbox | Same directory basename, wired in separate runs | Pin one with `.agent-bus-name`, or wire both in one `--scan` |
 | `upgrade agent-bus` on any command | The database was written by a newer version | Upgrade the package on this machine |
 | Every turn is held open quoting an error | An unusable binary — only possible with hand-written hooks | Re-run `init`, which appends `\|\| true` so a broken binary is silent |
+| An idle Claude Code session is not woken by mail | Claude Code older than 2.1.290 when `init` ran (see its note), a session that is not an interactive terminal one (`claude -p`, the SDK, an IDE), a `wake.json` entry for the agent, `AGENT_BUS_NATIVE_WAKE=0`, the hourly limit, or the session idle for longer than `AGENT_BUS_WATCH_HOURS` | Upgrade Claude Code and re-run `init`; check `agent-bus tail` for `rate-limited` |
+| An idle Codex session is not woken | It has not had a turn since its hooks were approved, its turn was interrupted with Esc, or `codex` cannot be run by the sender | Send it one prompt; set `AGENT_BUS_CODEX_BIN`; check `agent-bus tail` for `fired:ERR` |
+| A woken agent and another keep waking each other | Two agents answering every message | The hourly limit (`AGENT_BUS_WAKES_PER_HOUR`, default 20) stops it; lower it if needed |
 
 Diagnostics:
 
