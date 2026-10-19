@@ -3,7 +3,7 @@
 Notable changes per release. This project is pre-1.0: minor versions may
 change behaviour, and each release says what to expect.
 
-## Unreleased
+## 0.7.0
 
 An idle agent now wakes up when mail arrives, without a terminal
 multiplexer or a `wake.json` command: Claude Code, Codex and opencode are
