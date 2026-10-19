@@ -20,18 +20,30 @@ Its hooks follow the standard contract with one trap: stdout that starts
 with `[` or `{` is parsed as JSON, and a hook whose output fails to parse
 is discarded. Context for the prompt therefore goes out as JSON, never as
 the plain text other clients take.
+
+An idle Codex session is woken from the sender's side: `codex queue`
+adds a message to a thread, and a running Codex starts a turn with it
+within seconds. The thread id is the hook payload's `session_id`; the
+hooks record it with the executable that runs the session (`routes`).
+The queued text only starts the turn — the prompt hook then adds the
+mail, as on any other turn.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import tomllib
 from pathlib import Path
 
+from .. import settings
 from . import base
 from .base import UnreadableConfigError, WiringState, WiringStatus
 
 CLIENT_ID = "codex"
+# The prompt a woken Codex session starts its turn with; the mail itself
+# follows from the prompt hook.
+QUEUE_NOTICE = "[agent-bus] New mail from peers has arrived; it is shown below."
 
 HOOK_EVENTS = (
     ("UserPromptSubmit", "hook-user-prompt"),
@@ -55,6 +67,14 @@ class CodexHookDialect(base.StandardHookDialect):
                 "additionalContext": context,
             }
         }) + "\n"
+
+
+def queue_command(*, thread: str, executable: str | None) -> list[str]:
+    """The command that starts a turn in Codex thread `thread`: with the
+    executable the session runs, while it is still there."""
+    recorded = executable if executable and os.path.isfile(executable) else None
+    program = settings.codex_bin() or recorded or "codex"
+    return [program, "queue", "--thread", thread, "--message", QUEUE_NOTICE]
 
 
 def _toml_string(value: str) -> str:

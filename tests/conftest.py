@@ -22,6 +22,17 @@ def _never_the_real_bus(
     monkeypatch.setenv("AGENT_BUS_AUDIT_LOG", str(root / "audit.log"))
 
 
+@pytest.fixture(autouse=True)
+def _claude_code_can_wake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`init` asks this machine's Claude Code for its version before it
+    writes the wake hooks. Tests must not depend on what is installed, so
+    they see a Claude Code that can; the version check has tests of its
+    own."""
+    from agent_bus.clients import claude
+
+    monkeypatch.setattr(claude, "rewake_unsupported_reason", lambda: None)
+
+
 @pytest.fixture
 def bus_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     db = tmp_path / "bus.db"

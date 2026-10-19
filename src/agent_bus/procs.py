@@ -192,6 +192,45 @@ def gone(candidates: list[Proc]) -> set[Proc]:
     return ended
 
 
+# libproc's buffer size for a process's path (PROC_PIDPATHINFO_MAXSIZE).
+_MAC_PATH_BUFFER = 4096
+# What Linux appends to /proc/<pid>/exe once the file has been replaced.
+_DELETED_SUFFIX = " (deleted)"
+
+
+def executable(pid: int) -> str | None:
+    """The file process `pid` runs, as an absolute path, or None when the
+    platform cannot say. Not its name: a client started through a wrapper
+    script reports the wrapper's name, and the wrapper may need an
+    interpreter the caller does not have on its PATH."""
+    if _uses_proc():
+        try:
+            target = os.readlink(PROC_ROOT / str(pid) / "exe")
+        except OSError:
+            return None
+        # a binary replaced while it runs (an upgrade) reads as
+        # "<path> (deleted)"; the path itself now holds the new one
+        return target.removesuffix(_DELETED_SUFFIX) or None
+    return _mac_executable(pid)
+
+
+def _mac_executable(pid: int) -> str | None:
+    import ctypes
+    import ctypes.util
+
+    library = ctypes.util.find_library("proc")
+    if library is None:
+        return None
+    try:
+        proc_pidpath = ctypes.CDLL(library).proc_pidpath
+    except (OSError, AttributeError):
+        return None
+    buffer = ctypes.create_string_buffer(_MAC_PATH_BUFFER)
+    if proc_pidpath(pid, buffer, len(buffer)) <= 0:
+        return None
+    return buffer.value.decode("utf-8", "replace") or None
+
+
 def scope() -> Scope:
     """This process's boot and PID namespace, as far as the platform says.
     macOS has neither; its `ps` start times are wall-clock dates, which a

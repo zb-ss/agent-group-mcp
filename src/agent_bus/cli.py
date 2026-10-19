@@ -28,12 +28,14 @@ from . import clients
 from . import formatting as fmt
 from . import identity
 from . import init_cmd
+from . import settings
 from . import wake
 from .migrations import SchemaTooNewError
 from .paths import audit_path
 from .clients.base import UnreadableConfigError
 from .sessions import SessionRegistry
 from .storage import BROADCAST, KIND_SESSION, Storage, UnknownRecipientError
+from .watch import WAKE_EXIT_CODE
 
 NAME_COL = 18
 TARGET_COL = 18
@@ -569,6 +571,14 @@ def cmd_hook_user_prompt(args: argparse.Namespace) -> int:
     return run_hook_user_prompt(client=args.client)
 
 
+def cmd_hook_watch(args: argparse.Namespace) -> int:
+    from .watch import run_hook_watch
+
+    return run_hook_watch(
+        client=args.client, max_seconds=args.max_seconds, handle_signals=True
+    )
+
+
 def cmd_serve(args: argparse.Namespace) -> int:  # pragma: no cover
     from .server import main as server_main
 
@@ -744,6 +754,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--client", help=client_help)
     s.set_defaults(func=cmd_hook_user_prompt)
+
+    s = sub.add_parser(
+        "hook-watch",
+        help="Hook handler run in the background: wait for mail, then wake the session.",
+        description=(
+            "Waits until this session has mail to act on, prints it on stderr "
+            f"and exits {WAKE_EXIT_CODE}; the client's hook turns that into a "
+            "new turn. Exits 0 when a newer watcher of the session takes "
+            "over, the client exits, or the time is up."
+        ),
+    )
+    s.add_argument("--client", help=client_help)
+    s.add_argument(
+        "--max-seconds",
+        type=float,
+        help=f"Give up after this long. Default: ${settings.WATCH_HOURS_ENV} hours, "
+             f"else {settings.DEFAULT_WATCH_HOURS:g}.",
+    )
+    s.set_defaults(func=cmd_hook_watch)
 
     # optional serve helper (so `agent-bus serve` works besides python -m)
     s = sub.add_parser(

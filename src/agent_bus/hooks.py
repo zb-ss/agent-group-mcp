@@ -9,24 +9,32 @@ session it belongs to drains only the address the client's sessions share,
 never another session's own mail. What to print is the client's business
 (`clients.hook_dialect`); draining and formatting are shared. Each delivered
 message gets a sibling `deliver` audit row so the log shows the hook path.
+
+For a client whose idle sessions are woken by their sender (Codex), the
+hooks also keep that session's wake route current: busy from the start of
+a turn, idle once it ends with nothing to act on (`routes.py`).
 """
 
 from __future__ import annotations
 
 import os
 import select
+import sqlite3
 import sys
 import time
+from dataclasses import dataclass
 from typing import Iterable, TextIO
 
-from . import clients, identity, resolution, settings
+from . import clients, identity, procs, push, resolution, settings
 from .clients.base import HookDialect
 from .identity import KIND_BROADCAST, KIND_GROUP
+from .procs import Proc
+from .routes import WakeRoutes
 from .sessions import SessionRegistry
 from .storage import Message, Storage
 
 
-def _read_payload(stdin: TextIO) -> dict:
+def read_payload(stdin: TextIO) -> dict:
     """Consume the hook payload. Always read it, even when the name comes
     from the environment, so the client's pipe never blocks."""
     try:
@@ -90,7 +98,8 @@ def _client_of(name: str | None) -> str | None:
 
 
 def _identify(
-    store: Storage, payload: dict, client: str | None, actor: str | None = None
+    store: Storage, payload: dict, client: str | None, actor: str | None = None,
+    *, ancestry: list[Proc] | None = None,
 ) -> tuple[str | None, HookDialect]:
     """(agent name, dialect). The name is None when this client has no
     agent in the payload's repo — a user-wide hook firing in a repo that is
@@ -98,6 +107,86 @@ def _identify(
     and skips resolution."""
     if actor:
         return actor, clients.hook_dialect(client or _client_of(actor))
+    name, dialect = resolve_agent(store, payload, client)
+    if name is None:
+        return None, dialect
+    return session_of(store, name, payload, dialect, ancestry=ancestry), dialect
+
+
+@dataclass(frozen=True)
+class _Turn:
+    """One hook run: who it is for, and what the client said about it."""
+
+    name: str | None
+    dialect: HookDialect
+    payload: dict
+    client: str | None
+    # this process's ancestry, looked up only for a client whose sessions
+    # are woken by their sender (see `_note_route`)
+    ancestry: list[Proc] | None
+
+
+def _wake_for_late_mail(store: Storage, turn: _Turn) -> None:
+    """Mail sent between this hook's drain and its marking the session
+    idle found the session busy, so nobody queued a turn for it. Queue
+    one now; a sender that saw the session idle already has, and then
+    this finds the route taken."""
+    if turn.ancestry is None or turn.name is None:
+        return
+    thread = turn.dialect.session_from_payload(turn.payload)
+    try:
+        if not thread or not store.pending_count(agent=turn.name, actionable_only=True):
+            return
+        routes = WakeRoutes(store)
+        mine = tuple(
+            r for r in routes.covering([turn.name])[turn.name] if r.route_key == thread
+        )
+        if mine:
+            fired, status = push.push_wake(routes, turn.name, mine)
+            if fired or status.startswith("fired:"):
+                push.audit_push(turn.name, status, note="mail arrived as the turn ended")
+    except sqlite3.Error as e:
+        sys.stderr.write(f"agent-bus hook: could not wake this session for late mail: {e}\n")
+
+
+def _begin(
+    store: Storage, stdin: TextIO | None, client: str | None, actor: str | None
+) -> _Turn:
+    payload = read_payload(stdin or sys.stdin)
+    client_id = (
+        client or os.environ.get(resolution.CLIENT_ENV)
+        or _client_of(actor or os.environ.get(resolution.NAME_ENV))
+    )
+    pushed_to = clients.can_push(client_id) and settings.native_wake_enabled()
+    ancestry = procs.ancestry() if pushed_to else None
+    name, dialect = _identify(store, payload, client, actor, ancestry=ancestry)
+    return _Turn(name, dialect, payload, client_id, ancestry)
+
+
+def _note_route(store: Storage, turn: _Turn, *, busy: bool) -> None:
+    """For a client whose idle sessions the sender wakes: how to reach
+    this session, and whether it is busy now. Best-effort — a hook that
+    has delivered its mail must not fail over bookkeeping."""
+    if turn.ancestry is None or turn.name is None or turn.client is None:
+        return
+    thread = turn.dialect.session_from_payload(turn.payload)
+    if not thread:
+        return
+    owner = procs.client_of(turn.ancestry)
+    try:
+        WakeRoutes(store).note_push(
+            route_key=thread, client=turn.client, address=turn.name, owner=owner,
+            command=procs.executable(owner.pid) if owner else None, busy=busy,
+        )
+    except sqlite3.Error as e:
+        sys.stderr.write(f"agent-bus hook: could not record how to wake this session: {e}\n")
+
+
+def resolve_agent(
+    store: Storage, payload: dict, client: str | None
+) -> tuple[str | None, HookDialect]:
+    """(agent name, dialect) for the payload's repo, before narrowing it
+    to the session the hook runs for (`session_of`)."""
     client = client or os.environ.get(resolution.CLIENT_ENV)
     explicit = os.environ.get(resolution.NAME_ENV)
     dialect = clients.hook_dialect(client or _client_of(explicit))
@@ -111,23 +200,26 @@ def _identify(
     except resolution.IdentityError as e:
         sys.stderr.write(f"agent-bus hook: {e}\n")
         raise SystemExit(2) from None
-    if who is None:
-        return None, dialect
-    return _session_of(store, who.name, payload, dialect), dialect
+    return (who.name if who else None), dialect
 
 
-def _session_of(store: Storage, name: str, payload: dict, dialect: HookDialect) -> str:
+def session_of(
+    store: Storage, name: str, payload: dict, dialect: HookDialect,
+    *, ancestry: list[Proc] | None = None,
+) -> str:
     """The session address this hook runs for, when this one can be told;
     otherwise the client address all its sessions share. Never a session
     address merely asked for (`AGENT_BUS_SESSION`): another session may
-    hold it."""
+    hold it. `ancestry` saves looking this process's up again."""
     parsed = identity.parse_or_none(name)
     if not settings.sessions_enabled() or parsed is None or parsed.client_address is None:
         return name
     key = dialect.session_from_payload(payload) or clients.session_key(
         parsed.client, os.environ
     )
-    found = SessionRegistry(store).for_hook(parsed.client_address, session_key=key)
+    found = SessionRegistry(store).for_hook(
+        parsed.client_address, session_key=key, ancestry=ancestry
+    )
     return found or parsed.client_address
 
 
@@ -159,7 +251,7 @@ def _format_message(m: Message, reader: str) -> str:
     )
 
 
-def _format_messages(msgs: Iterable[Message], reader: str) -> str:
+def format_messages(msgs: Iterable[Message], reader: str) -> str:
     """Messages the reader must handle first, then the ones a repo-mate
     already claimed."""
     mine: list[Message] = []
@@ -179,7 +271,7 @@ def _format_messages(msgs: Iterable[Message], reader: str) -> str:
     return "\n".join(lines)
 
 
-def _drain(store: Storage, name: str, *, actionable_only: bool = False) -> list[Message]:
+def drain(store: Storage, name: str, *, actionable_only: bool = False) -> list[Message]:
     # a hook firing is a sign of life: some clients never call an MCP tool
     # between turns, and fan-out skips agents that look long gone
     store.touch_agent(name)
@@ -203,14 +295,18 @@ def run_hook_user_prompt(
     """
     store = storage or Storage()
     out = stdout or sys.stdout
-    name, dialect = _identify(store, _read_payload(stdin or sys.stdin), client, actor)
+    turn = _begin(store, stdin, client, actor)
+    name = turn.name
+    # busy before the drain: mail sent after it reaches this turn's end,
+    # rather than queueing another turn
+    _note_route(store, turn, busy=True)
 
-    msgs = _drain(store, name) if name else []
+    msgs = drain(store, name) if name else []
     context = None
     if msgs:
         header = f"[agent-bus] {len(msgs)} new message(s) since last turn:"
-        context = header + "\n" + _format_messages(msgs, name)
-    out.write(dialect.prompt_output(context))
+        context = header + "\n" + format_messages(msgs, name)
+    out.write(turn.dialect.prompt_output(context))
     out.flush()
     return 0
 
@@ -231,17 +327,22 @@ def run_hook_stop(
     """
     store = storage or Storage()
     out = stdout or sys.stdout
-    name, dialect = _identify(store, _read_payload(stdin or sys.stdin), client, actor)
+    turn = _begin(store, stdin, client, actor)
+    name = turn.name
 
     # only what this agent must act on: a copy a repo-mate already claimed
     # must not keep a second agent's turn open
-    msgs = _drain(store, name, actionable_only=True) if name else []
+    msgs = drain(store, name, actionable_only=True) if name else []
     reason = None
     if msgs:
         reason = (
             "Pending messages from peers — handle them before stopping:\n"
-            + _format_messages(msgs, name)
+            + format_messages(msgs, name)
         )
-    out.write(dialect.stop_output(reason))
+    out.write(turn.dialect.stop_output(reason))
     out.flush()
+    # the turn goes on when there was mail; otherwise the session is idle
+    _note_route(store, turn, busy=reason is not None)
+    if reason is None:
+        _wake_for_late_mail(store, turn)
     return 0

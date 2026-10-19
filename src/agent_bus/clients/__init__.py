@@ -8,7 +8,7 @@ and a client that follows the standard hook contract needs no dialect.
 
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Callable, Mapping
 
 from . import agy, claude, codex, opencode
 from .base import ClientWiring, HookDialect, StandardHookDialect
@@ -24,6 +24,18 @@ _STANDARD = StandardHookDialect()
 # the others rely on process ancestry alone.
 _SESSION_KEY_ENV: dict[str, str] = {
     claude.CLIENT_ID: claude.SESSION_KEY_ENV,
+}
+
+# Clients whose idle sessions the sender wakes, by running a command that
+# starts a turn: (thread id, executable the session runs) → argv.
+_PUSH_COMMANDS: dict[str, Callable[..., list[str]]] = {
+    codex.CLIENT_ID: codex.queue_command,
+}
+
+# Clients whose sessions can take a wake from a watcher only under some
+# conditions, told by the environment the watcher runs in.
+_WATCH_ALLOWED: dict[str, Callable[[Mapping[str, str]], bool]] = {
+    claude.CLIENT_ID: claude.can_take_wake,
 }
 
 _WIRINGS: dict[str, ClientWiring] = {
@@ -47,6 +59,23 @@ def session_key(client: str | None, env: Mapping[str, str]) -> str | None:
     variable = _SESSION_KEY_ENV.get(client or "")
     value = env.get(variable, "").strip() if variable else ""
     return value or None
+
+
+def watch_allowed(client: str | None, env: Mapping[str, str]) -> bool:
+    """Whether a watcher may run for the session `client` started it in."""
+    check = _WATCH_ALLOWED.get(client or "")
+    return check(env) if check else True
+
+
+def can_push(client: str | None) -> bool:
+    """Whether `client`'s idle sessions are woken by their sender."""
+    return (client or "") in _PUSH_COMMANDS
+
+
+def push_command(client: str, *, thread: str, executable: str | None) -> list[str]:
+    """The argv that starts a turn in `client`'s session `thread`.
+    Raises KeyError for a client that cannot be pushed to."""
+    return _PUSH_COMMANDS[client](thread=thread, executable=executable)
 
 
 def wirable_clients() -> tuple[str, ...]:

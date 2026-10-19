@@ -38,11 +38,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
-from . import audit, identity, migrations, settings, wake
+from . import audit, identity, migrations, push, settings, wake
+from .push import STATUS_RATE_LIMITED
 from .identity import BROADCAST, KIND_BROADCAST, KIND_DIRECT, KIND_GROUP
 from .paths import db_path, ensure_parents
+from .routes import DRIVER_PUSH, DRIVER_WATCH, Route, WakeRoutes
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 MAX_SUGGESTIONS = 3
@@ -130,6 +132,12 @@ INBOX_PREDICATE = _inbox_predicate(":agent", ":group", ":address")
 # under the client address, not once more under every one of its sessions.
 ROSTER_INBOX_PREDICATE = _inbox_predicate(
     "agents.name", "COALESCE(agents.group_name, agents.name)", "agents.name"
+)
+
+# Narrows INBOX_PREDICATE to what the reader must act on: a fan-out copy a
+# repo-mate already claimed is for information only.
+ACTIONABLE_FILTER = (
+    "AND (fanout_id IS NULL OR claimed_by IS NULL OR claimed_by = :agent)"
 )
 
 
@@ -272,6 +280,39 @@ class _Delivery:
     @property
     def names(self) -> list[str]:
         return [r.name for r in self.recipients]
+
+
+# How the sender wakes a recipient: by its wake.json command, by pushing
+# to one of its sessions (a tuple of candidate routes), or not at all —
+# because nothing is configured, or because the session watches itself.
+WAKE_COMMAND = "command"
+WAKES_ITSELF = "self"
+
+
+@dataclass(frozen=True)
+class _WakePlan:
+    message_id: str
+    agent: "AgentRow"
+    way: str | tuple[Route, ...]
+
+    @property
+    def pushes(self) -> tuple[Route, ...]:
+        return self.way if isinstance(self.way, tuple) else ()
+
+
+def _way_to_wake(
+    agent: "AgentRow", config: dict, covering: dict[str, list[Route]]
+) -> str | tuple[Route, ...] | None:
+    """wake.json has the last word: an entry there, a command or `false`,
+    is the user's explicit choice. Otherwise the agent's sessions decide."""
+    command, status = wake.wake_command(config, agent.name, agent.group)
+    if status != "no-config":
+        return WAKE_COMMAND if command else None
+    found = covering.get(agent.name, [])
+    if any(r.driver == DRIVER_WATCH for r in found):
+        return WAKES_ITSELF
+    pushes = tuple(r for r in found if r.driver == DRIVER_PUSH)
+    return pushes or None
 
 
 def register_in(
@@ -772,10 +813,7 @@ class Storage:
         conn: sqlite3.Connection, params: dict[str, str], limit: int,
         actionable_only: bool,
     ) -> list[sqlite3.Row]:
-        mine_to_act_on = (
-            "AND (fanout_id IS NULL OR claimed_by IS NULL OR claimed_by = :agent)"
-            if actionable_only else ""
-        )
+        mine_to_act_on = ACTIONABLE_FILTER if actionable_only else ""
         return conn.execute(
             f"""
             SELECT {MESSAGE_COLUMNS}
@@ -931,25 +969,46 @@ class Storage:
 
     @staticmethod
     def _agents_to_wake(
-        delivery: _Delivery, config: dict
-    ) -> list[tuple[str, AgentRow]]:
-        """(message_id, agent) pairs worth waking for this send.
+        delivery: _Delivery, config: dict, covering: dict[str, list[Route]],
+        is_live: Callable[[Route], bool] = lambda _route: True,
+    ) -> list[_WakePlan]:
+        """Which recipients of this send the sender wakes, and how.
 
         A direct message wakes its addressee. A fan-out wakes at most one
-        agent per repo — the most recently seen one that has a wake command
-        — because whoever wakes will claim the message, and waking its
-        repo-mates too would start a turn in each of them for nothing.
+        agent per repo — the most recently seen one the sender can wake —
+        because whoever wakes will claim the message, and waking its
+        repo-mates too would start a turn in each of them for nothing. A
+        repo where a recipient's session watches for mail itself is left
+        to that session, which claims the message when it wakes — as long
+        as its watcher still runs (`is_live`), which is looked up only
+        where somebody else there could be woken instead.
         """
         pairs = list(zip(delivery.message_ids, delivery.recipients))
+        ways = {agent.name: _way_to_wake(agent, config, covering) for _, agent in pairs}
         if delivery.kind == KIND_DIRECT:
-            return pairs
+            return [
+                _WakePlan(mid, agent, ways[agent.name]) for mid, agent in pairs
+                if ways[agent.name] not in (None, WAKES_ITSELF)
+            ]
 
-        chosen: dict[str, tuple[str, AgentRow]] = {}
+        self_waking = {a.group for _, a in pairs if ways[a.name] == WAKES_ITSELF}
+        wakeable = {a.group for _, a in pairs if ways[a.name] not in (None, WAKES_ITSELF)}
+        for group in self_waking & wakeable:
+            watchers = [
+                r for _, a in pairs if a.group == group
+                for r in covering.get(a.name, []) if r.driver == DRIVER_WATCH
+            ]
+            if not any(is_live(r) for r in watchers):
+                self_waking.discard(group)
+        chosen: dict[str, _WakePlan] = {}
         for mid, agent in sorted(pairs, key=lambda p: p[1].last_seen, reverse=True):
-            command, _status = wake.wake_command(config, agent.name, agent.group)
-            if command is not None and agent.group not in chosen:
-                chosen[agent.group] = (mid, agent)
-        return sorted(chosen.values(), key=lambda p: p[1].name)
+            way = ways[agent.name]
+            if way in (None, WAKES_ITSELF) or agent.group in self_waking:
+                continue
+            if agent.group in chosen:
+                continue
+            chosen[agent.group] = _WakePlan(mid, agent, way)
+        return sorted(chosen.values(), key=lambda p: p.agent.name)
 
     def _fire_wakes(
         self,
@@ -959,7 +1018,7 @@ class Storage:
         actor_name: str,
         body: str,
     ) -> None:
-        """Run the configured wake commands for this send. Fire-and-forget.
+        """Wake the recipients the sender is meant to wake. Fire-and-forget.
 
         Wake config is loaded once per send (cheap: file is ~hundreds of
         bytes typically) so per-call edits to wake.json take effect on
@@ -973,47 +1032,70 @@ class Storage:
             cfg = wake.load_wake_config()
         except Exception:
             cfg = {}
-        if not cfg:
+        routes = WakeRoutes(self) if settings.native_wake_enabled() else None
+        if not cfg and routes is None:
             return
+        try:
+            covering = routes.covering(delivery.names) if routes else {}
+        except sqlite3.Error:
+            covering = {}
 
         wake_rows: list[dict] = []
-        for mid, agent in self._agents_to_wake(delivery, cfg):
+        is_live = routes.alive if routes else (lambda _route: True)
+        for plan in self._agents_to_wake(delivery, cfg, covering, is_live):
             try:
-                fired, status = wake.fire_wake(
-                    agent.name,
-                    from_agent=from_agent,
-                    to_agent=agent.name,
-                    body=body,
-                    thread_id=delivery.thread_id,
-                    message_id=mid,
-                    config=cfg,
-                    group=agent.group,
+                fired, status = self._wake(
+                    plan, cfg, routes, from_agent=from_agent,
+                    thread_id=delivery.thread_id, body=body,
                 )
             except Exception as e:
                 fired, status = False, f"fired:ERR:{type(e).__name__}"
-            if fired or status.startswith("fired:"):
-                wake_rows.append(
-                    {
-                        "ts": _utc_now_iso(),
-                        "op": "wake",
-                        "actor": actor_name,
-                        "message_id": mid,
-                        "from": from_agent,
-                        "to": agent.name,
-                        "thread_id": delivery.thread_id,
-                        "body_preview": audit.body_preview(body),
-                        "body_sha256": audit.body_sha256(body),
-                        "wake_status": status,
-                    }
-                )
+            if fired or status.startswith("fired:") or status == STATUS_RATE_LIMITED:
+                row = {
+                    "ts": _utc_now_iso(),
+                    "op": "wake",
+                    "actor": actor_name,
+                    "message_id": plan.message_id,
+                    "from": from_agent,
+                    "to": plan.agent.name,
+                    "thread_id": delivery.thread_id,
+                    "body_preview": audit.body_preview(body),
+                    "body_sha256": audit.body_sha256(body),
+                    "wake_status": status,
+                }
+                if plan.pushes:
+                    row["wake_driver"] = DRIVER_PUSH
+                wake_rows.append(row)
         if wake_rows:
             audit.append_many(wake_rows)
 
-    def pending_count(self, *, agent: str) -> int:
+    @staticmethod
+    def _wake(
+        plan: _WakePlan, cfg: dict, routes: WakeRoutes | None, *,
+        from_agent: str, thread_id: str | None, body: str,
+    ) -> tuple[bool, str]:
+        if not plan.pushes:
+            return wake.fire_wake(
+                plan.agent.name,
+                from_agent=from_agent,
+                to_agent=plan.agent.name,
+                body=body,
+                thread_id=thread_id,
+                message_id=plan.message_id,
+                config=cfg,
+                group=plan.agent.group,
+            )
+        assert routes is not None  # pushes are only planned with routes
+        return push.push_wake(routes, plan.agent.name, plan.pushes)
+
+    def pending_count(self, *, agent: str, actionable_only: bool = False) -> int:
+        """Unread messages `agent` may drain. `actionable_only` leaves out
+        the copies a repo-mate already claimed, as the Stop hook does."""
         self.init_schema()
+        mine_to_act_on = ACTIONABLE_FILTER if actionable_only else ""
         with self.connect() as conn:
             row = conn.execute(
-                f"SELECT COUNT(*) AS c FROM messages WHERE {INBOX_PREDICATE}",
+                f"SELECT COUNT(*) AS c FROM messages WHERE {INBOX_PREDICATE} {mine_to_act_on}",
                 _inbox_params(agent),
             ).fetchone()
         return int(row["c"]) if row else 0
