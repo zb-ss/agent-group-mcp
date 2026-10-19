@@ -210,12 +210,13 @@ def test_apply_is_idempotent(tmp_path):
         plan = init_cmd.plan_for_repo(repo)
         init_cmd.apply_plan(plan, bin_path="/usr/local/bin/agent-bus")
     settings = json.loads((repo / ".claude" / "settings.json").read_text())
-    # exactly one matcher per event for our hook
-    for event in ("UserPromptSubmit", "Stop"):
+    # exactly one block per event and hook for each of ours
+    expected = {"UserPromptSubmit": 1, "Stop": 2, "SessionStart": 1}
+    for event, count in expected.items():
         managed = [
             b for b in settings["hooks"][event] if init_cmd.is_managed_hook_block(b)
         ]
-        assert len(managed) == 1, f"duplicate hooks for {event}"
+        assert len(managed) == count, f"duplicate hooks for {event}"
     # allow-list has each agent-bus tool exactly once
     allow = settings["permissions"]["allow"]
     for tool in init_cmd.ALLOW_TOOLS:
@@ -332,9 +333,14 @@ def _wired_name(repo: Path) -> str:
     return mcp["mcpServers"]["agent-bus"]["env"]["AGENT_BUS_NAME"]
 
 
-def _hook_commands(repo: Path, event: str) -> list[str]:
+def _hook_commands(repo: Path, event: str, *, watchers: bool = False) -> list[str]:
+    """The commands of `event`'s hooks; the background wake hooks only
+    when asked for."""
     settings = json.loads((repo / ".claude" / "settings.json").read_text())
-    return [h["command"] for block in settings["hooks"][event] for h in block["hooks"]]
+    return [
+        h["command"] for block in settings["hooks"].get(event, []) for h in block["hooks"]
+        if watchers or not h.get("asyncRewake")
+    ]
 
 
 def _wire_the_old_way(repo: Path, name: str) -> None:
@@ -504,10 +510,9 @@ def test_hook_commands_fail_safe(tmp_path):
         clients.wiring(client).apply(repo, name=f"ok/{client}", bin_path="/bin/agent-bus")
 
     commands = [
-        h["command"]
+        command
         for ev in ("UserPromptSubmit", "Stop")
-        for block in json.loads((repo / ".claude" / "settings.json").read_text())["hooks"][ev]
-        for h in block["hooks"]
+        for command in _hook_commands(repo, ev)
     ]
     assert commands and all(c.endswith("|| true") for c in commands)
 
@@ -518,11 +523,7 @@ def test_a_failing_binary_neither_blocks_nor_speaks(tmp_path):
 
     repo = _make_repo(tmp_path, "ok")
     init_cmd.apply_plan(init_cmd.plan_for_repo(repo), bin_path="/nonexistent/agent-bus")
-    (command,) = [
-        h["command"]
-        for block in json.loads((repo / ".claude" / "settings.json").read_text())["hooks"]["Stop"]
-        for h in block["hooks"]
-    ]
+    (command,) = _hook_commands(repo, "Stop")
     done = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=30)
     assert done.returncode == 0
     assert done.stdout == ""

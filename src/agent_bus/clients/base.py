@@ -65,7 +65,10 @@ MANAGED_DESCRIPTION = (
     "Safe to regenerate; safe to delete to opt this repo out."
 )
 SERVER_KEY = "agent-bus"
-HOOK_SUBCOMMANDS = ("hook-user-prompt", "hook-stop")
+HOOK_SUBCOMMANDS = ("hook-user-prompt", "hook-stop", "hook-watch")
+# What `hook-watch` exits with when it found mail and the session should
+# wake. Not 2: see `watch.py`.
+WAKE_EXIT_CODE = 10
 
 
 class WiringStatus(Enum):
@@ -140,6 +143,25 @@ def hook_command(
     prefix = f"AGENT_BUS_NAME={shlex.quote(name)} " if name else ""
     return (
         f"{prefix}{shlex.quote(bin_path)} {subcommand} --client {client} || true"
+    )
+
+
+def watch_command(
+    *, name: str | None, bin_path: str, client: str, max_seconds: int, wake_exit: int
+) -> str:
+    """The shell command for a background `hook-watch` hook whose client
+    wakes the session when the hook exits with `wake_exit`.
+
+    `hook-watch` signals a wake with WAKE_EXIT_CODE and the shell turns
+    that, and only that, into `wake_exit`. Every other outcome exits 0 —
+    including an agent-bus too old to know `hook-watch`, whose argument
+    parser exits 2 and would otherwise wake the model with a usage error
+    at the end of every turn. `|| true` cannot be used here: it would
+    swallow the wake as well."""
+    prefix = f"AGENT_BUS_NAME={shlex.quote(name)} " if name else ""
+    return (
+        f"{prefix}{shlex.quote(bin_path)} hook-watch --client {client} "
+        f"--max-seconds {max_seconds} ; [ $? -ne {WAKE_EXIT_CODE} ] || exit {wake_exit}"
     )
 
 

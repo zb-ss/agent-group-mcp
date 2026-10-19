@@ -14,9 +14,11 @@ Design constraints:
   - Generic MCP, no Claude-Code-only features. The wake fires from the
     sender's MCP server process (or from `agent-bus send` in a shell)
     regardless of which client the *recipient* uses.
-  - Opt-in per agent. No wake.json entry → no command runs → existing
-    behaviour unchanged. An entry keyed by a bare repo name covers every
-    agent in that repo that has no entry of its own.
+  - Opt-in per agent. No wake.json entry → no command runs, and the
+    client's native wake (`watch.py`, `push.py`) is used where it has
+    one. An entry — a command, or `false` — overrides native wake for
+    that agent. An entry keyed by a bare repo name covers every agent in
+    that repo that has no entry of its own.
   - Latency-sensitive: subprocess.Popen returns immediately, so the
     sender never blocks on the recipient's wake.
 

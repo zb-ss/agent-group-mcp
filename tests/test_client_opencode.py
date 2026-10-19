@@ -301,3 +301,161 @@ def test_a_stuck_hook_is_not_started_again_on_every_request(tmp_path):
     # the harness makes four model requests and two idle checks; waiting out
     # the timeout on each would take six seconds or more
     assert took < 4.5, f"took {took:.1f}s"
+
+
+# --------------------------- the plugin's watcher ------------------------
+
+WATCH_HARNESS = r"""
+import { AgentBus } from "./plugin.mjs";
+
+const prompts = [];
+const $ = () => {
+  const chain = {
+    cwd() { return chain; }, env() { return chain; },
+    quiet() { return chain; }, nothrow() { return chain; },
+    async text() { return ""; },  // no mail at idle: the watcher takes over
+  };
+  return chain;
+};
+const client = { session: {
+  get: async () => ({ data: { id: "s1" } }),
+  prompt: async (req) => { prompts.push({ via: "prompt", ...req }); },
+  promptAsync: async (req) => { prompts.push({ via: "promptAsync", ...req }); },
+} };
+
+const hooks = await AgentBus({ client, $, directory: process.cwd() });
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "s1" } } });
+const scenario = process.argv[2];
+if (scenario === "busy-then-idle") {
+  // let the watcher get going (and set up its trap) before the turn starts
+  await new Promise((resolve) => setTimeout(resolve, 300));
+}
+if (scenario === "busy" || scenario === "busy-then-idle" || scenario === "deleted") {
+  const type = scenario === "deleted" ? "session.deleted" : "session.status";
+  const properties = scenario === "deleted"
+    ? { info: { id: "s1" } }
+    : { sessionID: "s1", status: { type: "busy" } };
+  await hooks.event({ event: { type, properties } });
+}
+if (scenario === "busy-then-idle") {
+  await new Promise((resolve) => setTimeout(resolve, 1500));  // the watcher exits meanwhile
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "s1" } } });
+}
+const waitMs = Number(process.argv[3]);
+const deadline = Date.now() + waitMs;
+while (prompts.length === 0 && Date.now() < deadline) {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+process.stdout.write(JSON.stringify({ prompts }), () => process.exit(0));
+"""
+
+
+def _drive_watcher(
+    tmp_path: Path, *, watcher: str, scenario: str = "idle", wait_ms: int = 5000,
+    watch_seconds: int = 3600,
+) -> dict:
+    fake = tmp_path / "agent-bus"
+    fake.write_text("#!/bin/sh\n" + watcher + "\n")
+    fake.chmod(0o755)
+    plugin = clients.opencode.render_plugin(
+        name="repo-a/opencode", bin_path=str(fake), watch_seconds=watch_seconds
+    )
+    (tmp_path / "plugin.mjs").write_text(plugin)
+    (tmp_path / "harness.mjs").write_text(WATCH_HARNESS)
+    result = subprocess.run(
+        ["node", "harness.mjs", scenario, str(wait_ms)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@needs_node
+def test_an_idle_session_is_woken_with_the_mail_its_watcher_found(tmp_path):
+    out = _drive_watcher(tmp_path, watcher=(
+        'cat > stdin-seen\nprintf "%s " "$@" > args-seen\n'
+        'echo "[agent-bus] 1 new message(s) from peers" >&2\nexit 10'
+    ))
+    assert out["prompts"] == [{
+        "via": "promptAsync",
+        "path": {"id": "s1"},
+        "body": {"parts": [{"type": "text", "text": "[agent-bus] 1 new message(s) from peers"}]},
+    }]
+    assert json.loads((tmp_path / "stdin-seen").read_text()) == {
+        "session_id": "s1", "cwd": str(tmp_path),
+    }
+    assert (tmp_path / "args-seen").read_text().split() == [
+        "hook-watch", "--client", "opencode", "--max-seconds", "3600",
+    ]
+
+
+@needs_node
+def test_a_watcher_that_found_nothing_starts_no_turn(tmp_path):
+    out = _drive_watcher(tmp_path, watcher="exit 0", wait_ms=1000)
+    assert out["prompts"] == []
+
+
+@needs_node
+def test_an_old_agent_bus_without_hook_watch_starts_no_turn(tmp_path):
+    out = _drive_watcher(
+        tmp_path, watcher="echo 'usage: agent-bus ...' >&2\nexit 2", wait_ms=1000
+    )
+    assert out["prompts"] == []
+
+
+@needs_node
+def test_a_session_that_turns_busy_loses_its_watcher(tmp_path):
+    out = _drive_watcher(
+        tmp_path, scenario="busy", wait_ms=2500,
+        watcher="sleep 1\ntouch survived\necho 'too late' >&2\nexit 10",
+    )
+    assert out["prompts"] == []
+    assert not (tmp_path / "survived").exists(), "the watcher was not stopped"
+
+
+@needs_node
+def test_no_watcher_when_native_wake_was_off_at_init(tmp_path):
+    out = _drive_watcher(
+        tmp_path, watch_seconds=0, wait_ms=1000,
+        watcher='touch started\necho mail >&2\nexit 10',
+    )
+    assert out["prompts"] == []
+    assert not (tmp_path / "started").exists()
+
+
+def test_init_writes_the_watch_time_or_none(tmp_path, monkeypatch, opencode):
+    monkeypatch.setenv("AGENT_BUS_WATCH_HOURS", "2")
+    repo = _repo(tmp_path)
+    opencode.apply(repo, name="repo-a/opencode", bin_path=BIN)
+    plugin = repo / ".opencode" / "plugins" / "agent-bus.js"
+    assert "const WATCH_SECONDS = 7200;" in plugin.read_text()
+
+    monkeypatch.setenv("AGENT_BUS_NATIVE_WAKE", "0")
+    opencode.apply(repo, name="repo-a/opencode", bin_path=BIN)
+    assert "const WATCH_SECONDS = 0;" in plugin.read_text()
+
+
+@needs_node
+def test_mail_a_watcher_took_while_the_session_turned_busy_waits_for_idle(tmp_path):
+    """The watcher had already taken the mail from the inbox when the
+    session turned busy: it must reach the session at its next idle, not
+    be dropped."""
+    out = _drive_watcher(
+        tmp_path, scenario="busy-then-idle", wait_ms=3000,
+        watcher="trap '' TERM\nsleep 1\necho 'held mail' >&2\nexit 10",
+    )
+    assert out["prompts"] == [{
+        "via": "prompt",
+        "path": {"id": "s1"},
+        "body": {"parts": [{"type": "text", "text": "held mail"}]},
+    }]
+
+
+@needs_node
+def test_a_deleted_session_loses_its_watcher(tmp_path):
+    out = _drive_watcher(
+        tmp_path, scenario="deleted", wait_ms=2500,
+        watcher="sleep 1\ntouch survived\necho 'too late' >&2\nexit 10",
+    )
+    assert out["prompts"] == []
+    assert not (tmp_path / "survived").exists()

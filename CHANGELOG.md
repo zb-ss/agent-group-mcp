@@ -3,6 +3,59 @@
 Notable changes per release. This project is pre-1.0: minor versions may
 change behaviour, and each release says what to expect.
 
+## Unreleased
+
+An idle agent now wakes up when mail arrives, without a terminal
+multiplexer or a `wake.json` command: Claude Code, Codex and opencode are
+woken through their own mechanisms, and `agent-bus init` sets this up by
+default.
+
+### Added
+
+- **Native wake.**
+  - **Claude Code:** a background `asyncRewake` hook runs the new
+    `agent-bus hook-watch` when a session starts and after every turn.
+    It waits for mail, takes it from the inbox, and Claude Code starts a
+    turn with it — also mid-turn, inside the running turn. Written only
+    for Claude Code 2.1.290 or later, which `init` checks with
+    `claude --version`, and active only in interactive sessions: under
+    `claude -p` or the SDK the watcher exits at once.
+  - **Codex:** the sender runs `codex queue --thread <id>` for an idle
+    session whose Codex is still running, and the prompt hook delivers
+    the mail in the turn that starts. A busy session is not queued to;
+    its Stop hook delivers as before.
+  - **opencode:** the generated plugin runs `hook-watch` for a session
+    when it goes idle, and starts a turn with what it finds.
+- A repo-wide or broadcast message still wakes at most one agent per
+  repo; a session watching there for mail takes it.
+- At most `AGENT_BUS_WAKES_PER_HOUR` (default 20) native wakes per agent
+  per hour, so two agents answering each other cannot keep each other
+  busy indefinitely.
+- `AGENT_BUS_NATIVE_WAKE=0` turns native wake off, both for `init` and for
+  wiring already in place. Also new: `AGENT_BUS_WATCH_POLL_SECONDS`,
+  `AGENT_BUS_WATCH_HOURS`, `AGENT_BUS_CLAUDE_BIN`,
+  `AGENT_BUS_CLIENT_VERSION_TIMEOUT`, `AGENT_BUS_CODEX_BIN`.
+- `op="wake"` audit rows for native wakes carry `wake_driver` (`watch` or
+  `push`), and `wake_status` gains `woke` and `rate-limited`.
+
+### Changed
+
+- A `wake.json` entry for an agent, its client or its repo takes
+  precedence over native wake: its command runs instead, and `false`
+  turns waking off for that agent.
+- A repo-wide or broadcast send no longer fires a `wake.json` command in a
+  repo where a session is watching for mail itself.
+- Re-run `agent-bus init` to add the wake hooks. Codex asks to approve its
+  hooks again only if their commands changed; they did not.
+
+### Compatibility
+
+- The database gains `wake_routes` and `wakes` tables; the migration is
+  additive, and older versions keep working against it.
+- The Claude Code hook command maps `hook-watch`'s exit code itself, so an
+  older `agent-bus` that does not know `hook-watch` stays silent instead
+  of waking the model with a usage error.
+
 ## 0.6.0
 
 Several sessions of the same client can now work in the same repository
@@ -177,7 +230,7 @@ Existing agents keep their names and their unread mail; upgrading the
 package alone changes nothing. Re-run `agent-bus init` to move a
 repository onto per-client names — the old name is retired and its mail is
 picked up by the first agent in that repository to read. Full steps:
-[`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md#9-upgrading-from-04x).
+[`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md#11-upgrading-from-04x).
 
 An older agent-bus keeps working against a migrated database; it simply
 does not expand a repository name into its agents.

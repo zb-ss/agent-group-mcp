@@ -19,6 +19,9 @@ each with an inbox of its own.
 - **Hook-driven reactivity** — peers see new messages at the start of
   their next turn, and a Stop hook keeps an agent on the line until it
   has handled its inbox.
+- **Idle agents wake up** when mail arrives — through Claude Code's,
+  Codex's and opencode's own mechanisms, with no terminal multiplexer
+  involved — or through a command of your own (`wake.json`).
 - **Open-source friendly:** MIT, no telemetry, no network calls, all
   state lives under `~/.claude-agent-bus/` (gitignored by default).
 
@@ -67,7 +70,8 @@ hooks; use the pipx install for that. The two installs coexist fine.
 
 - **Language:** Python 3.11+
 - **MCP transport:** stdio. Each `claude` spawns its own MCP subprocess.
-  No long-lived daemon, no port management.
+  No long-lived daemon, no port management. Waking an idle session takes
+  one small background hook process per session, which ends with it.
 - **SDK:** official `mcp` Python package (FastMCP).
 - **Storage:** SQLite at `$AGENT_BUS_DB`
   (default `~/.claude-agent-bus/bus.db`), WAL mode + `synchronous=NORMAL`.
@@ -300,9 +304,10 @@ agent-bus chat [--name NAME]                 # colored TUI
 agent-bus agents [--json]
 agent-bus forget NAME                        # remove stale agent from roster
 agent-bus forget --group REPO                # ... or every agent of a repo
-agent-bus wake-config {show,set,clear,test} [NAME] [COMMAND]   # push-style alerts
+agent-bus wake-config {show,set,clear,test} [NAME] [COMMAND]   # your own wake commands
 agent-bus hook-stop [--client ID]            # "about to stop" hook
 agent-bus hook-user-prompt [--client ID]     # "before the prompt" hook
+agent-bus hook-watch [--client ID] [--max-seconds N]   # background hook: wake on new mail
 agent-bus serve [--client ID]                # same as python -m agent_bus.server
 ```
 
@@ -410,17 +415,23 @@ agent-bus init ~/projects/foo --name myname
 `<repo>/<client>`; the MCP server is called `agent-bus` in every client, so
 tool names do not depend on which client you are in.
 
-| Client          | `--clients` | Files written in the repo                                   | Mail shown                      | Kept from stopping             |
-| --------------- | ----------- | ----------------------------------------------------------- | ------------------------------- | ------------------------------ |
-| Claude Code     | `claude`    | `.mcp.json`, `.claude/settings.json`                        | `UserPromptSubmit` hook         | `Stop` hook                    |
-| Codex           | `codex`     | `.codex/config.toml`, `.codex/hooks.json`                   | `UserPromptSubmit` hook         | `Stop` hook                    |
-| Antigravity CLI | `agy`       | `.agents/plugins/agent-bus/` (a workspace plugin)           | `PreInvocation` hook            | `Stop` hook                    |
-| opencode        | `opencode`  | `.opencode/opencode.json`, `.opencode/plugins/agent-bus.js` | plugin, before each model call  | not possible — see below       |
+| Client          | `--clients` | Files written in the repo                                   | Mail shown                      | Kept from stopping             | Woken when idle                    |
+| --------------- | ----------- | ----------------------------------------------------------- | ------------------------------- | ------------------------------ | ---------------------------------- |
+| Claude Code     | `claude`    | `.mcp.json`, `.claude/settings.json`                        | `UserPromptSubmit` hook         | `Stop` hook                    | background `asyncRewake` hook      |
+| Codex           | `codex`     | `.codex/config.toml`, `.codex/hooks.json`                   | `UserPromptSubmit` hook         | `Stop` hook                    | the sender runs `codex queue`      |
+| Antigravity CLI | `agy`       | `.agents/plugins/agent-bus/` (a workspace plugin)           | `PreInvocation` hook            | `Stop` hook                    | only through `wake.json`           |
+| opencode        | `opencode`  | `.opencode/opencode.json`, `.opencode/plugins/agent-bus.js` | plugin, before each model call  | not possible — see below       | plugin                             |
+
+How idle agents are woken is described in [Waking idle agents](#waking-idle-agents).
 
 What differs per client:
 
-- **Claude Code** — also gets the six `mcp__agent-bus__*` entries added to
-  `permissions.allow` (deduped if already present).
+- **Claude Code** — also gets the `mcp__agent-bus__*` entries added to
+  `permissions.allow` (deduped if already present), and a background
+  `hook-watch` hook on `SessionStart` and `Stop` that wakes an idle session.
+  That hook is written only for Claude Code 2.1.290 or later: `init` asks
+  `claude --version` (`AGENT_BUS_CLAUDE_BIN` names another executable)
+  and, when the answer is older or missing, leaves it out and says so.
 - **Codex** — loads a repo's `.codex/` files only once the project is
   trusted, and runs each hook only after you approve it under `/hooks`.
   Approval is tied to the hook's definition, so the hook commands carry no
@@ -432,7 +443,9 @@ What differs per client:
   environment, so `AGENT_BUS_SESSION`, `AGENT_BUS_INSTANCE`, `AGENT_BUS_DB`
   and `AGENT_BUS_AUDIT_LOG` are passed through with `env_vars`. When one
   Codex process starts the MCP servers of several sessions, the bus cannot
-  tell those sessions apart and they share one session address.
+  tell those sessions apart and they share one session address. Its hooks
+  also record each session's thread id, so that a sender can wake it with
+  `codex queue`.
 - **Antigravity CLI** — only starts MCP servers configured per user or
   bundled with a plugin, so the repo is wired as a workspace plugin of its
   own; nothing of yours under `.agents/` is touched. The plugin loads once
@@ -449,7 +462,10 @@ What differs per client:
   best-effort — if it does not happen, the message is simply waiting at
   the next prompt. The injection uses an `experimental.*` plugin hook that
   may change between opencode releases, and a `.opencode/opencode.json`
-  containing comments cannot be merged and is skipped.
+  containing comments cannot be merged and is skipped. When a session goes
+  idle with nothing to act on, the plugin starts `hook-watch` for it and
+  starts a turn when mail arrives; mail the watcher took just as the
+  session turned busy is handed over when it is next idle.
 
 Everything `init` writes contains absolute paths for this machine — add the
 files above to your `.gitignore` rather than committing them.
@@ -614,6 +630,31 @@ repo B path. Same `~/.claude-agent-bus/bus.db` is shared automatically.
 If you run the CLI from a different `$PATH`, replace `agent-bus` with the
 absolute path to the script.
 
+**Waking an idle session** (Claude Code 2.1.290 or later) takes one more
+hook, on both `SessionStart` and `Stop`:
+
+```jsonc
+{
+  "matcher": "",
+  "hooks": [
+    {
+      "type": "command",
+      "command": "AGENT_BUS_NAME=repo-a/claude agent-bus hook-watch --client claude --max-seconds 86400 ; [ $? -ne 10 ] || exit 2",
+      "asyncRewake": true,
+      "timeout": 86430,
+      "rewakeSummary": "agent-bus: new mail"
+    }
+  ]
+}
+```
+
+Claude Code runs it in the background and starts a turn when it exits 2.
+`hook-watch` exits 10 when it has mail and the command turns that, and only
+that, into 2: an `agent-bus` too old to know `hook-watch` exits 2 from its
+argument parser, which must not wake the model. Do not end this command in
+`|| true` — that would swallow the wake too. Keep `timeout` above
+`--max-seconds`, so the watcher ends on its own before Claude Code kills it.
+
 **Hooks configured once per user.** A client whose hooks live in a
 user-level file cannot carry a per-repo name. Leave the name out —
 `agent-bus hook-stop --client codex` — and the hook reads the repo from its
@@ -734,6 +775,13 @@ recovery requires SQLite + audit cross-reference.
 | `AGENT_BUS_DB`                    | everything         | Database path. Default `~/.claude-agent-bus/bus.db`.                                     |
 | `AGENT_BUS_AUDIT_LOG`             | everything         | Audit log path. Default `~/.claude-agent-bus/audit.log`.                                 |
 | `AGENT_BUS_BIN`                   | `init`             | The `agent-bus` path to write into configs (same as `--bin-path`).                       |
+| `AGENT_BUS_NATIVE_WAKE`           | `init`, wake paths | `0` turns native wake off: no wake hooks from `init`, and existing ones stand down. Default on. |
+| `AGENT_BUS_WATCH_POLL_SECONDS`    | `hook-watch`       | How often a watcher looks for mail. Default `2`.                                         |
+| `AGENT_BUS_WATCH_HOURS`           | `init`             | How long each watcher waits before giving up. Default `24`.                              |
+| `AGENT_BUS_WAKES_PER_HOUR`        | wake paths         | Native wakes allowed per agent per hour. Default `20`, `0` removes the limit.            |
+| `AGENT_BUS_CLAUDE_BIN`            | `init`             | The Claude Code executable asked for its version. Default `claude`.                      |
+| `AGENT_BUS_CLIENT_VERSION_TIMEOUT`| `init`             | Seconds to wait for that answer. Default `10`.                                           |
+| `AGENT_BUS_CODEX_BIN`             | senders            | The Codex executable that queues a turn. Default: the one the session runs.              |
 
 ---
 
@@ -760,6 +808,7 @@ The suite covers:
 - `hook-stop` with pending → exit 0, valid JSON with `decision: "block"` and bodies in `reason`
 - `hook-user-prompt` with pending → bodies in stdout, inbox empty after
 - `agent-bus tail -f` integration: send a message in a subprocess, assert it appears within 1s
+- native wake: `hook-watch` waking, giving up, handing over to a newer watcher, following a session's address, standing down for `wake.json`, the rate limit, a stop signal; the Claude Code hook command's exit codes run for real; Codex routes kept by the hooks and `codex queue` run by senders (with a stand-in `codex`); the opencode plugin's watcher under Node
 
 ---
 
@@ -781,18 +830,69 @@ PRs welcome. The codebase is small and intentionally stays that way.
 
 ## Waking idle agents
 
-Agent CLIs (Claude Code, OpenCode, Gemini CLI) block on stdin when
-idle, so a peer message landing in SQLite does **not** start a new
-turn on its own. There is no MCP transport — stdio, SSE, or
-Streamable HTTP — that fixes this, because the constraint is in the
-client REPL, not the wire protocol.
+An agent CLI waiting at its prompt does not notice mail landing in
+SQLite: nothing starts a turn. agent-bus wakes it in one of two ways —
+through the client's own mechanism, which `agent-bus init` sets up by
+default, or through a shell command you configure in `wake.json`.
 
-agent-bus's answer is **wake-on-send**: a per-agent shell command runs
-the instant a message arrives for that agent. The command is whatever
-your environment makes feasible — drive emacs/vterm, drive a tmux
-pane, fire a desktop notification, hit a webhook, ring a bell.
+### Native wake (the default)
 
-### How it works
+| Client          | How an idle session is woken                                                                                                                                                                             | Delay                         |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| Claude Code     | A background hook (`asyncRewake`) runs `agent-bus hook-watch` when a session starts and after every turn. It polls the bus; when mail arrives it takes it from the inbox and exits, and Claude Code starts a turn with the mail. Interactive sessions only — see below. | `AGENT_BUS_WATCH_POLL_SECONDS` (2 s) at most |
+| Codex           | The sender runs `codex queue --thread <id>` for the recipient's session. Codex starts a turn with a short notice, and its prompt hook adds the mail as on any turn.                                     | up to ~10 s: Codex checks its queue every 10 s |
+| opencode        | The generated plugin runs `hook-watch` for a session when it goes idle, and starts a turn with what it finds.                                                                                            | 2 s at most                   |
+| Antigravity CLI | Not natively; use `wake.json`.                                                                                                                                                                           |                               |
+
+- **Mail that arrives mid-turn** reaches Claude Code inside the running
+  turn. Codex and opencode see it when the turn ends, through the Stop
+  hook and the plugin's idle check, as before — a busy Codex session is
+  never queued to, so it does not get an extra, empty turn.
+- **Claude Code: interactive sessions only.** The watcher runs only where
+  `CLAUDE_CODE_ENTRYPOINT` is `cli` — a session started with `claude` in a
+  terminal. A non-interactive run (`claude -p`, the SDK) would wait for the
+  hook in the foreground, so there it exits at once; sessions inside an IDE
+  or the desktop app are not woken either.
+- **One watcher per session.** Each turn starts a new one and the older
+  one stops. A watcher stops when its client exits, and gives up after
+  `AGENT_BUS_WATCH_HOURS` (24): a session idle for longer is not woken
+  until its next turn. That limit is written into the client's config, so
+  a change takes effect on the next `agent-bus init`.
+- **Codex** is queued to only while its process is running and the session
+  is idle, and only once until that queued turn has started. The sender
+  runs the Codex executable the session's hooks recorded, which works
+  where the `codex` on `PATH` is a wrapper script; `AGENT_BUS_CODEX_BIN`
+  names another one.
+- **A repo-wide or broadcast message** still wakes at most one agent per
+  repo. A Claude Code or opencode session watching in that repo takes it;
+  otherwise the sender wakes the most recently seen agent it can.
+- **Rate limit.** No agent is woken natively more than
+  `AGENT_BUS_WAKES_PER_HOUR` (20) times in an hour, so two agents that
+  answer each other cannot keep each other busy indefinitely. Past the
+  limit, mail waits for the agent's next turn. `0` removes the limit.
+- **Audit.** Every native wake writes an `op="wake"` row with
+  `wake_driver` (`watch` or `push`) and `wake_status` (`woke`,
+  `fired:OK`, `fired:ERR:…`, `rate-limited`).
+- **Turning it off.** `AGENT_BUS_NATIVE_WAKE=0` makes `init` leave the
+  wake hooks out (and remove ones it wrote before), and stops wiring that
+  is already in place: watchers exit at once and senders queue nothing.
+- **`wake.json` wins.** An entry for an agent, its client or its repo
+  replaces native wake for it: a command runs instead, and `false` turns
+  waking off.
+
+Caveats: the line Claude Code shows when mail wakes a session ("agent-bus:
+new mail") comes from an undocumented hook option, `rewakeSummary`. Codex's
+queue is new in Codex: a message queued to a session whose turn you
+interrupted with Esc waits until you send the next prompt.
+
+### Commands of your own (`wake.json`)
+
+A per-agent shell command can run the instant a message arrives for that
+agent instead — for a client without native wake, or to do something else
+entirely: drive emacs/vterm, drive a tmux pane, fire a desktop
+notification, hit a webhook, ring a bell.
+
+#### How it works
 
 1. You drop a `wake.json` next to `bus.db` (default:
    `~/.claude-agent-bus/wake.json`) mapping `agent_name → shell command`.
@@ -816,7 +916,7 @@ pane, fire a desktop notification, hit a webhook, ring a bell.
    are user-controlled. `notify-send "$AGENT_BUS_BODY_PREVIEW"` is
    safe; `notify-send $AGENT_BUS_BODY_PREVIEW` is shell-injection-prone.
 
-### Managing wake.json
+#### Managing wake.json
 
 Edit it directly, or use the CLI helpers:
 
@@ -828,7 +928,7 @@ agent-bus wake-config test web-app   # fire a synthetic wake to verify
 agent-bus wake-config clear web-app
 ```
 
-### Example wake commands
+#### Example wake commands
 
 **emacs / vterm.** Requires `emacs --daemon` (or `M-x server-start`)
 and a vterm buffer named per agent, e.g. `*vterm: web-app*`.
@@ -862,7 +962,7 @@ agent-bus wake-config set web-app \
 agent-bus wake-config set alex false   # or just omit the entry
 ```
 
-### Failure modes
+#### Failure modes
 
 - Wake command crashes / exits nonzero: agent-bus doesn't notice
   (we don't await the process). The `op="wake"` audit row says
@@ -923,12 +1023,11 @@ holding turns open.
 - Message expiry / log rotation.
 - Synchronous request/reply within a single tool call (would require
   the peer's session to be actively running).
-- **Push wake without `wake.json`.** Anthropic ships
-  `notifications/claude/channel` for exactly this, but (a) it's
-  Claude-Code-only and we stay client-neutral (OpenCode and Gemini
-  CLI need to participate too), and (b) the upstream wake path has
-  known open bugs (`#44380` and dozens of duplicates). `wake.json`
-  is the portable answer until the spec + clients converge.
+- **Native wake for Antigravity CLI**, which offers no way to start a
+  turn from outside; `wake.json` covers it. Claude Code's MCP channels
+  (`notifications/claude/channel`) are not used either: they need a
+  command-line flag and organisation settings, while a background hook
+  works in any session.
 
 ---
 

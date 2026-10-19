@@ -155,10 +155,51 @@ def _add_sessions(conn: sqlite3.Connection) -> None:
             )
 
 
+def _add_wake_routes(conn: sqlite3.Connection) -> None:
+    """How each running session can be woken (`wake_routes`), and when it
+    last was (`wakes`, for the rate limit). See `routes.py`."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wake_routes (
+            route_key        TEXT PRIMARY KEY,
+            client           TEXT NOT NULL,
+            address          TEXT NOT NULL,
+            driver           TEXT NOT NULL,
+            pid              INTEGER,
+            started          TEXT,
+            watcher_pid      INTEGER,
+            watcher_started  TEXT,
+            token            TEXT,
+            command          TEXT,
+            state            TEXT,
+            boot_id          TEXT,
+            pid_ns           TEXT,
+            updated_at       TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wake_routes_address ON wake_routes (address)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wakes (
+            address   TEXT NOT NULL,
+            woken_at  TEXT NOT NULL,
+            driver    TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wakes_address ON wakes (address, woken_at)"
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "base tables (0.4.x schema)", _create_base_tables),
     Migration(2, "group addressing columns", _add_group_addressing_columns),
     Migration(3, "sessions table and agent topics", _add_sessions),
+    Migration(4, "wake routes and wake history", _add_wake_routes),
 )
 
 
