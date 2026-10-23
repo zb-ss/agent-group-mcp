@@ -20,10 +20,10 @@ client process; failing that, to the session with the same client session
 id; failing that, to none — and then it drains only the shared client
 address, so it never takes another session's own mail.
 
-Two servers a hook could not tell apart — one client process, no session
-ids to separate them, as one Codex app server does for all its threads —
-share one address, which is how every session of a client behaved before
-session addresses existed.
+Legacy clients without thread metadata use ancestry to share an address
+when their servers cannot be told apart. Codex servers each get a private
+address, then bind it to the thread id on their first MCP tool call. Its
+hooks require that id and never infer a thread from its parent process.
 
 A session ends when its server process does: on a clean exit (`release`),
 or when the next claim finds the process gone. A numbered address is then
@@ -45,7 +45,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from . import audit, identity, procs, settings
+from . import audit, clients, identity, procs, settings
 from .procs import Proc
 from .storage import Storage, register_in
 
@@ -210,7 +210,8 @@ class SessionRegistry:
     ) -> str | None:
         """The session a hook belongs to, or None when it cannot be told.
 
-        The hook's own client process — its nearest ancestor that is not a
+        Codex requires an exact thread id. For other clients, the hook's
+        own client process — its nearest ancestor that is not a
         shell — decides first; a session id the client reports decides
         next. A session further up the hook's ancestry never counts: that
         is a different session, such as one whose terminal ran this
@@ -220,6 +221,9 @@ class SessionRegistry:
         candidates = self.live(client_address)
         if not candidates:
             return None
+        if clients.requires_session_key(identity.parse(client_address).client):
+            names = {r.name for r in candidates if session_key and r.session_key == session_key}
+            return names.pop() if len(names) == 1 else None
         own = procs.client_of(procs.ancestry() if ancestry is None else ancestry)
         if own is not None:
             names = {r.name for r in candidates if r.client_process == own}
@@ -326,13 +330,16 @@ class SessionRegistry:
         pinned: str | None,
         warnings: list[str],
     ) -> _Choice:
+        parsed = identity.parse(client_address)
+        keyed = clients.requires_session_key(parsed.client)
         held = {r.name for r in live}
         unavailable = held | self._untracked_numbers(conn, client_address, live + over)
         for row in live:
+            if keyed and (session_key is None or row.session_key != session_key):
+                continue
             if _could_be_the_same_session(row, client, session_key):
                 return _Choice(row.name)
 
-        parsed = identity.parse(client_address)
         if pinned is not None:
             wanted = identity.compose(parsed.group, parsed.client, pinned)
             if wanted not in unavailable:
@@ -347,7 +354,8 @@ class SessionRegistry:
         for row in sorted(over, key=lambda r: r.ended_at or r.last_seen, reverse=True):
             same_process = client is not None and row.client_process == client
             same_key = session_key is not None and row.session_key == session_key
-            if (same_process or same_key) and row.name not in unavailable:
+            resumes = same_key if keyed else same_process or same_key
+            if resumes and row.name not in unavailable:
                 return _Choice(row.name, predecessor=row)
 
         # a fresh start: mail an ended holder left at a number goes to the
@@ -363,11 +371,79 @@ class SessionRegistry:
         kept = {r.name for r in over}
         for candidate in sorted(free, key=lambda name: name in kept):
             return _Choice(candidate, inherits=False)
+        if keyed:
+            raise SessionError(
+                f"every session number of {client_address!r} is taken; "
+                "close an unused server or set a unique AGENT_BUS_SESSION label"
+            )
         warnings.append(
             f"every session number of {client_address!r} is taken, so this "
             "session shares the client address"
         )
         return _Choice(client_address)
+
+    def bind(
+        self, server: Proc, client_address: str, session_key: str, *, resume: bool = True,
+    ) -> str:
+        """Bind a provisional server address to the thread on its first call.
+
+        Recover an ended thread's address atomically. A connection already
+        serving another thread must never switch inboxes under an in-flight call.
+        """
+        _rows, over = self._look(client_address)
+        now = _utc_now_iso()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _expire(conn, client_address, now)
+                mine = _own_row(conn, server, client_address)
+                if mine is None or mine["ended_at"] is not None:
+                    raise SessionError("this server holds no session address to bind")
+                row = SessionRow.from_row(mine)
+                if row.session_key is not None and row.session_key != session_key:
+                    raise SessionError("this server is already bound to another thread")
+                rows = [r for r in self._rows(conn, client_address) if r.key != row.key]
+                live = [r for r in rows if r.ended_at is None and r.key not in over]
+                if any(r.session_key == session_key for r in live):
+                    raise SessionError("this thread already has a running server")
+                new = self._resume_bound(conn, row, rows, live, session_key, now) if resume else row.name
+                conn.execute(
+                    "UPDATE sessions SET name = ?, session_key = ?, last_seen = ? "
+                    "WHERE server_pid = ? AND server_started = ? AND client_address = ?",
+                    (new, session_key, now, server.pid, server.started, client_address),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        self._audit("bind", new, f"{new!r} bound to its client thread", now, previous=row.name)
+        return new
+
+    def _resume_bound(
+        self, conn: sqlite3.Connection, row: SessionRow, rows: list[SessionRow],
+        live: list[SessionRow], session_key: str, now: str,
+    ) -> str:
+        if row.session_key is not None or identity.parse(row.name).label:
+            return row.name
+        held = {r.name for r in live}
+        predecessors = [
+            r for r in rows if r.session_key == session_key and r.name not in held
+        ]
+        if not predecessors:
+            return row.name
+        old = max(predecessors, key=lambda r: r.ended_at or r.last_seen)
+        register_in(conn, old.name, row.repo_path, overwrite_repo=True, now=now)
+        if row.name != old.name and row.name != row.client_address:
+            conn.execute(
+                "UPDATE agents SET topic = COALESCE(topic, "
+                "(SELECT topic FROM agents WHERE name = ?)) WHERE name = ?",
+                (row.name, old.name),
+            )
+            _move_unread(conn, row.name, old.name)
+            _rewrite_sender(conn, row.name, old.name)
+            conn.execute("DELETE FROM agents WHERE name = ?", (row.name,))
+        _delete_own_row(conn, old.server, old.client_address)
+        return old.name
 
     def _end(
         self,

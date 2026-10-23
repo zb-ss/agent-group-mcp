@@ -3,6 +3,16 @@
 Notable changes per release. This project is pre-1.0: minor versions may
 change behaviour, and each release says what to expect.
 
+## Unreleased
+
+### Fixed
+
+- Codex threads under one app-server process now have separate session
+  addresses and can be labelled independently. MCP tool-call thread metadata
+  binds each address to its conversation, including after a restart.
+- Codex hooks and resumed servers no longer select another thread's address
+  merely because they share a parent process.
+
 ## 0.7.0
 
 An idle agent now wakes up when mail arrives, without a terminal

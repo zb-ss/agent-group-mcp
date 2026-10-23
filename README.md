@@ -198,9 +198,16 @@ the bus: each MCP server claims one when it starts.
   Address a session by its own name when it has to be that one.
 - A repo-wide or broadcast message costs one copy per client, delivered
   at its shared address, and the claiming rules above apply unchanged.
+- Codex threads get separate addresses even when one app-server process
+  starts all their MCP servers. The first tool call binds the address to
+  Codex's thread id. Call the agent-bus MCP tool `whoami` to discover it,
+  and include `set_session` in `enabled_tools` if your Codex MCP
+  configuration uses an allowlist.
 - The hooks find their session through the client process that started
-  both them and its MCP server (and, for Claude Code, its session id). A
-  hook that cannot tell which session it runs for surfaces only the shared
+  both them and its MCP server (and, for Claude Code, its session id).
+  Codex hooks require the matching thread id; before the first MCP call
+  they can deliver shared mail only. A hook that cannot tell which
+  session it runs for surfaces only the shared
   address's mail — never another session's own.
 - A session ends with its server process. A numbered address is then given
   up and its unread mail moves to the shared address; a labelled one is
@@ -211,8 +218,9 @@ the bus: each MCP server claims one when it starts.
 - Whether a session's process has ended is decided on evidence only. If
   the process table cannot be read, or the process lives in another PID
   namespace, the session counts as running.
-- Servers that cannot be told apart — one process starting several with
-  no session ids to separate them — share one session address, which is
+- For clients without per-call thread ids, servers that cannot be told
+  apart — one process starting several with no session ids to separate
+  them — share one session address, which is
   how every session of a client behaved before. Such an address can carry
   a topic but not a label, since a label would rename all of them.
 
