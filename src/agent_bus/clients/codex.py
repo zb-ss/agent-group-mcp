@@ -26,7 +26,10 @@ adds a message to a thread, and a running Codex starts a turn with it
 within seconds. The thread id is the hook payload's `session_id`; the
 hooks record it with the executable that runs the session (`routes`).
 The queued text only starts the turn — the prompt hook then adds the
-mail, as on any other turn.
+mail, as on any other turn. MCP servers do not receive that thread id at
+startup: Codex supplies `_meta.threadId` on tool calls. Each server gets
+a separate address, bound to its thread on the first call. Hooks use the
+payload's session_id (or CODEX_THREAD_ID) to find that address.
 """
 
 from __future__ import annotations
@@ -41,6 +44,10 @@ from . import base
 from .base import UnreadableConfigError, WiringState, WiringStatus
 
 CLIENT_ID = "codex"
+# Shells/hooks receive the environment variable; MCP tool calls carry
+# threadId in _meta (sessionId changes when a conversation is resumed).
+SESSION_KEY_ENV = "CODEX_THREAD_ID"
+SESSION_KEY_META = "threadId"
 # The prompt a woken Codex session starts its turn with; the mail itself
 # follows from the prompt hook.
 QUEUE_NOTICE = "[agent-bus] New mail from peers has arrived; it is shown below."

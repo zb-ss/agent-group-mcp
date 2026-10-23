@@ -29,14 +29,16 @@ MAX_TOPIC_LEN = audit.PREVIEW_LIMIT
 
 @dataclass
 class Me:
-    """Who this server speaks for. `name` changes when the session is
-    renamed; everything else is fixed for the life of the process."""
+    """Who this server speaks for. The name follows renames and resumes;
+    the thread key is fixed once learned from the first Codex tool call."""
 
     name: str
     repo_path: str
     registry: SessionRegistry | None = None
     process: Proc | None = None
     client_address: str | None = None
+    session_key: str | None = None
+    pinned: bool = False
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -132,18 +134,42 @@ def start(
     registry = SessionRegistry(store)
     address = parsed.client_address
     assert address is not None  # parsed.client is set
+    # A parent shell can carry a different Codex thread's environment.
+    # Only per-call metadata identifies the thread that owns this server.
+    key = None if clients.requires_session_key(parsed.client) else clients.session_key(parsed.client, env)
     claim = registry.claim(
         client_address=address,
         repo_path=who.repo_path,
         server=process,
         lineage=procs.ancestry() if lineage is None else lineage,
-        session_key=clients.session_key(parsed.client, env),
+        session_key=key,
         pinned=parsed.handle,
     )
     return Me(
         claim.name, who.repo_path, registry=registry, process=process,
-        client_address=address, warnings=warnings + claim.warnings,
+        client_address=address, session_key=key, pinned=parsed.handle is not None,
+        warnings=warnings + claim.warnings,
     )
+
+
+def _bind_thread(me: Me, ctx: Context) -> None:
+    if not me.holds_session or me.client_address is None:
+        return
+    client = identity.parse(me.client_address).client
+    if not clients.requires_session_key(client):
+        return
+    try:
+        meta = ctx.request_context.meta
+    except ValueError:
+        return  # tools invoked directly, without an MCP request
+    key = clients.session_key_from_meta(client, meta.model_dump() if meta else {})
+    if key is None or key == me.session_key:
+        return
+    if me.session_key is not None:
+        raise SessionError("this server is already bound to another thread")
+    assert me.registry is not None and me.process is not None
+    me.name = me.registry.bind(me.process, me.client_address, key, resume=not me.pinned)
+    me.session_key = key
 
 
 def _instructions(me: Me) -> str:
@@ -163,6 +189,11 @@ def _instructions(me: Me) -> str:
             "client here. Once you know what this session is working on, "
             "call `set_session` with a short label and topic so peers can "
             "reach you by name; `whoami` shows your current address."
+        )
+    if me.client_address and clients.requires_session_key(identity.parse(me.client_address).client):
+        text += (
+            " Call `whoami` before sharing your address: the first tool call "
+            "binds this connection to your thread and may restore its previous name."
         )
     return text
 
@@ -208,6 +239,10 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
     """The FastMCP app for an identity `start` has settled."""
     mcp = FastMCP("agent-bus", instructions=_instructions(me))
 
+    def touch(ctx: Context) -> None:
+        _bind_thread(me, ctx)
+        store.touch_agent(me.name)
+
     def live_names() -> set[str]:
         return me.registry.live_names() if me.registry else set()
 
@@ -222,7 +257,7 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
         holds one), its repo's group, the client address its sessions
         share, the other agents working in the same repo, plus any wiring
         warnings."""
-        store.touch_agent(me.name)
+        touch(ctx)
         row = store.get_agent(me.name)
         parsed = identity.parse_or_none(me.name)
         group = row.group if row else me.name
@@ -252,11 +287,11 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
         }
 
     @mcp.tool()
-    def list_agents(group: str | None = None) -> list[dict]:
+    def list_agents(ctx: Context, group: str | None = None) -> list[dict]:
         """Every agent that has ever connected, plus its current unread
         count. Pass `group` (a bare repo name) to see one repo's agents.
         Sessions say whether a running server holds them (`live`)."""
-        store.touch_agent(me.name)
+        touch(ctx)
         live = live_names()
         return [
             describe(a, pending=c, live=live)
@@ -265,7 +300,7 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
         ]
 
     @mcp.tool()
-    def send_message(to: str, body: str, thread_id: str | None = None) -> dict:
+    def send_message(to: str, body: str, ctx: Context, thread_id: str | None = None) -> dict:
         """Send `body` to one session, to a client, to every agent in a
         repo, or to everyone.
 
@@ -283,7 +318,7 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
         `kind` is "direct", "group" or "broadcast". Each recipient gets its
         own row and message_id, so read state is tracked per agent.
         """
-        store.touch_agent(me.name)
+        touch(ctx)
         live = live_names() if me.registry is not None else set()
         result = store.send_message(
             from_agent=me.name, to=to, body=body, thread_id=thread_id,
@@ -296,37 +331,37 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
         return result
 
     @mcp.tool()
-    def read_inbox(mark_read: bool = True, limit: int = 50) -> list[dict]:
+    def read_inbox(ctx: Context, mark_read: bool = True, limit: int = 50) -> list[dict]:
         """Unread messages for this session, oldest first — its own, plus
         any sent to its client address that no other session has taken.
 
         Set mark_read=False to peek without flipping read_at.
         """
-        store.touch_agent(me.name)
+        touch(ctx)
         msgs = store.read_inbox(
             agent=me.name, mark_read=mark_read, limit=limit, actor=me.name,
         )
         return [m.to_dict() for m in msgs]
 
     @mcp.tool()
-    def read_thread(thread_id: str, limit: int = 100) -> list[dict]:
+    def read_thread(thread_id: str, ctx: Context, limit: int = 100) -> list[dict]:
         """Full thread across all participants, ordered by sent_at."""
-        store.touch_agent(me.name)
+        touch(ctx)
         return [m.to_dict() for m in store.read_thread(thread_id=thread_id, limit=limit)]
 
     @mcp.tool()
-    def tail_audit(limit: int = 50) -> list[dict]:
+    def tail_audit(ctx: Context, limit: int = 50) -> list[dict]:
         """Last N audit-log entries across the whole bus.
 
         Audit rows are the recovery-truth source; messages.body is the
         only place the full body lives, but the audit log records its
         sha256 so you can reconstruct provenance.
         """
-        store.touch_agent(me.name)
+        touch(ctx)
         return audit.tail(limit=limit)
 
     @mcp.tool()
-    def set_session(label: str | None = None, topic: str | None = None) -> dict:
+    def set_session(ctx: Context, label: str | None = None, topic: str | None = None) -> dict:
         """Name this session after what it works on, so peers can reach it.
 
         `label` renames the session to `<repo>/<client>-<label>` (for
@@ -336,6 +371,7 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
         name in `list_agents`; an empty string clears it.
         Returns {"name", "client_address", "topic"}.
         """
+        touch(ctx)
         if not me.holds_session or me.client_address is None:
             raise SessionError(
                 f"{me.name!r} is not a session of a client, so it has no "

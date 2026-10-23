@@ -159,6 +159,15 @@ Codex ties approval to the exact hook command, so it asks again whenever
 the wiring changes. A Codex session can be woken by mail only once those
 hooks have run for it, that is after its first turn.
 
+Each Codex thread has its own inbox, including threads in one app-server
+process. Ask it to call the agent-bus MCP tool `whoami` once to bind that
+inbox to its thread id; any bus tool call does this. For example: "Call
+`whoami` on the agent-bus MCP server and show its `name` and `client_address`."
+If your global MCP config uses `enabled_tools`,
+include `set_session` so it can name its inbox. No thread id needs to be
+hardcoded in the config or added to the MCP environment. After upgrading,
+restart the existing Codex MCP connections so they load the fix.
+
 **Antigravity CLI** — open the repository with `agy` and trust the folder
 when asked. The workspace plugin loads immediately after that; no restart
 needed.
@@ -399,7 +408,7 @@ up first if you want it.
 | Codex hook reports "Failed" | It got output that is not valid JSON | Make sure the hook command has `--client codex` |
 | `agy` shows no agent-bus tools | Workspace not trusted yet | Open the folder in `agy` and trust it |
 | A message was "sent" but never arrived | It went to a name nobody holds | Check `agent-bus agents`; unknown names are now an error, so re-send |
-| Two sessions of one client share an inbox | Their MCP servers were started by one process that gives no session ids, so the bus cannot tell them apart | Start each with its own `AGENT_BUS_SESSION=<label>`; or check `AGENT_BUS_SESSIONS` is not `0` |
+| Two sessions of one client share an inbox | Session identities are disabled, an old server is still running, or the client supplies no usable thread identity | Check `AGENT_BUS_SESSIONS` is not `0`; upgrade and restart the MCP connections. For Codex, call `whoami` in each thread and compare addresses. For other clients without thread ids, use separate client processes |
 | A session's hook surfaces only `to any <repo>/<client> session` mail | The hook could not tell which session it runs for (e.g. a wrapper script between the client and `agent-bus serve`) | Start the server with `exec`, or call `read_inbox` for the session's own mail |
 | Two different repos share an inbox | Same directory basename, wired in separate runs | Pin one with `.agent-bus-name`, or wire both in one `--scan` |
 | `upgrade agent-bus` on any command | The database was written by a newer version | Upgrade the package on this machine |

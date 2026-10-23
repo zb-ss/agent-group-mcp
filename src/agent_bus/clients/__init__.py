@@ -20,10 +20,16 @@ _HOOK_DIALECTS: dict[str, HookDialect] = {
 _STANDARD = StandardHookDialect()
 
 # Where a client tells the processes it starts which of its sessions they
-# serve. Only a client listed here can have its sessions told apart by id;
-# the others rely on process ancestry alone.
+# serve. Codex publishes this to shells/hooks; its MCP calls use _meta below.
 _SESSION_KEY_ENV: dict[str, str] = {
     claude.CLIENT_ID: claude.SESSION_KEY_ENV,
+    codex.CLIENT_ID: codex.SESSION_KEY_ENV,
+}
+
+# These clients multiplex threads in one process. Ancestry cannot identify
+# a conversation, even when only one of its servers is currently registered.
+_SESSION_KEY_META: dict[str, str] = {
+    codex.CLIENT_ID: codex.SESSION_KEY_META,
 }
 
 # Clients whose idle sessions the sender wakes, by running a command that
@@ -59,6 +65,20 @@ def session_key(client: str | None, env: Mapping[str, str]) -> str | None:
     variable = _SESSION_KEY_ENV.get(client or "")
     value = env.get(variable, "").strip() if variable else ""
     return value or None
+
+
+def requires_session_key(client: str | None) -> bool:
+    """Whether hooks must identify a thread rather than its parent process."""
+    return client in _SESSION_KEY_META
+
+
+def session_key_from_meta(client: str | None, meta: Mapping[str, object]) -> str | None:
+    """The conversation id supplied by the MCP client on a tool call."""
+    field = _SESSION_KEY_META.get(client or "")
+    value = meta.get(field) if field else None
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
 
 
 def watch_allowed(client: str | None, env: Mapping[str, str]) -> bool:

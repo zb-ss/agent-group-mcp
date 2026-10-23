@@ -180,12 +180,11 @@ def test_a_resumed_session_with_the_same_id_gets_its_old_address_back(
 def test_servers_a_hook_cannot_tell_apart_share_one_address(
     storage, registry, fake_procs
 ):
-    """One process starting several servers with no session ids — one Codex
-    app server for all its threads — gets one address, as before."""
+    """Legacy clients without per-call thread ids keep ancestry fallback."""
     daemon = fake_procs.proc()
-    first, *_ = _start(registry, fake_procs, "shared/codex", client=daemon)
-    second, *_ = _start(registry, fake_procs, "shared/codex", client=daemon)
-    assert first == second == "shared/codex-1"
+    first, *_ = _start(registry, fake_procs, client=daemon)
+    second, *_ = _start(registry, fake_procs, client=daemon)
+    assert first == second == "shared/claude-1"
 
 
 def test_session_ids_tell_apart_servers_of_one_process(storage, registry, fake_procs):
@@ -493,13 +492,13 @@ def test_sessions_table_exists_after_migration(storage):
 
 
 def test_a_shared_address_cannot_be_relabelled(storage, registry, fake_procs):
-    """Two threads of one Codex process share an address; relabelling it
+    """Two indistinguishable legacy servers share an address; relabelling it
     for one would leave the other on a name that no longer exists."""
-    daemon = fake_procs.proc("codex")
-    name, server, _ = _start(registry, fake_procs, "shared/codex", client=daemon)
-    _start(registry, fake_procs, "shared/codex", client=daemon)
+    daemon = fake_procs.proc("claude")
+    name, server, _ = _start(registry, fake_procs, client=daemon)
+    _start(registry, fake_procs, client=daemon)
     with pytest.raises(SessionError, match="shared with other sessions"):
-        registry.rename(server, "shared/codex", "frontend")
+        registry.rename(server, CLAUDE, "frontend")
     assert storage.get_agent(name) is not None
 
 

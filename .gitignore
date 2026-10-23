@@ -19,6 +19,15 @@ venv/
 .vscode/
 .idea/
 
+# Private assistant instructions
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.cursorrules
+.windsurfrules
+.clinerules
+copilot-instructions.md
+
 # local bus data — never commit
 *.db
 *.db-wal
