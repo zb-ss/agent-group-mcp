@@ -3,7 +3,10 @@
 Notable changes per release. This project is pre-1.0: minor versions may
 change behaviour, and each release says what to expect.
 
-## Unreleased
+## 0.7.2
+
+Idle Antigravity CLI sessions are now woken natively as well, so every
+client agent-bus wires can be woken without a `wake.json` command.
 
 ### Added
 

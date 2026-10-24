@@ -55,8 +55,9 @@ pipx install agent-group-mcp
 agent-bus --version
 ```
 
-Expected: `agent-bus 0.7.0` or newer. Older versions do not wake idle
-agents, 0.5.x also gives every session of a client in a repository one
+Expected: `agent-bus 0.7.2` or newer. 0.7.0 and 0.7.1 do not wake idle
+Antigravity CLI sessions, older versions wake no idle agents at all,
+0.5.x also gives every session of a client in a repository one
 shared inbox, and 0.5.0 hangs every opencode turn, so upgrade if that is
 what you see. The distribution is
 `agent-group-mcp`; the command it installs is `agent-bus`.
