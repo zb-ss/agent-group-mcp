@@ -20,8 +20,9 @@ each with an inbox of its own.
   their next turn, and a Stop hook keeps an agent on the line until it
   has handled its inbox.
 - **Idle agents wake up** when mail arrives — through Claude Code's,
-  Codex's and opencode's own mechanisms, with no terminal multiplexer
-  involved — or through a command of your own (`wake.json`).
+  Codex's, Antigravity CLI's and opencode's own mechanisms, with no
+  terminal multiplexer involved — or through a command of your own
+  (`wake.json`).
 - **Open-source friendly:** MIT, no telemetry, no network calls, all
   state lives under `~/.claude-agent-bus/` (gitignored by default).
 
@@ -316,6 +317,7 @@ agent-bus wake-config {show,set,clear,test} [NAME] [COMMAND]   # your own wake c
 agent-bus hook-stop [--client ID]            # "about to stop" hook
 agent-bus hook-user-prompt [--client ID]     # "before the prompt" hook
 agent-bus hook-watch [--client ID] [--max-seconds N]   # background hook: wake on new mail
+agent-bus wake-register [--client ID]        # run by an agy agent when asked: let mail wake it
 agent-bus serve [--client ID]                # same as python -m agent_bus.server
 ```
 
@@ -427,7 +429,7 @@ tool names do not depend on which client you are in.
 | --------------- | ----------- | ----------------------------------------------------------- | ------------------------------- | ------------------------------ | ---------------------------------- |
 | Claude Code     | `claude`    | `.mcp.json`, `.claude/settings.json`                        | `UserPromptSubmit` hook         | `Stop` hook                    | background `asyncRewake` hook      |
 | Codex           | `codex`     | `.codex/config.toml`, `.codex/hooks.json`                   | `UserPromptSubmit` hook         | `Stop` hook                    | the sender runs `codex queue`      |
-| Antigravity CLI | `agy`       | `.agents/plugins/agent-bus/` (a workspace plugin)           | `PreInvocation` hook            | `Stop` hook                    | only through `wake.json`           |
+| Antigravity CLI | `agy`       | `.agents/plugins/agent-bus/` (a workspace plugin)           | `PreInvocation` hook            | `Stop` hook                    | the sender runs `agy agentapi`     |
 | opencode        | `opencode`  | `.opencode/opencode.json`, `.opencode/plugins/agent-bus.js` | plugin, before each model call  | not possible — see below       | plugin                             |
 
 How idle agents are woken is described in [Waking idle agents](#waking-idle-agents).
@@ -460,7 +462,11 @@ What differs per client:
   you have trusted the workspace in `agy`. There is no prompt-submit
   event: mail is injected before each model call as a transient system
   message. Check the result with `agy plugin validate
-  .agents/plugins/agent-bus`.
+  .agents/plugins/agent-bus`. A sender wakes an idle session with `agy
+  agentapi send-message`, which needs credentials agy gives only to the
+  commands its agent runs; so the first model call of each session asks
+  the agent to run `agent-bus wake-register` once, and agy asks you to
+  allow that command — allow it always, and it stops asking.
 - **opencode** — has no shell hooks; a small generated plugin runs the two
   hook commands. It adds pending mail to the system prompt before each
   model request (repeating it for the rest of the turn, since that
@@ -790,6 +796,7 @@ recovery requires SQLite + audit cross-reference.
 | `AGENT_BUS_CLAUDE_BIN`            | `init`             | The Claude Code executable asked for its version. Default `claude`.                      |
 | `AGENT_BUS_CLIENT_VERSION_TIMEOUT`| `init`             | Seconds to wait for that answer. Default `10`.                                           |
 | `AGENT_BUS_CODEX_BIN`             | senders            | The Codex executable that queues a turn. Default: the one the session runs.              |
+| `AGENT_BUS_AGY_BIN`               | senders            | The agy executable that starts a turn. Default: the one the session runs.                |
 
 ---
 
@@ -816,7 +823,7 @@ The suite covers:
 - `hook-stop` with pending → exit 0, valid JSON with `decision: "block"` and bodies in `reason`
 - `hook-user-prompt` with pending → bodies in stdout, inbox empty after
 - `agent-bus tail -f` integration: send a message in a subprocess, assert it appears within 1s
-- native wake: `hook-watch` waking, giving up, handing over to a newer watcher, following a session's address, standing down for `wake.json`, the rate limit, a stop signal; the Claude Code hook command's exit codes run for real; Codex routes kept by the hooks and `codex queue` run by senders (with a stand-in `codex`); the opencode plugin's watcher under Node
+- native wake: `hook-watch` waking, giving up, handing over to a newer watcher, following a session's address, standing down for `wake.json`, the rate limit, a stop signal; the Claude Code hook command's exit codes run for real; Codex routes kept by the hooks and `codex queue` run by senders (with a stand-in `codex`); agy's registration request, private credential store and `agy agentapi send-message` run by senders (with a stand-in `agy`); the opencode plugin's watcher under Node
 
 ---
 
@@ -850,12 +857,16 @@ default, or through a shell command you configure in `wake.json`.
 | Claude Code     | A background hook (`asyncRewake`) runs `agent-bus hook-watch` when a session starts and after every turn. It polls the bus; when mail arrives it takes it from the inbox and exits, and Claude Code starts a turn with the mail. Interactive sessions only — see below. | `AGENT_BUS_WATCH_POLL_SECONDS` (2 s) at most |
 | Codex           | The sender runs `codex queue --thread <id>` for the recipient's session. Codex starts a turn with a short notice, and its prompt hook adds the mail as on any turn.                                     | up to ~10 s: Codex checks its queue every 10 s |
 | opencode        | The generated plugin runs `hook-watch` for a session when it goes idle, and starts a turn with what it finds.                                                                                            | 2 s at most                   |
-| Antigravity CLI | Not natively; use `wake.json`.                                                                                                                                                                           |                               |
+| Antigravity CLI | The sender runs `agy agentapi send-message <conversation id>` for the recipient's session, which starts a turn with a short notice; the PreInvocation hook adds the mail. The session's agent must have run `agent-bus wake-register` once — see below. | under a second                |
 
 - **Mail that arrives mid-turn** reaches Claude Code inside the running
-  turn. Codex and opencode see it when the turn ends, through the Stop
-  hook and the plugin's idle check, as before — a busy Codex session is
-  never queued to, so it does not get an extra, empty turn.
+  turn, and agy at its next model call. Codex and opencode see it when
+  the turn ends, through the Stop hook and the plugin's idle check, as
+  before — a busy Codex session is never queued to, so it does not get an
+  extra, empty turn. agy is pushed to while busy as well, at most once per
+  model call: its message joins the running turn, and agy ends a turn you
+  interrupt without running its Stop hook, so a session that looks busy
+  may be idle.
 - **Claude Code: interactive sessions only.** The watcher runs only where
   `CLAUDE_CODE_ENTRYPOINT` is `cli` — a session started with `claude` in a
   terminal. A non-interactive run (`claude -p`, the SDK) would wait for the
@@ -871,6 +882,18 @@ default, or through a shell command you configure in `wake.json`.
   runs the Codex executable the session's hooks recorded, which works
   where the `codex` on `PATH` is a wrapper script; `AGENT_BUS_CODEX_BIN`
   names another one.
+- **Antigravity CLI** guards the API that starts a turn with a token, and
+  gives it only to the commands its agent runs — not to hooks or MCP
+  servers. So the first model call of each session (and of a conversation
+  resumed in a new `agy` process) asks the agent to run `agent-bus
+  wake-register --client agy` once; agy asks you to allow that command,
+  and choosing to always allow it stops the question for good. The token
+  lets whoever holds it drive that session, so it is kept apart from the
+  bus database, in `push-credentials/` beside it (a directory only you
+  can open, one file per session readable only by you), passed to `agy`
+  through its environment rather than its arguments, and deleted once
+  the session's `agy` process has ended. Until a session has registered,
+  mail waits for its next turn and the audit says `unregistered`.
 - **A repo-wide or broadcast message** still wakes at most one agent per
   repo. A Claude Code or opencode session watching in that repo takes it;
   otherwise the sender wakes the most recently seen agent it can.
@@ -880,7 +903,7 @@ default, or through a shell command you configure in `wake.json`.
   limit, mail waits for the agent's next turn. `0` removes the limit.
 - **Audit.** Every native wake writes an `op="wake"` row with
   `wake_driver` (`watch` or `push`) and `wake_status` (`woke`,
-  `fired:OK`, `fired:ERR:…`, `rate-limited`).
+  `fired:OK`, `fired:ERR:…`, `rate-limited`, `unregistered`).
 - **Turning it off.** `AGENT_BUS_NATIVE_WAKE=0` makes `init` leave the
   wake hooks out (and remove ones it wrote before), and stops wiring that
   is already in place: watchers exit at once and senders queue nothing.
@@ -891,7 +914,9 @@ default, or through a shell command you configure in `wake.json`.
 Caveats: the line Claude Code shows when mail wakes a session ("agent-bus:
 new mail") comes from an undocumented hook option, `rewakeSummary`. Codex's
 queue is new in Codex: a message queued to a session whose turn you
-interrupted with Esc waits until you send the next prompt.
+interrupted with Esc waits until you send the next prompt. agy's
+`agentapi` is barely documented and may change between agy releases, and
+the registration depends on the agent running the command it is asked to.
 
 ### Commands of your own (`wake.json`)
 
@@ -1015,6 +1040,9 @@ holding turns open.
 - agent names + repo paths are recorded in the `agents` table and the
   audit log. Don't put secrets in agent names. Don't broadcast
   credentials over the bus.
+- The one secret agent-bus keeps itself — the token an agy session
+  registers so that it can be woken — is never written to the database or
+  the audit log; see [Native wake](#native-wake-the-default).
 
 ## Out of scope (future work)
 
@@ -1031,11 +1059,9 @@ holding turns open.
 - Message expiry / log rotation.
 - Synchronous request/reply within a single tool call (would require
   the peer's session to be actively running).
-- **Native wake for Antigravity CLI**, which offers no way to start a
-  turn from outside; `wake.json` covers it. Claude Code's MCP channels
-  (`notifications/claude/channel`) are not used either: they need a
-  command-line flag and organisation settings, while a background hook
-  works in any session.
+- Claude Code's MCP channels (`notifications/claude/channel`) as a way to
+  wake a session: they need a command-line flag and organisation
+  settings, while a background hook works in any session.
 
 ---
 
