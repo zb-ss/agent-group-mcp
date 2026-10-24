@@ -9,13 +9,15 @@ its address. There are two kinds:
     older one that finds the route taken gives up — so a session never
     has more than one watcher working, however many it started.
   * `push` — the sender starts the turn with the client's own command
-    (`codex queue`). The route keeps the client's id for the session and
-    the client's executable, which is all the command needs. Codex. Its
-    hooks keep the route's `state` current: `busy` from the start of a
-    turn, `idle` once a turn ends with nothing left to act on. Only an
-    idle session is pushed to — a busy one is given its mail by its own
-    end-of-turn hook — and pushing marks it `pushed`, so that a second
-    message does not queue a second turn before the first has started.
+    (`codex queue`, `agy agentapi send-message`). The route keeps the
+    client's id for the session and the client's executable; agy also
+    needs the credentials its agent registered (`push_credentials.py`).
+    Codex and agy. Their hooks keep the route's `state` current: `busy`
+    from the start of a turn, `idle` once a turn ends with nothing left
+    to act on. Only an idle Codex session is pushed to — a busy one is
+    given its mail by its own hooks — while agy is pushed to busy or idle
+    (see `clients/agy.py`). Pushing marks the route `pushed`, so that a
+    second message does not push again before the session's next hook.
 
 A route records the processes it depends on: the client, and for a watch
 route the watcher itself. A route one of them has left is dead. As with
@@ -224,25 +226,37 @@ class WakeRoutes:
                 values,
             )
 
-    def take_idle(self, route: Route) -> bool:
-        """Mark an idle push route as pushed to. False when it was not idle
-        any more — busy, or another sender got there first."""
+    def take_idle(self, route: Route, *, busy_too: bool = False) -> bool:
+        """Mark an idle push route — or with `busy_too` a busy one — as
+        pushed to. False when it is in no such state: already pushed to
+        by another sender, or busy when only idle counts."""
+        states = (STATE_IDLE, STATE_BUSY) if busy_too else (STATE_IDLE,)
+        marks = ", ".join("?" * len(states))
         with self._connect() as conn:
             changed = conn.execute(
-                "UPDATE wake_routes SET state = ? WHERE route_key = ? AND state = ?",
-                (STATE_PUSHED, route.route_key, STATE_IDLE),
+                f"UPDATE wake_routes SET state = ? WHERE route_key = ? AND state IN ({marks})",
+                (STATE_PUSHED, route.route_key, *states),
             ).rowcount
         return changed == 1
 
     def put_back(self, route: Route) -> None:
         """Undo `take_idle` for a push that could not be started."""
+        before = route.state if route.state in (STATE_IDLE, STATE_BUSY) else STATE_IDLE
         with self._connect() as conn:
             conn.execute(
                 "UPDATE wake_routes SET state = ? WHERE route_key = ? AND state = ?",
-                (STATE_IDLE, route.route_key, STATE_PUSHED),
+                (before, route.route_key, STATE_PUSHED),
             )
 
     # ----------------------------- queries ----------------------------------
+
+    def get(self, route_key: str) -> Route | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {ROUTE_COLUMNS} FROM wake_routes WHERE route_key = ?",
+                (route_key,),
+            ).fetchone()
+        return Route.from_row(row) if row else None
 
     def covering(self, recipients: Iterable[str]) -> dict[str, list[Route]]:
         """recipient → the routes of the sessions that read its mail,

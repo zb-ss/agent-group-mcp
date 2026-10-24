@@ -15,8 +15,8 @@ What a finished setup gives every wired repository:
 - mail shown to the agent at its next turn, and a Stop hook that keeps the
   turn open until the agent has handled it;
 - **an idle agent woken when mail arrives** — natively for Claude Code,
-  Codex and opencode, or by a command of your own (`wake.json`) for any
-  client;
+  Codex, Antigravity CLI and opencode, or by a command of your own
+  (`wake.json`) for any client;
 - an audit log of every send, read, claim and wake.
 
 ---
@@ -82,7 +82,7 @@ installed:
 | --- | --- | --- | --- |
 | Claude Code | `claude` | `command -v claude` | yes, from 2.1.290: `claude --version` |
 | Codex CLI | `codex` | `command -v codex` | yes, where `codex queue --help` works |
-| Antigravity CLI | `agy` | `command -v agy` | only with a `wake.json` command (step 9) |
+| Antigravity CLI | `agy` | `command -v agy` | yes, where `agy agentapi --help` lists `send-message`, once its agent has registered (step 5) |
 | opencode | `opencode` | `command -v opencode` | yes |
 
 ```bash
@@ -171,6 +171,14 @@ restart the existing Codex MCP connections so they load the fix.
 **Antigravity CLI** — open the repository with `agy` and trust the folder
 when asked. The workspace plugin loads immediately after that; no restart
 needed.
+
+To be woken by mail while idle, each agy session registers once: at its
+first model call the agent is asked to run `agent-bus wake-register
+--client agy`, and agy asks the user to allow that command. Tell the user
+to pick the option that always allows it and saves it to `settings.json`;
+the command is the same in every repository, so agy then stops asking on
+this machine. Declining is harmless: that session still gets its mail at
+every turn, it is just not woken while idle.
 
 Claude Code and opencode need no approval step beyond Claude Code's
 folder-trust prompt on first start.
@@ -270,7 +278,8 @@ send_message(to="other-repo", body="are you there?")
 The other agent sees it at the start of its next turn, and its Stop hook
 keeps the turn open until it has handled it. If the other session is idle
 at its prompt, it wakes up and starts that turn by itself — within a few
-seconds for Claude Code and opencode, within about ten for Codex.
+seconds for Claude Code and opencode, within about ten for Codex, and in
+under a second for agy.
 
 ```bash
 # 8f. the wake path, after the real test: which sessions can be woken,
@@ -280,11 +289,13 @@ agent-bus tail --json --limit 50 | grep '"op": "wake"'
 ```
 
 A Claude Code or opencode session that is waiting shows as `watch`; a
-Codex session that has had a turn as `push`, with state `idle` or `busy`.
+Codex or agy session that has had a turn as `push`, with state `idle` or
+`busy`.
 
 **8g. The wake test, per client.** Ask the user to start one session of the
-client in a wired repository and leave it at its prompt (for Codex: after
-one turn, so its hooks have run). Then, from a shell:
+client in a wired repository and leave it at its prompt (for Codex and
+agy: after one turn, so its hooks have run — and for agy, after its agent
+has run `agent-bus wake-register` as asked). Then, from a shell:
 
 ```bash
 agent-bus send --to my-repo/claude "agent-bus wake test: reply with the word PONG"
@@ -297,19 +308,20 @@ agent-bus tail --json --limit 20 | grep '"op": "wake"'
 | Claude Code | Within a few seconds the session starts a turn on its own, shows `agent-bus: new mail`, and answers. The audit has a `wake` row with `"wake_status": "woke"`. |
 | Codex | Within about ten seconds a turn starts with `[agent-bus] New mail from peers has arrived` and the agent answers. The `wake` row says `"wake_status": "fired:OK"`. |
 | opencode | Within a few seconds a turn starts with the mail and the agent answers. The `wake` row says `"wake_status": "woke"`. |
+| Antigravity CLI | Within a second a turn starts with `[agent-bus] New mail from peers has arrived` and the agent answers. The `wake` row says `"wake_status": "fired:OK"`; `unregistered` means its agent has not run `agent-bus wake-register` yet. |
 
 Nothing happens? Work through the wake rows of the troubleshooting table.
 A `claude -p` run is never woken, by design.
 
 ## 9. Optional: commands of your own (`wake.json`)
 
-For a client without native wake (Antigravity CLI), or to do something
-else when mail arrives — a desktop notification, a terminal multiplexer
-pane, a webhook — set a command per agent or per repository:
+To do something else when mail arrives — a desktop notification, a
+terminal multiplexer pane, a webhook — or to wake a client agent-bus has
+no native wake for, set a command per agent or per repository:
 
 ```bash
-agent-bus wake-config set my-repo/agy 'notify-send "agent-bus" "$AGENT_BUS_BODY_PREVIEW"'
-agent-bus wake-config test my-repo/agy     # fires it once
+agent-bus wake-config set my-repo/claude 'notify-send "agent-bus" "$AGENT_BUS_BODY_PREVIEW"'
+agent-bus wake-config test my-repo/claude     # fires it once
 agent-bus wake-config show
 ```
 
@@ -333,6 +345,12 @@ other agents.
 A `wake.json` entry written before keeps working, and now also replaces
 native wake for its agent: remove entries that only drove a terminal pane
 if native wake should take over.
+
+From 0.7.x, agy sessions are woken natively with the wiring they already
+have: upgrading the package is enough, and `init` needs no re-run. Each
+running agy session asks for its registration at its next model call
+(step 5). Remove a `wake.json` entry for an agy agent if native wake
+should take over from it.
 
 ## 11. Upgrading from 0.4.x
 
@@ -415,6 +433,7 @@ up first if you want it.
 | Every turn is held open quoting an error | An unusable binary — only possible with hand-written hooks | Re-run `init`, which appends `\|\| true` so a broken binary is silent |
 | An idle Claude Code session is not woken by mail | Claude Code older than 2.1.290 when `init` ran (see its note), a session that is not an interactive terminal one (`claude -p`, the SDK, an IDE), a `wake.json` entry for the agent, `AGENT_BUS_NATIVE_WAKE=0`, the hourly limit, or the session idle for longer than `AGENT_BUS_WATCH_HOURS` | Upgrade Claude Code and re-run `init`; check `agent-bus tail` for `rate-limited` |
 | An idle Codex session is not woken | It has not had a turn since its hooks were approved, its turn was interrupted with Esc, or `codex` cannot be run by the sender | Send it one prompt; set `AGENT_BUS_CODEX_BIN`; check `agent-bus tail` for `fired:ERR` |
+| An idle agy session is not woken | Its agent has not run `agent-bus wake-register` (the user declined, or refused the permission), an agy whose `agentapi` has no `send-message`, a `wake.json` entry for the agent, `AGENT_BUS_NATIVE_WAKE=0`, or the hourly limit | Check `agent-bus tail` for `unregistered`; ask the agent to run `agent-bus wake-register --client agy` and allow it; set `AGENT_BUS_AGY_BIN` if the sender cannot run `agy` |
 | A woken agent and another keep waking each other | Two agents answering every message | The hourly limit (`AGENT_BUS_WAKES_PER_HOUR`, default 20) stops it; lower it if needed |
 
 Diagnostics:

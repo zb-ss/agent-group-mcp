@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from . import audit, identity, migrations, push, settings, wake
-from .push import STATUS_RATE_LIMITED
+from .push import STATUS_RATE_LIMITED, STATUS_UNREGISTERED
 from .identity import BROADCAST, KIND_BROADCAST, KIND_DIRECT, KIND_GROUP
 from .paths import db_path, ensure_parents
 from .routes import DRIVER_PUSH, DRIVER_WATCH, Route, WakeRoutes
@@ -1050,7 +1050,9 @@ class Storage:
                 )
             except Exception as e:
                 fired, status = False, f"fired:ERR:{type(e).__name__}"
-            if fired or status.startswith("fired:") or status == STATUS_RATE_LIMITED:
+            if fired or status.startswith("fired:") or status in (
+                STATUS_RATE_LIMITED, STATUS_UNREGISTERED,
+            ):
                 row = {
                     "ts": _utc_now_iso(),
                     "op": "wake",

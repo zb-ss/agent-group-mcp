@@ -182,6 +182,8 @@ def test_agy_hooks_always_answer_in_json(storage, tmp_path, monkeypatch):
     from agent_bus.hooks import run_hook_stop, run_hook_user_prompt
 
     monkeypatch.delenv("AGENT_BUS_NAME", raising=False)
+    # without the wake registration request (tests/test_push_agy.py)
+    monkeypatch.setenv("AGENT_BUS_NATIVE_WAKE", "0")
     repo = _wired_repo(tmp_path, storage, "repo-a/agy")
     payload = {"workspacePaths": [str(repo)], "conversationId": "c-1"}
 

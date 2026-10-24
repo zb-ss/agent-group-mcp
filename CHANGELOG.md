@@ -3,6 +3,42 @@
 Notable changes per release. This project is pre-1.0: minor versions may
 change behaviour, and each release says what to expect.
 
+## Unreleased
+
+### Added
+
+- **Native wake for Antigravity CLI.** A sender starts a turn in an idle
+  agy session with `agy agentapi send-message <conversation id>`, and the
+  PreInvocation hook adds the mail, as on any model call. agy gives the
+  credentials that command needs only to the commands its agent runs, so
+  the first model call of each session asks the agent to run the new
+  `agent-bus wake-register --client agy` once; agy asks the user to allow
+  it, and allowing it always stops the question. Until a session has
+  registered, mail waits for its next turn and the audit row says
+  `unregistered`.
+- agy sessions are pushed to while busy too, at most once per model call:
+  the message joins the running turn instead of starting another, and agy
+  ends a turn the user interrupts without running its Stop hook, so a
+  session marked busy may in fact be idle. Codex is unchanged.
+- `AGENT_BUS_AGY_BIN` names the agy executable senders run; by default it
+  is the one the session runs.
+- New `wake_status`: `unregistered`.
+
+### Security
+
+- The token an agy session registers lets whoever holds it drive that
+  session, so it is never written to the database or the audit log. It is
+  kept in `push-credentials/` beside the database — a directory only the
+  user can open, one file per session readable only by the user — handed
+  to `agy` through its environment, never its arguments, and deleted once
+  the session's agy process has ended.
+
+### Compatibility
+
+- No schema change, and no wiring change: repositories wired for agy by
+  an earlier `init` are woken natively once the package is upgraded.
+- A `wake.json` entry for an agy agent keeps replacing native wake for it.
+
 ## 0.7.1
 
 ### Fixed

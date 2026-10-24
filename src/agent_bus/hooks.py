@@ -10,24 +10,29 @@ never another session's own mail. What to print is the client's business
 (`clients.hook_dialect`); draining and formatting are shared. Each delivered
 message gets a sibling `deliver` audit row so the log shows the hook path.
 
-For a client whose idle sessions are woken by their sender (Codex), the
-hooks also keep that session's wake route current: busy from the start of
-a turn, idle once it ends with nothing to act on (`routes.py`).
+For a client whose idle sessions are woken by their sender (Codex, agy),
+the hooks also keep that session's wake route current: busy from the start
+of a turn, idle once it ends with nothing to act on (`routes.py`). agy's
+sender also needs credentials that agy gives only to its agent: the
+prompt hook asks the agent once to run `agent-bus wake-register`
+(`run_wake_register`), which keeps them for senders.
 """
 
 from __future__ import annotations
 
 import os
 import select
+import shlex
 import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from typing import Iterable, TextIO
+from typing import Iterable, Mapping, TextIO
 
-from . import clients, identity, procs, push, resolution, settings
+from . import clients, identity, procs, push, push_credentials, resolution, settings
 from .clients.base import HookDialect
 from .identity import KIND_BROADCAST, KIND_GROUP
+from .init_cmd import detect_agent_bus_bin
 from .procs import Proc
 from .routes import WakeRoutes
 from .sessions import SessionRegistry
@@ -182,6 +187,37 @@ def _note_route(store: Storage, turn: _Turn, *, busy: bool) -> None:
         sys.stderr.write(f"agent-bus hook: could not record how to wake this session: {e}\n")
 
 
+def _registration_request(turn: _Turn) -> str | None:
+    """For a client that gives the credentials to wake a session only to
+    its agent's commands (agy): what to ask the agent so that it registers
+    them — once per conversation and client process. Best-effort, like
+    `_note_route`."""
+    registration = clients.push_registration(turn.client)
+    if registration is None or turn.ancestry is None or turn.name is None:
+        return None
+    thread = turn.dialect.session_from_payload(turn.payload)
+    if not thread:
+        return None
+    try:
+        if not push_credentials.request_once(thread, procs.client_of(turn.ancestry)):
+            return None
+    except OSError as e:
+        sys.stderr.write(f"agent-bus hook: could not ask for the wake registration: {e}\n")
+        return None
+    command = f"{shlex.quote(_own_command())} wake-register --client {turn.client}"
+    return registration.request.format(command=command)
+
+
+def _own_command() -> str:
+    """This agent-bus, by the path the client runs its hooks with: the
+    same command in every repo, so that allowing it once allows it
+    everywhere."""
+    argv0 = sys.argv[0] if sys.argv else ""
+    if os.path.isabs(argv0) and os.path.basename(argv0) == "agent-bus":
+        return argv0
+    return detect_agent_bus_bin()
+
+
 def resolve_agent(
     store: Storage, payload: dict, client: str | None
 ) -> tuple[str | None, HookDialect]:
@@ -306,6 +342,9 @@ def run_hook_user_prompt(
     if msgs:
         header = f"[agent-bus] {len(msgs)} new message(s) since last turn:"
         context = header + "\n" + format_messages(msgs, name)
+    request = _registration_request(turn)
+    if request:
+        context = f"{context}\n\n{request}" if context else request
     out.write(turn.dialect.prompt_output(context))
     out.flush()
     return 0
@@ -345,4 +384,55 @@ def run_hook_stop(
     _note_route(store, turn, busy=reason is not None)
     if reason is None:
         _wake_for_late_mail(store, turn)
+    return 0
+
+
+def run_wake_register(
+    *,
+    storage: Storage | None = None,
+    env: Mapping[str, str] | None = None,
+    stdout: TextIO | None = None,
+    client: str | None = None,
+) -> int:
+    """`agent-bus wake-register`, run by the agent itself when the prompt
+    hook asks it to: keep the credentials its client gives only to the
+    agent's commands, so that senders can wake the session
+    (`push_credentials.py`). Prints nothing secret.
+
+    Exit code 0 also when there is nothing to keep (the session is not on
+    the bus, native wake is off); 1 when the credentials are missing from
+    the environment; 2 for a client that needs no registration.
+    """
+    out = stdout or sys.stdout
+    env = os.environ if env is None else env
+    client = client or env.get(resolution.CLIENT_ENV)
+    registration = clients.push_registration(client)
+    if registration is None:
+        out.write(f"agent-bus: {client or 'this client'} needs no wake registration.\n")
+        return 2
+    credentials = registration.from_env(env)
+    if credentials is None:
+        out.write(
+            "agent-bus: nothing to register here: run this as a shell command "
+            "of the agent itself.\n"
+        )
+        return 1
+    if not settings.native_wake_enabled():
+        out.write(f"agent-bus: native wake is off ({settings.NATIVE_WAKE_ENV}); nothing kept.\n")
+        return 0
+    try:
+        route = WakeRoutes(storage or Storage()).get(credentials.thread)
+        if route is None or route.client != client:
+            out.write("agent-bus: this session is not on the bus; nothing kept.\n")
+            return 0
+        push_credentials.register(
+            credentials.thread, route.process, credentials.endpoint, credentials.secret
+        )
+    except (OSError, sqlite3.Error) as e:
+        out.write(f"agent-bus: could not keep the wake registration: {e}\n")
+        return 1
+    out.write(
+        "agent-bus: registered for the rest of this conversation; do not run "
+        "this again. Nothing else to do; carry on.\n"
+    )
     return 0

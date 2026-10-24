@@ -571,6 +571,12 @@ def cmd_hook_user_prompt(args: argparse.Namespace) -> int:
     return run_hook_user_prompt(client=args.client)
 
 
+def cmd_wake_register(args: argparse.Namespace) -> int:
+    from .hooks import run_wake_register
+
+    return run_wake_register(client=args.client)
+
+
 def cmd_hook_watch(args: argparse.Namespace) -> int:
     from .watch import run_hook_watch
 
@@ -773,6 +779,20 @@ def build_parser() -> argparse.ArgumentParser:
              f"else {settings.DEFAULT_WATCH_HOURS:g}.",
     )
     s.set_defaults(func=cmd_hook_watch)
+
+    s = sub.add_parser(
+        "wake-register",
+        help="Run by an agent when asked: let mail wake its idle session.",
+        description=(
+            "For a client that gives the credentials to start a turn in a "
+            "session only to the commands its agent runs (agy): keeps them, "
+            "readable by this user only, so that senders can wake the session "
+            "when it is idle. The session's hook asks its agent to run this "
+            "once per conversation."
+        ),
+    )
+    s.add_argument("--client", help=client_help)
+    s.set_defaults(func=cmd_wake_register)
 
     # optional serve helper (so `agent-bus serve` works besides python -m)
     s = sub.add_parser(

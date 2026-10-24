@@ -14,10 +14,10 @@ from __future__ import annotations
 import json
 import os
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Mapping, Protocol
 
 
 class HookDialect(Protocol):
@@ -56,6 +56,33 @@ class StandardHookDialect:
         if not reason:
             return ""
         return json.dumps({"decision": "block", "reason": reason}) + "\n"
+
+
+# --------------------------- waking a session from the sender's side -----
+
+
+@dataclass(frozen=True)
+class PushCredentials:
+    """What a sender needs, besides the session id, to start a turn in a
+    session of a client that guards its local API with a token."""
+
+    thread: str
+    endpoint: str
+    # whoever holds it can drive the session: never logged, never in argv
+    secret: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class PushRegistration:
+    """A client that hands those credentials only to the commands its agent
+    runs, not to its hooks or MCP servers. A hook asks the agent (`request`,
+    with `{command}` standing for the command to run) to run `agent-bus
+    wake-register`, which reads them with `from_env` and keeps them; a
+    sender passes them to the push command's environment with `to_env`."""
+
+    from_env: Callable[[Mapping[str, str]], PushCredentials | None]
+    to_env: Callable[[PushCredentials], dict[str, str]]
+    request: str
 
 
 # --------------------------- wiring (agent-bus init) ---------------------
