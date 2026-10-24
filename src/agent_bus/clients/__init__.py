@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Callable, Mapping
 
 from . import agy, claude, codex, opencode
-from .base import ClientWiring, HookDialect, StandardHookDialect
+from .base import ClientWiring, HookDialect, PushRegistration, StandardHookDialect
 
 _HOOK_DIALECTS: dict[str, HookDialect] = {
     agy.CLIENT_ID: agy.AgyHookDialect(),
@@ -35,7 +35,18 @@ _SESSION_KEY_META: dict[str, str] = {
 # Clients whose idle sessions the sender wakes, by running a command that
 # starts a turn: (thread id, executable the session runs) → argv.
 _PUSH_COMMANDS: dict[str, Callable[..., list[str]]] = {
+    agy.CLIENT_ID: agy.send_command,
     codex.CLIENT_ID: codex.queue_command,
+}
+
+# Of those, the clients whose busy sessions are pushed to as well: the
+# message joins the running turn rather than starting an empty one after it.
+_PUSHED_WHILE_BUSY: frozenset[str] = frozenset({agy.CLIENT_ID})
+
+# Of those, the clients whose command also needs credentials that only the
+# commands their agent runs receive: the agent registers them first.
+_PUSH_REGISTRATIONS: dict[str, PushRegistration] = {
+    agy.CLIENT_ID: agy.REGISTRATION,
 }
 
 # Clients whose sessions can take a wake from a watcher only under some
@@ -96,6 +107,17 @@ def push_command(client: str, *, thread: str, executable: str | None) -> list[st
     """The argv that starts a turn in `client`'s session `thread`.
     Raises KeyError for a client that cannot be pushed to."""
     return _PUSH_COMMANDS[client](thread=thread, executable=executable)
+
+
+def pushed_while_busy(client: str | None) -> bool:
+    """Whether a busy session of `client` is pushed to as well as an idle one."""
+    return (client or "") in _PUSHED_WHILE_BUSY
+
+
+def push_registration(client: str | None) -> PushRegistration | None:
+    """How `client`'s agent registers the credentials a push needs, for a
+    client that gives them to nobody else; None for every other client."""
+    return _PUSH_REGISTRATIONS.get(client or "")
 
 
 def wirable_clients() -> tuple[str, ...]:

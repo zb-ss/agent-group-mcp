@@ -204,3 +204,14 @@ def codex_bin() -> str | None:
     is a wrapper script needing an interpreter the sender lacks."""
     raw = os.environ.get(CODEX_BIN_ENV, "").strip()
     return raw or None
+
+
+AGY_BIN_ENV = "AGENT_BUS_AGY_BIN"
+
+
+def agy_bin() -> str | None:
+    """The agy executable a sender runs to start a turn in an idle agy
+    session. Unset, the executable the session itself runs is used, as its
+    hooks recorded it."""
+    raw = os.environ.get(AGY_BIN_ENV, "").strip()
+    return raw or None
