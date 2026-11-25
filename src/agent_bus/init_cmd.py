@@ -293,11 +293,35 @@ def _describe(plan: InitPlan, storage: Storage | None) -> None:
         a.repo_path for a in storage.list_agents()
         if a.group == plan.name and a.repo_path != str(plan.repo)
     })
-    if others:
+    if not others:
+        return
+    if _share_repo_id(plan.repo, others):
         plan.notes.append(
-            f"'{plan.name}' is also registered for {', '.join(others)} — if that "
-            f"repo is live too they share an inbox; pin a name with {NAME_FILE}"
+            f"'{plan.name}' is also registered for {', '.join(others)} — another "
+            f"clone of the same repository; the two share an inbox by design "
+            f"unless one is pinned with {NAME_FILE}"
         )
+        return
+    plan.notes.append(
+        f"'{plan.name}' is also registered for {', '.join(others)} — if that "
+        f"repo is live too they share an inbox; pin a name with {NAME_FILE}"
+    )
+
+
+def _share_repo_id(repo: Path, others: list[str]) -> bool:
+    """True when every other path is a clone of the same remote as `repo`.
+    Any failure (bad config, no remote, git error) answers False."""
+    # Lazy: repo_identity imports this module.
+    from . import config, repo_identity
+
+    try:
+        cfg = config.load()["repos"]
+        mine = repo_identity.repo_id(repo, cfg=cfg)
+        if mine is None:
+            return False
+        return all(repo_identity.repo_id(Path(o), cfg=cfg) == mine for o in others)
+    except (config.ConfigError, KeyError, OSError):
+        return False
 
 
 def plan_for_paths(

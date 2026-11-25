@@ -32,6 +32,7 @@ than `settings.wakes_per_hour` allows.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Iterable
@@ -316,6 +317,20 @@ class WakeRoutes:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+        self._note_working(address)
+
+    def _note_working(self, address: str) -> None:
+        """A woken session starts a turn without its prompt hook, so the
+        wake itself reports `working` (also over `done`: a follow-up is new
+        work). Only a session address is written; best-effort, like the
+        hooks' state notes. Called only once a wake has really happened."""
+        parsed = identity.parse_or_none(address)
+        if parsed is None or not parsed.is_session:
+            return
+        try:
+            self.storage.note_woken(address)
+        except sqlite3.Error as e:
+            sys.stderr.write(f"agent-bus: could not record this session's state: {e}\n")
 
 
 def _is_dead(route: Route) -> bool:

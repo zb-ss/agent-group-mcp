@@ -321,3 +321,140 @@ def test_retire_is_a_noop_for_an_unchanged_or_unknown_name(two_agents, bus_paths
     assert two_agents.get_agent("alpha") is not None
     assert two_agents.retire_agent("nobody", successor="nobody/claude") == 0
     assert not bus_paths["log"].exists()
+
+
+# ----------------------- state, spawn records, repo ids ---------------------
+
+
+def _spawn_record(name="repo-a/claude-fix", **overrides):
+    from agent_bus.storage import SpawnRecord
+
+    fields = dict(
+        name=name, client="claude", repo_id="example.com/org/repo-a",
+        repo_path="/code/repo-a", work_dir="/code/repo-a", model=None,
+        prompt_file="/tmp/p.txt", tmux_session="agents", tmux_window="fix",
+        remote=True, spawned_at="2026-01-01T00:00:00Z",
+    )
+    fields.update(overrides)
+    return SpawnRecord(**fields)
+
+
+def test_set_state_writes_state_and_timestamp(storage):
+    storage.upsert_agent("repo-a/claude", "/code/repo-a")
+    assert storage.get_agent("repo-a/claude").state is None
+
+    storage.set_state("repo-a/claude", "working")
+
+    agent = storage.get_agent("repo-a/claude")
+    assert agent.state == "working"
+    assert agent.state_at
+    assert agent.to_dict()["state"] == "working"
+
+
+def test_set_state_keep_done_only_protects_done(storage):
+    storage.upsert_agent("repo-a/claude", "/code/repo-a")
+
+    storage.set_state("repo-a/claude", "waiting", keep_done=True)
+    assert storage.get_agent("repo-a/claude").state == "waiting"
+
+    storage.set_state("repo-a/claude", "done")
+    storage.set_state("repo-a/claude", "waiting", keep_done=True)
+    assert storage.get_agent("repo-a/claude").state == "done"
+
+    storage.set_state("repo-a/claude", "working")
+    assert storage.get_agent("repo-a/claude").state == "working"
+
+
+def test_set_state_none_clears_both_columns(storage):
+    storage.upsert_agent("repo-a/claude", "/code/repo-a")
+    storage.set_state("repo-a/claude", "working")
+
+    storage.set_state("repo-a/claude", None)
+
+    agent = storage.get_agent("repo-a/claude")
+    assert (agent.state, agent.state_at) == (None, None)
+
+
+def test_spawn_record_round_trip_replace_move_delete(storage):
+    assert storage.get_spawn("repo-a/claude-fix") is None
+    record = _spawn_record()
+    storage.record_spawn(record)
+    assert storage.get_spawn("repo-a/claude-fix") == record
+
+    replaced = _spawn_record(model="m1", remote=False)
+    storage.record_spawn(replaced)
+    assert storage.list_spawns() == [replaced]
+
+    storage.record_spawn(_spawn_record("repo-a/claude-other"))
+    storage.move_spawn("repo-a/claude-fix", "repo-a/claude-other")
+    moved = storage.list_spawns()
+    assert [r.name for r in moved] == ["repo-a/claude-other"]
+    assert moved[0].model == "m1"
+
+    assert storage.delete_spawn("repo-a/claude-other") is True
+    assert storage.delete_spawn("repo-a/claude-other") is False
+    assert storage.list_spawns() == []
+
+
+def test_forget_agent_and_group_remove_spawn_records(storage):
+    for name in ("repo-a/claude-one", "repo-a/claude-two", "repo-b/claude-x"):
+        storage.upsert_agent(name, "/code/" + name.split("/")[0])
+        storage.record_spawn(_spawn_record(name))
+
+    storage.forget_agent("repo-a/claude-one")
+    assert storage.get_spawn("repo-a/claude-one") is None
+
+    storage.forget_group("repo-a")
+    assert [r.name for r in storage.list_spawns()] == ["repo-b/claude-x"]
+
+
+def test_repo_id_upsert_and_read_back(storage):
+    assert storage.repo_ids() == {}
+    storage.set_repo_id("/code/repo-a", "example.com/org/repo-a")
+    storage.set_repo_id("/code/scratch", None)
+    storage.set_repo_id("/code/repo-a", "example.com/org/renamed")
+
+    assert storage.repo_ids() == {
+        "/code/repo-a": "example.com/org/renamed",
+        "/code/scratch": None,
+    }
+
+
+def test_repo_id_entries_carry_the_check_time(storage):
+    storage.set_repo_id("/srv/code/repo-a", "github.com/example-org/repo-a")
+    storage.set_repo_id("/srv/code/repo-b", None)
+    entries = storage.repo_id_entries()
+    assert entries["/srv/code/repo-a"][0] == "github.com/example-org/repo-a"
+    assert entries["/srv/code/repo-b"][0] is None
+    assert entries["/srv/code/repo-a"][1].endswith("Z")
+
+
+def test_move_spawn_is_shared_with_the_rename_helper(storage):
+    from agent_bus.storage import SpawnRecord, move_spawn_in
+
+    storage.ensure_agent("repo-a/claude-fix", "/srv/code/repo-a")
+    storage.record_spawn(SpawnRecord(
+        name="repo-a/claude-fix", client="claude", repo_id=None,
+        repo_path="/srv/code/repo-a", work_dir="/srv/code/repo-a", model=None,
+        prompt_file="/tmp/p.txt", tmux_session="agents", tmux_window="fix",
+        remote=False, spawned_at="2026-01-01T00:00:00Z",
+    ))
+    with storage.connect() as conn:
+        move_spawn_in(conn, "repo-a/claude-fix", "repo-a/claude-other")
+    assert storage.get_spawn("repo-a/claude-fix") is None
+    assert storage.get_spawn("repo-a/claude-other").tmux_window == "fix"
+
+
+def test_restore_agent_state_puts_back_state_and_timestamps(storage):
+    storage.upsert_agent("repo-a/claude", "/code/repo-a")
+    storage.set_state("repo-a/claude", "working")
+    storage.restore_agent_state(
+        "repo-a/claude", "done", "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z"
+    )
+    row = storage.get_agent("repo-a/claude")
+    assert (row.state, row.state_at, row.last_seen) == (
+        "done", "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z"
+    )
+    storage.restore_agent_state("repo-a/claude", None, None, "2020-01-02T00:00:00Z")
+    row = storage.get_agent("repo-a/claude")
+    assert (row.state, row.state_at) == (None, None)

@@ -22,7 +22,9 @@ from mcp.server.fastmcp import Context, FastMCP
 from . import audit, clients, identity, procs, resolution, settings
 from .procs import Proc
 from .sessions import SessionError, SessionRegistry
-from .storage import KIND_SESSION, Storage
+from .storage import KIND_SESSION, REPORTED_STATES, Storage
+
+SPAWN_TOKEN_ENV = resolution.SPAWN_TOKEN_ENV
 
 MAX_TOPIC_LEN = audit.PREVIEW_LIMIT
 
@@ -144,6 +146,7 @@ def start(
         lineage=procs.ancestry() if lineage is None else lineage,
         session_key=key,
         pinned=parsed.handle,
+        spawn_token=env.get(SPAWN_TOKEN_ENV) or None,
     )
     return Me(
         claim.name, who.repo_path, registry=registry, process=process,
@@ -188,7 +191,10 @@ def _instructions(me: Me) -> str:
             f" `{me.client_address}` is shared by every session of this "
             "client here. Once you know what this session is working on, "
             "call `set_session` with a short label and topic so peers can "
-            "reach you by name; `whoami` shows your current address."
+            "reach you by name; `whoami` shows your current address. "
+            "When the task you were given is finished, call `set_session` "
+            "with `state=\"done\"`; a turn that ends without it shows as "
+            "waiting for a human."
         )
     if me.client_address and clients.requires_session_key(identity.parse(me.client_address).client):
         text += (
@@ -273,6 +279,8 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
             "repo_path": row.repo_path if row else me.repo_path,
             "registered_at": row.registered_at if row else None,
             "last_seen": row.last_seen if row else None,
+            "state": row.state if row else None,
+            "state_at": row.state_at if row else None,
             "mcp_client": _mcp_client_name(ctx),
             "group_members": [
                 {
@@ -361,15 +369,23 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
         return audit.tail(limit=limit)
 
     @mcp.tool()
-    def set_session(ctx: Context, label: str | None = None, topic: str | None = None) -> dict:
+    def set_session(
+        ctx: Context,
+        label: str | None = None,
+        topic: str | None = None,
+        state: str | None = None,
+    ) -> dict:
         """Name this session after what it works on, so peers can reach it.
 
         `label` renames the session to `<repo>/<client>-<label>` (for
         example "frontend" or "release-notes"): unread mail moves with it, and a
         label an ended session left behind is taken over along with its
         waiting mail. `topic` is a short free-text line shown next to the
-        name in `list_agents`; an empty string clears it.
-        Returns {"name", "client_address", "topic"}.
+        name in `list_agents`; an empty string clears it. `state` says where
+        the session is: `working`, `waiting` (it needs a human) or `done`
+        (the task it was given is finished). The hooks report `working` and
+        `waiting` on their own, so an agent normally only reports `done`.
+        Returns {"name", "client_address", "topic", "state"}.
         """
         touch(ctx)
         if not me.holds_session or me.client_address is None:
@@ -377,17 +393,28 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
                 f"{me.name!r} is not a session of a client, so it has no "
                 "session address to name"
             )
+        wanted = None
+        if state is not None:
+            wanted = state.strip().lower()
+            if wanted not in REPORTED_STATES:
+                raise SessionError(
+                    f"unknown state {state!r}; use one of: "
+                    + ", ".join(REPORTED_STATES)
+                )
         if label is not None:
             assert me.registry is not None and me.process is not None
             me.name = me.registry.rename(me.process, me.client_address, label)
         if topic is not None:
             store.set_topic(me.name, topic.strip()[:MAX_TOPIC_LEN] or None)
+        if wanted is not None:
+            store.set_state(me.name, wanted)
         store.touch_agent(me.name)
         row = store.get_agent(me.name)
         return {
             "name": me.name,
             "client_address": me.client_address,
             "topic": row.topic if row else None,
+            "state": row.state if row else None,
         }
 
     return mcp

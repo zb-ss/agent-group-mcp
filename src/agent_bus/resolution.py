@@ -39,6 +39,8 @@ REPO_ENV = "AGENT_BUS_REPO"
 CLIENT_ENV = "AGENT_BUS_CLIENT"
 INSTANCE_ENV = "AGENT_BUS_INSTANCE"
 SESSION_ENV = "AGENT_BUS_SESSION"
+# set by `agent-bus spawn` only: proves a session is the one spawn started
+SPAWN_TOKEN_ENV = "AGENT_BUS_SPAWN_TOKEN"
 
 NAME_FILE = ".agent-bus-name"
 IGNORE_FILE = ".agent-bus-ignore"
@@ -157,6 +159,14 @@ def _registered_name(storage: Storage, repo_path: str, client: str) -> str | Non
     ]
     addresses = {p.client_address for p in parsed if p is not None}
     return min((a for a in addresses if a), default=None)
+
+
+def client_address(storage: Storage, repo: Path, client: str) -> str:
+    """`<group>/<client>` for `client` in `repo`: what the roster calls it,
+    else what the repo's own name derives."""
+    return _registered_name(storage, str(repo), client) or identity.compose(
+        group_for_repo(repo), client
+    )
 
 
 def resolve(

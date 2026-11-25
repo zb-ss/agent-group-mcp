@@ -36,6 +36,7 @@ from .init_cmd import detect_agent_bus_bin
 from .procs import Proc
 from .routes import WakeRoutes
 from .sessions import SessionRegistry
+from . import storage as storage_mod
 from .storage import Message, Storage
 
 
@@ -187,6 +188,23 @@ def _note_route(store: Storage, turn: _Turn, *, busy: bool) -> None:
         sys.stderr.write(f"agent-bus hook: could not record how to wake this session: {e}\n")
 
 
+def _note_state(
+    store: Storage, turn: _Turn, state: str, *, keep_done: bool = False
+) -> None:
+    """Report what this session is doing. Only a session address is
+    written: a state on the shared client address would be wrong.
+    Best-effort, like `_note_route`."""
+    if turn.name is None:
+        return
+    parsed = identity.parse_or_none(turn.name)
+    if parsed is None or not parsed.is_session:
+        return
+    try:
+        store.set_state(turn.name, state, keep_done=keep_done)
+    except sqlite3.Error as e:
+        sys.stderr.write(f"agent-bus hook: could not record this session's state: {e}\n")
+
+
 def _registration_request(turn: _Turn) -> str | None:
     """For a client that gives the credentials to wake a session only to
     its agent's commands (agy): what to ask the agent so that it registers
@@ -336,6 +354,7 @@ def run_hook_user_prompt(
     # busy before the drain: mail sent after it reaches this turn's end,
     # rather than queueing another turn
     _note_route(store, turn, busy=True)
+    _note_state(store, turn, storage_mod.STATE_WORKING)
 
     msgs = drain(store, name) if name else []
     context = None
@@ -383,6 +402,7 @@ def run_hook_stop(
     # the turn goes on when there was mail; otherwise the session is idle
     _note_route(store, turn, busy=reason is not None)
     if reason is None:
+        _note_state(store, turn, storage_mod.STATE_WAITING, keep_done=True)
         _wake_for_late_mail(store, turn)
     return 0
 

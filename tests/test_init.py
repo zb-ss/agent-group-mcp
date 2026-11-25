@@ -527,3 +527,30 @@ def test_a_failing_binary_neither_blocks_nor_speaks(tmp_path):
     done = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=30)
     assert done.returncode == 0
     assert done.stdout == ""
+
+
+def test_plan_says_shared_group_is_another_clone_of_the_same_repo(
+    tmp_path, storage, monkeypatch
+):
+    from agent_bus import repo_identity
+
+    repo = _make_repo(tmp_path / "projects", "foo")
+    storage.upsert_agent("foo/claude", "/code/websites/foo")
+    monkeypatch.setattr(repo_identity, "repo_id", lambda *a, **k: "example.com/org/foo")
+    plan = init_cmd.plan_for_paths([repo], scan=False, storage=storage)[0]
+    note = next(n for n in plan.notes if "/code/websites/foo" in n)
+    assert "another clone of the same repository" in note
+    assert "share an inbox by design" in note
+
+
+def test_plan_keeps_pin_advice_when_repo_ids_differ(tmp_path, storage, monkeypatch):
+    from agent_bus import repo_identity
+
+    repo = _make_repo(tmp_path / "projects", "foo")
+    storage.upsert_agent("foo/claude", "/code/websites/foo")
+    ids = {str(repo): "example.com/org/foo", "/code/websites/foo": "example.com/org/other"}
+    monkeypatch.setattr(repo_identity, "repo_id", lambda path, **k: ids[str(path)])
+    plan = init_cmd.plan_for_paths([repo], scan=False, storage=storage)[0]
+    note = next(n for n in plan.notes if "/code/websites/foo" in n)
+    assert "pin a name with" in note
+    assert "another clone" not in note

@@ -218,3 +218,75 @@ def test_dialect_follows_the_client_part_of_an_explicit_name(
     assert json.loads(_run_hook(run_hook_stop, storage, payload={})) == {
         "decision": "stop"
     }
+
+
+# ----------------------------- reported state --------------------------------
+
+
+def _session_hook(storage, monkeypatch, fake_procs, *, stop):
+    import io as _io
+
+    from agent_bus import procs
+    from agent_bus.hooks import run_hook_stop, run_hook_user_prompt
+    from agent_bus.sessions import SessionRegistry
+
+    server, lineage = fake_procs.session()
+    claim = SessionRegistry(storage).claim(
+        client_address="shared/claude", repo_path="/repo/shared", server=server,
+        lineage=lineage, session_key=None, pinned=None,
+    )
+    monkeypatch.setenv("AGENT_BUS_NAME", "shared/claude")
+    monkeypatch.setattr(procs, "ancestry", lambda pid=None: [lineage[0]])
+
+    def run(stop_hook):
+        fn = run_hook_stop if stop_hook else run_hook_user_prompt
+        fn(storage=storage, stdin=_io.StringIO("{}"), stdout=_io.StringIO(), client="claude")
+
+    return claim.name, run
+
+
+def test_hooks_report_working_then_waiting(storage, monkeypatch, fake_procs):
+    name, run = _session_hook(storage, monkeypatch, fake_procs, stop=False)
+    run(False)
+    assert storage.get_agent(name).state == "working"
+    run(True)
+    assert storage.get_agent(name).state == "waiting"
+
+
+def test_a_done_session_stays_done_until_the_next_prompt(storage, monkeypatch, fake_procs):
+    name, run = _session_hook(storage, monkeypatch, fake_procs, stop=False)
+    storage.set_state(name, "done")
+    run(True)
+    assert storage.get_agent(name).state == "done"
+    run(False)
+    assert storage.get_agent(name).state == "working"
+
+
+def test_a_stop_hook_holding_the_turn_open_leaves_the_state(storage, monkeypatch, fake_procs):
+    name, run = _session_hook(storage, monkeypatch, fake_procs, stop=False)
+    storage.upsert_agent("peer/codex", "/repo/peer")
+    storage.send_message(from_agent="peer/codex", to=name, body="please act")
+    storage.set_state(name, "working")
+    run(True)
+    assert storage.get_agent(name).state == "working"
+
+
+def test_a_hook_that_cannot_tell_its_session_writes_no_state(storage, monkeypatch, fake_procs):
+    import io as _io
+
+    from agent_bus import procs
+    from agent_bus.hooks import run_hook_stop, run_hook_user_prompt
+    from agent_bus.sessions import SessionRegistry
+
+    reg = SessionRegistry(storage)
+    for _ in range(2):
+        server, lineage = fake_procs.session()
+        reg.claim(
+            client_address="shared/claude", repo_path="/repo/shared", server=server,
+            lineage=lineage, session_key=None, pinned=None,
+        )
+    monkeypatch.setenv("AGENT_BUS_NAME", "shared/claude")
+    monkeypatch.setattr(procs, "ancestry", lambda pid=None: [fake_procs.proc()])
+    for fn in (run_hook_user_prompt, run_hook_stop):
+        fn(storage=storage, stdin=_io.StringIO("{}"), stdout=_io.StringIO(), client="claude")
+    assert all(a.state is None for a in storage.list_agents())

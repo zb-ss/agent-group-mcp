@@ -8,7 +8,7 @@ Identity for `send`/`chat` defaults to $AGENT_BUS_NAME, then "human".
 The same identity is upserted into the agents table so peers can target
 the human directly.
 
-All "human-readable" subcommands (`inbox`, `agents`, `tail`) use the
+All "human-readable" subcommands (`inbox`, `agents`, `tail`, `status`) use the
 shared formatting helpers in `formatting.py` so colors and column widths
 stay consistent between the CLI and the chat TUI. Add `--json` to any
 of them to get the raw machine-readable shape (stable across releases).
@@ -19,16 +19,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 from . import __version__, audit
 from . import clients
+from . import config
 from . import formatting as fmt
 from . import identity
 from . import init_cmd
+from . import repo_identity
 from . import settings
+from . import spawn
+from . import status
 from . import wake
 from .migrations import SchemaTooNewError
 from .paths import audit_path
@@ -487,6 +492,23 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def cmd_config(args: argparse.Namespace) -> int:
+    cfg_path = config.config_path()
+    try:
+        effective = config.load()
+    except config.ConfigError as exc:
+        sys.stdout.write(f"{exc}\n")
+        return 1
+    exists = cfg_path.exists()
+    if args.json:
+        payload = {"path": str(cfg_path), "exists": exists, "config": effective}
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return 0
+    sys.stdout.write(f"# {cfg_path} ({'present' if exists else 'not present, defaults in effect'})\n")
+    sys.stdout.write(json.dumps(effective, indent=2) + "\n")
+    return 0
+
+
 def cmd_wake_config(args: argparse.Namespace) -> int:
     action = args.action
     cfg_path = wake.wake_config_path()
@@ -551,6 +573,81 @@ def cmd_wake_config(args: argparse.Namespace) -> int:
 
     sys.stdout.write(f"unknown wake-config action: {action!r}\n")
     return 2
+
+
+def _spawn_failure(
+    message: str, hint: str | None, code: int, notes: list[str] | None = None
+) -> int:
+    for note in notes or []:
+        sys.stderr.write(f"agent-bus: note: {note}\n")
+    sys.stderr.write(f"agent-bus: {message}\n")
+    if hint:
+        sys.stdout.write(hint + "\n")
+    return code
+
+
+def cmd_spawn(args: argparse.Namespace) -> int:
+    try:
+        cfg = config.load()
+        request = spawn.SpawnRequest(
+            repo=args.repo,
+            client=args.client,
+            name=args.name,
+            prompt_file=Path(args.prompt_file),
+            model=args.model,
+            worktree=args.worktree,
+            clone=args.clone,
+            remote=not args.no_remote,
+            dry_run=args.dry_run,
+        )
+        result = spawn.spawn(request, storage=Storage(), cfg=cfg)
+    except config.ConfigError as e:
+        return _spawn_failure(str(e), None, 1, getattr(e, "notes", None))
+    except spawn.SpawnError as e:
+        return _spawn_failure(str(e), e.hint, e.exit_code, e.notes)
+    for note in result.notes:
+        sys.stderr.write(f"agent-bus: note: {note}\n")
+    if args.json:
+        sys.stdout.write(json.dumps(result.to_dict(), indent=2) + "\n")
+        return 0
+    where = f"tmux {result.tmux_session}:{result.tmux_window} ({result.work_dir})"
+    if result.launched:
+        sys.stdout.write(f"launched {result.name} in {where}\n")
+        sys.stdout.write(f"attach: tmux attach -t {result.tmux_session}\n")
+    else:
+        sys.stdout.write(f"would launch {result.name} in {where}\n{result.command}\n")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    try:
+        cfg = config.load()
+    except config.ConfigError as e:
+        # a broken optional file must not hide the roster
+        sys.stderr.write(f"agent-bus: warning: {e}; using default settings\n")
+        cfg = config.defaults()
+    store = Storage()
+    try:
+        repo_identity.refresh_missing(
+            store, cfg["repos"], budget_seconds=cfg["repos"]["status_budget_seconds"]
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    rows = status.collect(
+        store,
+        grace_seconds=cfg["spawn"]["startup_grace_seconds"],
+        include_ended=args.all,
+        hide_done_after_seconds=cfg["status"]["hide_done_after_seconds"],
+    )
+    if args.json:
+        sys.stdout.write(json.dumps([r.to_dict() for r in rows], indent=2) + "\n")
+        return 0
+    if not rows:
+        sys.stdout.write("(no sessions running)\n")
+        return 0
+    for line in status.fragments(rows):
+        _emit(line)
+    return 0
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
@@ -721,6 +818,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.set_defaults(func=cmd_init)
 
+    # config
+    s = sub.add_parser(
+        "config",
+        help="Show the effective config.json (shipped defaults merged with your file).",
+    )
+    s.add_argument("action", choices=("show",), help="show: print the effective config.")
+    s.add_argument("--json", action="store_true", help="Emit JSON.")
+    s.set_defaults(func=cmd_config)
+
     # wake-config
     s = sub.add_parser(
         "wake-config",
@@ -793,6 +899,44 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--client", help=client_help)
     s.set_defaults(func=cmd_wake_register)
+
+    # spawn
+    s = sub.add_parser(
+        "spawn",
+        help="Start an agent session for a repo in its own tmux window.",
+        description=(
+            "Opens one tmux window per session, all in one tmux session, "
+            "running the client interactively with the prompt file as its "
+            "first message. The window stays open with a login shell after "
+            "the client exits. tmux is required for this command only."
+        ),
+    )
+    s.add_argument("--repo", required=True, help=(
+        "A repo's bus name, its id such as host/owner/name, a remote URL, "
+        "or a unique ending of the id."))
+    s.add_argument("--client", required=True, help=(
+        "Client to run (" + ", ".join(clients.wirable_clients()) + "). "
+        "Command templates come from config.json."))
+    s.add_argument("--name", required=True, help=(
+        "Becomes the session label and the tmux window."))
+    s.add_argument("--prompt-file", required=True, help="File holding the first message.")
+    s.add_argument("--model", help="Model for the client, when its template has one.")
+    s.add_argument("--worktree", metavar="BASE_REF", help=(
+        "Run in a new git worktree created from this ref."))
+    s.add_argument("--clone", action="store_true", help=(
+        "Clone the repo into the configured root when it is not on this machine."))
+    s.add_argument("--no-remote", action="store_true", help=(
+        "Do not turn on the client's Remote Control."))
+    s.add_argument("--dry-run", action="store_true", help=(
+        "Print what would run; change nothing."))
+    s.add_argument("--json", action="store_true", help="Emit JSON result.")
+    s.set_defaults(func=cmd_spawn)
+
+    # status
+    s = sub.add_parser("status", help="Show which sessions run where and what they are doing.")
+    s.add_argument("--all", action="store_true", help="Include ended and long-finished sessions.")
+    s.add_argument("--json", action="store_true", help="Emit JSON rows.")
+    s.set_defaults(func=cmd_status)
 
     # optional serve helper (so `agent-bus serve` works besides python -m)
     s = sub.add_parser(

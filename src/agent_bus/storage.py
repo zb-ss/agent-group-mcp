@@ -202,8 +202,17 @@ class Message:
 
 
 AGENT_COLUMNS = (
-    "name, repo_path, registered_at, last_seen, group_name, client, topic"
+    "name, repo_path, registered_at, last_seen, group_name, client, topic, "
+    "state, state_at"
 )
+
+# Session state vocabulary (protocol words, not tunables). Sessions report
+# the REPORTED_STATES; spawn writes STATE_STARTING.
+STATE_STARTING = "starting"
+STATE_WORKING = "working"
+STATE_WAITING = "waiting"
+STATE_DONE = "done"
+REPORTED_STATES = (STATE_WORKING, STATE_WAITING, STATE_DONE)
 
 KIND_AGENT = "agent"
 KIND_CLIENT = "client"
@@ -221,6 +230,9 @@ class AgentRow:
     group_name: str | None = None
     client: str | None = None
     topic: str | None = None
+    # NULL: written by an older binary, or never reported.
+    state: str | None = None
+    state_at: str | None = None
 
     @property
     def group(self) -> str:
@@ -259,6 +271,8 @@ class AgentRow:
             "group": self.group,
             "client": self.client_id,
             "topic": self.topic,
+            "state": self.state,
+            "state_at": self.state_at,
             "repo_path": self.repo_path,
             "registered_at": self.registered_at,
             "last_seen": self.last_seen,
@@ -266,6 +280,35 @@ class AgentRow:
         if pending_count is not None:
             out["pending_count"] = pending_count
         return out
+
+
+@dataclass(frozen=True)
+class SpawnRecord:
+    """What `agent-bus spawn` started for one session address, and where."""
+
+    name: str
+    client: str
+    repo_id: str | None
+    repo_path: str
+    work_dir: str
+    model: str | None
+    prompt_file: str
+    tmux_session: str
+    tmux_window: str
+    remote: bool
+    spawned_at: str
+
+
+_SPAWN_COLUMNS = (
+    "name, client, repo_id, repo_path, work_dir, model, prompt_file, "
+    "tmux_session, tmux_window, remote, spawned_at"
+)
+
+
+def _spawn_from_row(row: sqlite3.Row) -> SpawnRecord:
+    fields = dict(row)
+    fields["remote"] = bool(fields["remote"])
+    return SpawnRecord(**fields)
 
 
 @dataclass(frozen=True)
@@ -313,6 +356,14 @@ def _way_to_wake(
         return WAKES_ITSELF
     pushes = tuple(r for r in found if r.driver == DRIVER_PUSH)
     return pushes or None
+
+
+def move_spawn_in(conn: sqlite3.Connection, old: str, new: str) -> None:
+    """Move the spawn record of `old` to `new` on an open connection; a
+    record already at `new` is replaced. Shared by `Storage.move_spawn` and
+    the session rename so both stay in step."""
+    conn.execute("DELETE FROM spawns WHERE name = ?", (new,))
+    conn.execute("UPDATE spawns SET name = ? WHERE name = ?", (new, old))
 
 
 def register_in(
@@ -474,6 +525,125 @@ class Storage:
                 "UPDATE agents SET topic = ? WHERE name = ?", (topic, name)
             )
 
+    def set_state(
+        self, name: str, state: str | None, *, keep_done: bool = False
+    ) -> None:
+        """Store what the session reports it is doing. `None` clears it.
+        With `keep_done`, a session that said `done` stays `done`."""
+        self.init_schema()
+        stamp = None if state is None else _utc_now_iso()
+        sql = "UPDATE agents SET state = ?, state_at = ? WHERE name = ?"
+        params: list = [state, stamp, name]
+        if keep_done:
+            sql += " AND (state IS NULL OR state != ?)"
+            params.append(STATE_DONE)
+        with self.connect() as conn:
+            conn.execute(sql, params)
+
+    def restore_agent_state(
+        self, name: str, state: str | None, state_at: str | None, last_seen: str
+    ) -> None:
+        """Put back what an earlier read saw, timestamps included, in one
+        UPDATE. `set_state` would stamp "now", which would make an old
+        `done` session look freshly finished after a rolled-back spawn."""
+        self.init_schema()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE agents SET state = ?, state_at = ?, last_seen = ? WHERE name = ?",
+                (state, state_at, last_seen, name),
+            )
+
+    def note_woken(self, name: str) -> None:
+        """A wake started a turn in `name`: it is `working`, even if it had
+        said `done` (a follow-up is new work)."""
+        self.set_state(name, STATE_WORKING)
+
+    # ----------------------------- spawns -----------------------------------
+
+    def record_spawn(self, record: SpawnRecord) -> None:
+        self.init_schema()
+        with self.connect() as conn:
+            conn.execute(
+                f"INSERT OR REPLACE INTO spawns ({_SPAWN_COLUMNS}) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.name, record.client, record.repo_id,
+                    record.repo_path, record.work_dir, record.model,
+                    record.prompt_file, record.tmux_session,
+                    record.tmux_window, int(record.remote), record.spawned_at,
+                ),
+            )
+
+    def get_spawn(self, name: str) -> SpawnRecord | None:
+        self.init_schema()
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT {_SPAWN_COLUMNS} FROM spawns WHERE name = ?", (name,)
+            ).fetchone()
+        return _spawn_from_row(row) if row else None
+
+    def list_spawns(self) -> list[SpawnRecord]:
+        self.init_schema()
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT {_SPAWN_COLUMNS} FROM spawns ORDER BY name"
+            ).fetchall()
+        return [_spawn_from_row(r) for r in rows]
+
+    def delete_spawn(self, name: str) -> bool:
+        self.init_schema()
+        with self.connect() as conn:
+            return conn.execute(
+                "DELETE FROM spawns WHERE name = ?", (name,)
+            ).rowcount > 0
+
+    def move_spawn(self, old: str, new: str) -> None:
+        """Rename a spawn record; any record already at `new` is replaced."""
+        self.init_schema()
+        if old == new:
+            return
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                move_spawn_in(conn, old, new)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    # ----------------------------- repo ids ---------------------------------
+
+    def repo_ids(self) -> dict[str, str | None]:
+        """repo_path -> normalised remote id (None: checked, no remote)."""
+        self.init_schema()
+        with self.connect() as conn:
+            rows = conn.execute("SELECT repo_path, repo_id FROM repos").fetchall()
+        return {r["repo_path"]: r["repo_id"] for r in rows}
+
+    def repo_id_entries(self) -> dict[str, tuple[str | None, str]]:
+        """repo_path -> (id, when it was last checked), to expire old ids."""
+        self.init_schema()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT repo_path, repo_id, checked_at FROM repos"
+            ).fetchall()
+        return {r["repo_path"]: (r["repo_id"], r["checked_at"]) for r in rows}
+
+    def set_repo_id(self, repo_path: str, repo_id: str | None) -> None:
+        """Store a definite answer only; callers never pass a failed lookup."""
+        self.init_schema()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO repos (repo_path, repo_id, checked_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(repo_path) DO UPDATE SET
+                    repo_id = excluded.repo_id,
+                    checked_at = excluded.checked_at
+                """,
+                (repo_path, repo_id, _utc_now_iso()),
+            )
+
     def forget_agent(self, name: str) -> bool:
         """Remove an agent from the roster. Returns True if a row was deleted.
 
@@ -487,6 +657,7 @@ class Storage:
         self.init_schema()
         with self.connect() as conn:
             cur = conn.execute("DELETE FROM agents WHERE name = ?", (name,))
+            conn.execute("DELETE FROM spawns WHERE name = ?", (name,))
             return cur.rowcount > 0
 
     def retire_agent(self, name: str, *, successor: str) -> int:
@@ -557,6 +728,10 @@ class Storage:
                     f"SELECT name FROM agents WHERE {in_group} ORDER BY name", (group,)
                 ).fetchall()
                 conn.execute(f"DELETE FROM agents WHERE {in_group}", (group,))
+                conn.executemany(
+                    "DELETE FROM spawns WHERE name = ?",
+                    [(r["name"],) for r in rows],
+                )
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")

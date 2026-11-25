@@ -391,6 +391,12 @@ The generated wiring is per-machine: it contains absolute paths to a
   every machine needs a version whose CLI accepts the flags in it. Install
   or upgrade the package on each machine **before** the config reaches it,
   or an older binary will reject the arguments.
+- A repo's identity is its normalised remote URL (`host/path`, lowercase,
+  no scheme, user, port or `.git`), the same on every machine. Each machine
+  finds its own clone from the roster, or by scanning the folders listed in
+  `repos.roots` in `~/.claude-agent-bus/config.json`; `repos.clone_root` is
+  where `spawn --clone` puts a clone that is missing. Group names stay the
+  local alias (`.agent-bus-name`), so nothing is renamed.
 - The database and audit log are per-machine too. Agents on different
   machines cannot see each other; the bus is local by design.
 - Repeat on each machine: upgrade the package, check the client versions
@@ -415,6 +421,50 @@ start. To remove everything, `pipx uninstall agent-group-mcp` and delete
 `~/.claude-agent-bus/`. That directory holds all message history — back it
 up first if you want it.
 
+## 14. Optional: spawning sessions and watching them
+
+Prerequisites: `tmux` installed, and the repository wired for the client
+with `agent-bus init` (steps 3 and 4). Put the first message in a file and
+look before starting anything:
+
+```bash
+echo "Fix the login redirect loop and open a pull request." > /tmp/prompt.txt
+agent-bus spawn --repo repo-a --client claude --name fix-login \
+    --prompt-file /tmp/prompt.txt --dry-run
+```
+
+It prints the address (`repo-a/claude-fix-login`), the folder and the exact
+command, and changes nothing. If it looks right, run it again without
+`--dry-run`, then:
+
+```bash
+agent-bus status          # state, client, tmux window; --all adds ended and long-finished ones
+tmux attach -t agents     # one window per session
+```
+
+Spawned sessions are started in the client's auto permission mode, with
+Remote Control on where the client has it (`--no-remote` turns it off). To
+change the commands, the cap of five sessions, or the folders searched for
+clones, create `~/.claude-agent-bus/config.json` (see the README's
+*Configuration*). Ask the agent in its prompt to call
+`set_session(state="done")` when it has finished; `status` then stops
+counting it against the cap. A finished session is hidden from `status`
+after `status.hide_done_after_seconds` (default one day) once it has ended;
+`--all` shows it. A mail wake sets a session back to `working`, and a
+reconnect of the same session keeps its reported state.
+
+To close everything: `tmux kill-session -t agents`. Sessions that were
+running show as `ended` in `status --all`.
+
+## 15. Upgrading from 0.7.x
+
+Nothing to re-wire. The database migrates forward the first time any
+`agent-bus` command opens it, and a `bus.db.pre-migrate-<version>` copy is
+kept next to it. Group names and addresses do not change. Restart
+long-running clients to get state reporting: a running MCP server and its
+hooks only learn `set_session(state=...)` and the `working` / `waiting`
+updates after a restart.
+
 ---
 
 ## Troubleshooting
@@ -435,12 +485,18 @@ up first if you want it.
 | An idle Claude Code session is not woken by mail | Claude Code older than 2.1.290 when `init` ran (see its note), a session that is not an interactive terminal one (`claude -p`, the SDK, an IDE), a `wake.json` entry for the agent, `AGENT_BUS_NATIVE_WAKE=0`, the hourly limit, or the session idle for longer than `AGENT_BUS_WATCH_HOURS` | Upgrade Claude Code and re-run `init`; check `agent-bus tail` for `rate-limited` |
 | An idle Codex session is not woken | It has not had a turn since its hooks were approved, its turn was interrupted with Esc, or `codex` cannot be run by the sender | Send it one prompt; set `AGENT_BUS_CODEX_BIN`; check `agent-bus tail` for `fired:ERR` |
 | An idle agy session is not woken | Its agent has not run `agent-bus wake-register` (the user declined, or refused the permission), an agy whose `agentapi` has no `send-message`, a `wake.json` entry for the agent, `AGENT_BUS_NATIVE_WAKE=0`, or the hourly limit | Check `agent-bus tail` for `unregistered`; ask the agent to run `agent-bus wake-register --client agy` and allow it; set `AGENT_BUS_AGY_BIN` if the sender cannot run `agy` |
+| `spawn` says tmux was not found | tmux is not installed or not on `PATH` | Install tmux, or set `spawn.tmux_bin`; spawn printed the command to run by hand |
+| A spawned worktree session lacks the project memory | Memory lives outside the repo, per folder | Claude links it by default through `spawn.clients.claude.worktree_links` (source `~/.claude/projects/{clone_key}/memory`, target `~/.claude/projects/{work_dir_key}/memory`); the source must exist. Set the list to `[]` in `config.json` to switch it off |
+| A spawned session stays `starting`, then disappears | The repo is not wired for that client, or the worktree lacks the wiring; or the client is waiting on a folder-trust or MCP-approval prompt: it shows `starting`, then `ended` after `spawn.startup_grace_seconds`, and becomes live again once it joins | Run `agent-bus init` for the repo and client. In a worktree, an untracked wiring file is linked in automatically; a wiring file the repo tracks keeps its committed copy there (spawn prints a note naming it), so the session runs without agent-bus hooks and `spawn.carry_over` cannot change that. That is a known limitation of this version. For clients that prompt, answer the prompt in the tmux window, or raise `spawn.startup_grace_seconds` in `config.json` |
+| `spawn` exits 4 | The cap (`spawn.max_sessions`, default 5) is reached | Wait, have a finished session report `done`, or raise the cap in `config.json` |
+| `spawn --repo` says the repo is ambiguous | Two different clones match | Give the full id or the bus name, or remove the stray clone from `repos.roots` |
 | A woken agent and another keep waking each other | Two agents answering every message | The hourly limit (`AGENT_BUS_WAKES_PER_HOUR`, default 20) stops it; lower it if needed |
 
 Diagnostics:
 
 ```bash
 agent-bus agents --json     # who is registered, and each unread count
+agent-bus status --json     # sessions with state, client, tmux window, folder
 agent-bus tail --limit 20   # the audit log: send, read, deliver, claim, wake, retire, session
 agent-bus tail -f           # follow it live
 agent-bus init --json --clients <c>   # what the wiring should say, without writing
