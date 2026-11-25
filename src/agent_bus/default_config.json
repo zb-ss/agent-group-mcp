@@ -26,10 +26,44 @@
     "carry_over": [],
     "clients": {
       "claude": {"command": ["claude", "-n", "{name}", "--permission-mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control", "{name}"], "prompt": ["{prompt}"],
+        "resume": ["claude", "--resume", "{label}"],
         "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
-      "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "worktree_links": []},
-      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "worktree_links": []},
-      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "worktree_links": []}
+      "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "resume": ["codex", "resume"], "worktree_links": []},
+      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": []},
+      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "resume": null, "worktree_links": []}
     }
+  },
+  "dispatch": {
+    "env_file": null,
+    "max_spawns_per_run": 2,
+    "working_hours": {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "19:00"},
+    "label": {"template": "t{gid_suffix}-{slug}", "gid_suffix_length": 8},
+    "handoff_channel": "{label}",
+    "templates_dir": null,
+    "prompts_dir": null,
+    "title_max_chars": 120,
+    "overlap_max_items": 10,
+    "fetch_timeout_seconds": 120,
+    "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify"],
+    "defaults": {"client": "claude", "model": null, "worktree": null, "fetch": false, "clone": false, "remote": true},
+    "types": {
+      "refinement": {"action": "spawn", "playbook": "refinement"},
+      "follow-up": {"action": "spawn", "playbook": "follow-up"},
+      "implementation": {"action": "notify", "playbook": "implementation"}
+    },
+    "rules": [
+      {"type": "refinement", "section": ["(?i)refine"]},
+      {"type": "follow-up", "handled_as": ["refinement", "follow-up"], "new_comment": true},
+      {"type": "implementation", "section": ["(?i)^(to ?do|ready|in progress)"]}
+    ],
+    "sources": {
+      "asana": {"enabled": false, "base_url": "https://app.asana.com/api/1.0", "token_env": "ASANA_TOKEN", "workspace": null, "lookahead_days": 0, "page_size": 100, "max_pages": 10, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "ignore_own_comments": true, "comment_authors": [], "projects": {}}
+    },
+    "notifiers": {
+      "log": {"file": null},
+      "macos": {"enabled": true, "osascript_bin": "osascript", "title": "agent-bus", "timeout_seconds": 10},
+      "email": {"enabled": false, "host": null, "port": 465, "security": "tls", "username": null, "password_env": null, "from": null, "to": [], "subject_prefix": "[agent-bus]", "timeout_seconds": 30}
+    },
+    "timer": {"name": "agent-bus-dispatch", "interval_minutes": 15, "command": ["{agent_bus_bin}", "dispatch", "run"], "environment": {}, "output_file": null, "launchctl_bin": "launchctl", "systemctl_bin": "systemctl", "timeout_seconds": 30}
   }
 }

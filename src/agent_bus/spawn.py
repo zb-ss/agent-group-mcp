@@ -144,6 +144,26 @@ def render_command(
     return " ".join(parts) + f"; {after_exit}"
 
 
+def resume_command(
+    template: Mapping, *, label: str, work_dir: str, client: str | None = None
+) -> str | None:
+    """The shell line that reopens a spawned session from its own folder, built
+    from the client's `resume` template; None when the client has none. The
+    folder matters: clients list and resolve sessions by working directory."""
+    fragment = _fragment(template, "resume", client)
+    if not fragment:
+        return None
+    values = {"label": label, "dir": work_dir}
+    try:
+        argv = [token.format_map(values) for token in fragment]
+    except (KeyError, IndexError, ValueError, AttributeError) as exc:
+        raise ConfigError(
+            f"spawn.clients.{client or '?'}.resume: cannot fill the template "
+            f"({type(exc).__name__}: {exc}); placeholders are {{label}}, {{dir}}"
+        ) from exc
+    return f"cd {shlex.quote(work_dir)} && {shlex.join(argv)}"
+
+
 # ------------------------------- helpers -----------------------------------
 
 

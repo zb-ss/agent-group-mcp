@@ -485,6 +485,24 @@ updates after a restart.
 
 ---
 
+## 16. Optional: dispatching tasks on a timer
+
+`agent-bus dispatch` reads your due tasks from Asana, starts a session for
+the ones your rules select, and notifies you. Do this only when the owner
+wants it, and never load the timer without their say-so.
+
+1. Provide the token. Export it under the name you will set as `token_env` (default `ASANA_TOKEN`), or, for timer runs, create an env file with `KEY=VALUE` lines and `chmod 600` it (for example `~/.claude-agent-bus/dispatch.env`). Never paste the value into `config.json`.
+2. Add a `dispatch` block to `~/.claude-agent-bus/config.json`: enable `sources.asana`, map each project id to a repo under `projects`, and set `env_file` and `templates_dir` if you use them. See the README section *Dispatching tasks* for the keys. Map only projects that belong to a single repo: the repo comes from the first of a task's projects found in `projects`, so a shared process project (one board for every repo) stays unmapped and is used in rules instead, through a rule's `project` scope.
+For an unattended timer, also set `sources.asana.comment_authors` to the user gids whose comments may start a follow-up session (empty means any author, including guests and collaborators). Also give `rules[].project` a non-empty list; an empty list is rejected.
+3. Run `agent-bus dispatch run --dry-run` and read the decisions. It makes read-only requests and changes nothing, and applies the per-run and session limits as a real run would.
+4. Run once for real: `agent-bus dispatch run --ignore-hours`.
+5. Check the result with `agent-bus dispatch status` and `agent-bus status`.
+6. Run `agent-bus dispatch install-timer` from a shell whose `PATH` has `tmux` and your clients. It prints the files it wrote and loads nothing. Only when the owner says so, run `agent-bus dispatch install-timer --load`.
+
+To remove it: `agent-bus dispatch uninstall-timer --unload`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -508,6 +526,12 @@ updates after a restart.
 | A spawned session stays `starting`, then disappears | The repo is not wired for that client, or the worktree lacks the wiring; or the client is waiting on a folder-trust or MCP-approval prompt: it shows `starting`, then `ended` after `spawn.startup_grace_seconds`, and becomes live again once it joins | Run `agent-bus init` for the repo and client (for Claude Code this also approves the server). In a worktree, untracked wiring files are linked in, and for Claude Code spawn writes a worktree-local `.claude/settings.local.json` (server approval, plus the hooks when the committed `.claude/settings.json` lacks them); other tracked wiring files keep their committed copy and spawn prints a note naming them. Answer a folder-trust prompt in the tmux window (Antigravity CLI asks in a new folder; Claude Code and Codex do not inside `<clone>/.worktrees`), or raise `spawn.startup_grace_seconds` in `config.json` |
 | A spawned Codex session is not linked to the spawn in `status` | Codex is wired once per user and does not pass `AGENT_BUS_SESSION` to MCP servers, so it registers under the folder's name | Wire the repo with `agent-bus init --clients codex`, which passes the variable through |
 | A spawned opencode session joins as a stranger | opencode's shared background service gave its MCP server the environment of an earlier launch | The default template uses `opencode --standalone`; keep it in custom templates |
+| `claude --resume` in the repo does not list a spawned session | The session ran in a worktree, and the picker shows the current folder only | Run the `resume:` command `agent-bus dispatch status` prints, `claude --resume <label>` from the repo, or press Ctrl+W in the picker to list every worktree |
+| `environment variable ... is not set` when the timer runs | launchd and systemd do not inherit your shell environment | Set `dispatch.env_file` to a `chmod 600` file with the `KEY=VALUE` line |
+| The timer runs but nothing happens | Outside `dispatch.working_hours`, the source is not `enabled`, or another run holds the lock | Read `dispatch.log` and `dispatch-timer.log` beside the database; try `agent-bus dispatch run --dry-run --ignore-hours` |
+| `dispatch` reports `spawn cap reached` | `spawn.max_sessions` or `dispatch.max_spawns_per_run` is reached | Wait for sessions to report `done`, or raise the limit in `config.json` |
+| A task is not picked up | Its project is not in `projects`, it has no due date or is due after the lookahead, it is not assigned to the token's user, or no rule matches | Check with `dispatch run --dry-run --json`; adjust `projects`, `lookahead_days` or `rules` |
+| The timer cannot find tmux or the client | The unit's `PATH` is the one of the shell that ran `install-timer` | Re-run `install-timer` from a shell whose `PATH` has them |
 | `spawn` exits 4 | The cap (`spawn.max_sessions`, default 5) is reached | Wait, have a finished session report `done`, or raise the cap in `config.json` |
 | `spawn --repo` says the repo is ambiguous | Two different clones match | Give the full id or the bus name, or remove the stray clone from `repos.roots` |
 | A woken agent and another keep waking each other | Two agents answering every message | The hourly limit (`AGENT_BUS_WAKES_PER_HOUR`, default 20) stops it; lower it if needed |
