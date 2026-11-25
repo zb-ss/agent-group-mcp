@@ -1052,10 +1052,11 @@ stops `spawn` with an error naming it; `status` warns and carries on.
     "carry_over": [],
     "clients": {
       "claude": {"command": ["claude", "-n", "{name}", "--permission-mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control", "{name}"], "prompt": ["{prompt}"],
+        "resume": ["claude", "--resume", "{label}"],
         "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
-      "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "worktree_links": []},
-      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "worktree_links": []},
-      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "worktree_links": []}
+      "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "resume": ["codex", "resume"], "worktree_links": []},
+      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": []},
+      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "resume": null, "worktree_links": []}
     }
   },
   "dispatch": {
@@ -1154,6 +1155,13 @@ stops `spawn` with an error naming it; `status` warns and carries on.
   except `{prompt}`, which becomes `"$(cat <prompt file>)"`, so the prompt
   never appears in the tmux command line. `worktree_links` is described
   under `--worktree` above (`[]` turns it off).
+- A client's `resume` list is how `dispatch status` tells you to reopen a
+  spawned session; it is printed after `cd` into the session's folder,
+  because clients list and look up sessions by working directory.
+  Placeholders: `{label}` (the spawn label) and `{dir}`. The defaults are
+  `claude --resume {label}` (spawn names a Claude session after its label)
+  and `codex resume` (the picker, filtered to that folder). agy and
+  opencode have `null`, so no command is shown for them.
 
 For example, to lower the cap and give Codex its working folder:
 
@@ -1399,7 +1407,12 @@ with `--unload`.
 State lives in `dispatch.db` beside the bus database (it follows
 `AGENT_BUS_DB`), with its own migrations; the bus database is untouched.
 `dispatch status` lists every known task with its type, outcome, session
-address and that session's current state.
+address and that session's current state. A session that renamed itself is
+shown under its new name. Below a spawned session it prints the command that
+reopens it (`resume: cd <folder> && claude --resume <label>`, from the
+client's `spawn.clients.<client>.resume`); `--json` gives the same as
+`resume`, and `current_session` for the current name. Follow-ups reuse the
+label, so Claude Code may show a picker filtered to that name.
 
 - A task is only seen while it is inside the due window, so follow-up only works on tasks still due today or overdue (or within `lookahead_days`).
 - A follow-up waits while the earlier session for the task is still open.

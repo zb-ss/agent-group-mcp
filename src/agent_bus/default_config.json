@@ -26,10 +26,11 @@
     "carry_over": [],
     "clients": {
       "claude": {"command": ["claude", "-n", "{name}", "--permission-mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control", "{name}"], "prompt": ["{prompt}"],
+        "resume": ["claude", "--resume", "{label}"],
         "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
-      "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "worktree_links": []},
-      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "worktree_links": []},
-      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "worktree_links": []}
+      "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "resume": ["codex", "resume"], "worktree_links": []},
+      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": []},
+      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "resume": null, "worktree_links": []}
     }
   },
   "dispatch": {

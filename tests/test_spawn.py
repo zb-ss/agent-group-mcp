@@ -1163,3 +1163,28 @@ def test_fresh_clone_with_a_linked_wiring_folder_is_not_wired(storage, cfg, prom
     note = next(n for n in result.notes if "not wiring" in n)
     assert "agent-bus init" in note
     assert not (tmp_path / "clones" / "repo-a" / ".mcp.json").exists()
+
+
+# ------------------------------ resume command -------------------------------
+
+
+def test_resume_command_runs_in_the_session_folder():
+    template = config.defaults()["spawn"]["clients"]["claude"]
+    line = spawn.resume_command(
+        template, label="t0000101-fix", work_dir="/w/my repo/.worktrees/t0000101-fix",
+        client="claude",
+    )
+    assert line == "cd '/w/my repo/.worktrees/t0000101-fix' && claude --resume t0000101-fix"
+
+
+def test_resume_command_is_none_without_a_template():
+    template = config.defaults()["spawn"]["clients"]["opencode"]
+    assert spawn.resume_command(template, label="x", work_dir="/w", client="opencode") is None
+
+
+def test_resume_command_names_a_bad_placeholder():
+    with pytest.raises(config.ConfigError, match=r"spawn\.clients\.claude\.resume"):
+        spawn.resume_command(
+            {"resume": ["claude", "--resume", "{nope}"]}, label="x", work_dir="/w",
+            client="claude",
+        )

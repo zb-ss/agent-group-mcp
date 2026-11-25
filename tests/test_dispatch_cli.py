@@ -119,9 +119,39 @@ def test_status_follows_a_session_that_renamed_itself(capsys, monkeypatch):
     row = json.loads(capsys.readouterr().out)[0]
     assert row["current_session"] == "repo-a/claude-login-form"
     assert row["session_state"] == "working"
+    # resumed by the spawn label, from the session's own folder
+    assert row["resume"] == "cd /x && claude --resume t0000101-fix-the-login"
     assert cli.main(["dispatch", "status"]) == 0
-    line = capsys.readouterr().out
-    assert "repo-a/claude-login-form  working" in line
+    out = capsys.readouterr().out
+    assert "repo-a/claude-login-form  working" in out
+    assert "    resume: cd /x && claude --resume t0000101-fix-the-login" in out
+
+
+def test_status_has_no_resume_line_for_a_client_without_a_template(capsys, monkeypatch):
+    import dataclasses
+
+    from agent_bus import status
+
+    store = DispatchStore()
+    store.observe(_task(), project_id=PROJECT, now="2030-01-07T10:00:00.000000Z")
+    store.update("asana", GID, type="refinement", label="t0000101-fix-the-login",
+                 session_name="repo-a/opencode-t0000101-fix-the-login")
+    row = status.StatusRow(
+        name="repo-a/opencode-t0000101-fix-the-login", group="repo-a", client="opencode",
+        label="t0000101-fix-the-login", state="done", reported_state="done", state_at=None,
+        live=False, spawned=True, last_seen=None, topic=None, pending_count=0,
+        repo_path="/x", repo_id=None, work_dir="/x", tmux_session="agents",
+        tmux_window="t0000101-fix-the-login", model=None, remote=None,
+    )
+    monkeypatch.setattr(status, "collect", lambda *a, **k: [row])
+    assert cli.main(["dispatch", "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["resume"] is None
+    assert cli.main(["dispatch", "status"]) == 0
+    assert "resume:" not in capsys.readouterr().out
+    unspawned = dataclasses.replace(row, client="claude", spawned=False)
+    monkeypatch.setattr(status, "collect", lambda *a, **k: [unspawned])
+    assert cli.main(["dispatch", "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["resume"] is None
 
 
 def _fail_if_called(*args, **kwargs):

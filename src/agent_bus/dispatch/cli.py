@@ -91,19 +91,25 @@ def cmd_status(args: argparse.Namespace) -> int:
         Storage(), grace_seconds=cfg["spawn"]["startup_grace_seconds"], include_ended=True
     )
 
-    def session(record) -> tuple[str | None, str]:
-        """(current name, state). A session may have renamed itself since the
-        spawn, so resolve it the way the runner does, not by the stored name."""
+    clients = cfg["spawn"]["clients"]
+
+    def session(record) -> tuple[str | None, str, str | None]:
+        """(current name, state, resume command). A session may have renamed
+        itself since the spawn, so resolve it the way the runner does, not by
+        the stored name."""
         if not record.session_name:
-            return None, "-"
+            return None, "-", None
         row = find_row(rows, record)
-        return (row.name, row.state) if row else (record.session_name, "ended")
+        if row is None:
+            return record.session_name, "ended", None
+        return row.name, row.state, _resume_for(row, clients)
 
     if args.json:
         out = []
         for r in records:
-            name, state = session(r)
-            out.append({**r.to_dict(), "current_session": name, "session_state": state})
+            name, state, resume = session(r)
+            out.append({**r.to_dict(), "current_session": name, "session_state": state,
+                        "resume": resume})
         _out(json.dumps(out, indent=2))
         return 0
     if not records:
@@ -111,7 +117,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
     max_chars = cfg["dispatch"]["title_max_chars"]
     for r in records:
-        name, state = session(r)
+        name, state, resume = session(r)
         _out(
             "  ".join(
                 [
@@ -125,7 +131,26 @@ def cmd_status(args: argparse.Namespace) -> int:
                 ]
             )
         )
+        if resume:
+            _out(f"    resume: {resume}")
     return 0
+
+
+def _resume_for(row, clients) -> str | None:
+    """How to reopen a spawned session, from its client's `resume` template."""
+    from ..config import ConfigError
+    from ..spawn import resume_command
+
+    template = clients.get(row.client)
+    if not (row.spawned and row.work_dir and row.tmux_window and template):
+        return None
+    try:
+        return resume_command(
+            template, label=row.tmux_window, work_dir=row.work_dir, client=row.client
+        )
+    except ConfigError as exc:
+        sys.stderr.write(f"agent-bus: warning: {exc}\n")
+        return None
 
 
 def _timer_plan(args: argparse.Namespace, *, uninstall: bool = False):

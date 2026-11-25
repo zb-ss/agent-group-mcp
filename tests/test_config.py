@@ -193,3 +193,14 @@ def test_status_budget_must_be_a_non_negative_number(bus_paths, value):
 
 def test_status_budget_defaults_to_five_seconds():
     assert config.defaults()["repos"]["status_budget_seconds"] == 5
+
+
+def test_client_resume_must_be_a_list_of_strings_or_null(bus_paths):
+    path = config.config_path()
+    path.write_text(json.dumps({"spawn": {"clients": {"claude": {"resume": "claude -r"}}}}),
+                    encoding="utf-8")
+    with pytest.raises(config.ConfigError, match=r"spawn\.clients\.claude\.resume"):
+        config.load()
+    path.write_text(json.dumps({"spawn": {"clients": {"claude": {"resume": None}}}}),
+                    encoding="utf-8")
+    assert config.load()["spawn"]["clients"]["claude"]["resume"] is None

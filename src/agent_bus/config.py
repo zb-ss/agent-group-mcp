@@ -109,6 +109,7 @@ _TEMPLATE_SCHEMA = {
     "model": (_is_str_list, "a list of strings or null", True),
     "remote": (_is_str_list, "a list of strings or null", True),
     "prompt": (_is_str_list, "a list of strings", False),
+    "resume": (_is_str_list, "a list of strings or null", True),
 }
 
 
