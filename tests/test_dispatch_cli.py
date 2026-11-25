@@ -100,6 +100,30 @@ def test_status_json_after_seeding(capsys):
     assert GID in capsys.readouterr().out
 
 
+def test_status_follows_a_session_that_renamed_itself(capsys, monkeypatch):
+    from agent_bus import status
+
+    store = DispatchStore()
+    store.observe(_task(), project_id=PROJECT, now="2030-01-07T10:00:00.000000Z")
+    store.update("asana", GID, type="refinement", label="t0000101-fix-the-login",
+                 session_name="repo-a/claude-t0000101-fix-the-login")
+    renamed = status.StatusRow(
+        name="repo-a/claude-login-form", group="repo-a", client="claude",
+        label="login-form", state="working", reported_state="working", state_at=None,
+        live=True, spawned=True, last_seen=None, topic=None, pending_count=0,
+        repo_path="/x", repo_id=None, work_dir="/x", tmux_session="agents",
+        tmux_window="t0000101-fix-the-login", model=None, remote=None,
+    )
+    monkeypatch.setattr(status, "collect", lambda *a, **k: [renamed])
+    assert cli.main(["dispatch", "status", "--json"]) == 0
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["current_session"] == "repo-a/claude-login-form"
+    assert row["session_state"] == "working"
+    assert cli.main(["dispatch", "status"]) == 0
+    line = capsys.readouterr().out
+    assert "repo-a/claude-login-form  working" in line
+
+
 def _fail_if_called(*args, **kwargs):
     raise AssertionError("the timer must not be loaded")
 

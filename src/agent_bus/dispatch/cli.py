@@ -78,6 +78,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     from .. import config, status
     from ..storage import Storage
     from .model import clean_text
+    from .runner import find_row
     from .store import DispatchStore
 
     try:
@@ -86,40 +87,39 @@ def cmd_status(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agent-bus: warning: {e}; using default settings\n")
         cfg = config.defaults()
     records = DispatchStore().list_tasks()
-    rows = {
-        r.name: r
-        for r in status.collect(
-            Storage(), grace_seconds=cfg["spawn"]["startup_grace_seconds"], include_ended=True
-        )
-    }
+    rows = status.collect(
+        Storage(), grace_seconds=cfg["spawn"]["startup_grace_seconds"], include_ended=True
+    )
 
-    def session_state(record) -> str:
+    def session(record) -> tuple[str | None, str]:
+        """(current name, state). A session may have renamed itself since the
+        spawn, so resolve it the way the runner does, not by the stored name."""
         if not record.session_name:
-            return "-"
-        row = rows.get(record.session_name)
-        return row.state if row else "ended"
+            return None, "-"
+        row = find_row(rows, record)
+        return (row.name, row.state) if row else (record.session_name, "ended")
 
     if args.json:
-        _out(
-            json.dumps(
-                [{**r.to_dict(), "session_state": session_state(r)} for r in records],
-                indent=2,
-            )
-        )
+        out = []
+        for r in records:
+            name, state = session(r)
+            out.append({**r.to_dict(), "current_session": name, "session_state": state})
+        _out(json.dumps(out, indent=2))
         return 0
     if not records:
         _out("(no dispatched tasks)")
         return 0
     max_chars = cfg["dispatch"]["title_max_chars"]
     for r in records:
+        name, state = session(r)
         _out(
             "  ".join(
                 [
                     r.task_id,
                     r.type or "-",
                     r.outcome or "-",
-                    r.session_name or "-",
-                    session_state(r),
+                    name or "-",
+                    state,
                     clean_text(r.title, max_chars),
                     r.url,
                 ]

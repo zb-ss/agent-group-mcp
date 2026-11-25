@@ -149,7 +149,7 @@ def _notify(ctx: _Ctx, notification: Notification) -> bool:
     return delivered
 
 
-def _find_row(rows: Sequence[Any], record: TaskRecord) -> Any | None:
+def find_row(rows: Sequence[Any], record: TaskRecord) -> Any | None:
     """The status row of a record's session. A session may rename itself, which
     moves its row to a new name; the spawn's tmux window keeps the dispatch label."""
     for row in rows:
@@ -173,7 +173,7 @@ def _find_row(rows: Sequence[Any], record: TaskRecord) -> Any | None:
 
 
 def _transition(ctx: _Ctx, record: TaskRecord, rows: Sequence[Any]) -> None:
-    row = _find_row(rows, record)
+    row = find_row(rows, record)
     state = row.state if row is not None else "ended"
     if row is not None and row.name != record.session_name and not ctx.dry_run:
         record = ctx.store.update(record.source, record.task_id, session_name=row.name)
@@ -276,7 +276,7 @@ def _skip_reason(ctx: _Ctx, label: str, record: TaskRecord | None) -> str | None
             row.name == (record.session_name if record else None)
             or row.label == label
             or (row.spawned and row.tmux_window == label)
-            or (record is not None and _find_row([row], record) is not None)
+            or (record is not None and find_row([row], record) is not None)
         )
         if same and (row.live or row.state in status.ACTIVE_STATES):
             return "session active"
@@ -315,7 +315,7 @@ def _head_sha(ctx: _Ctx, project: Mapping) -> str:
 
 
 def _in_flight(ctx: _Ctx, record: TaskRecord) -> bool:
-    row = _find_row(ctx.rows, record) if record.session_name else None
+    row = find_row(ctx.rows, record) if record.session_name else None
     return row is not None and bool(row.live or row.state in status.ACTIVE_STATES)
 
 
