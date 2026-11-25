@@ -411,6 +411,11 @@ agent-bus status --json
 agent-bus tail --json | jq '.[] | select(.op=="send")'
 ```
 
+Task dispatch has its own commands, described in
+[Dispatching tasks](#dispatching-tasks-agent-bus-dispatch):
+`dispatch run`, `dispatch status`, `dispatch install-timer` and
+`dispatch uninstall-timer`.
+
 By default `tail -f` renders one-line summaries instead of raw JSON, so
 it stays readable while still being scriptable via `--json`.
 
@@ -853,6 +858,7 @@ The suite covers:
 - config: shipped defaults, deep merge of a user file, unreadable or malformed files
 - repo identity: URL normalisation (ssh, https, ports, host aliases), resolving a repo from the roster and from scanned roots
 - spawn: command rendering per client, the tmux calls (with a stand-in `tmux`), the cap, cloning, worktrees and their carried-over files, dry runs, registration on the bus
+- dispatch: the Asana source, rules, playbooks, state file, notifiers and timer files, driven with fake HTTP, SMTP, tmux and timers (no network)
 - state reporting: `set_session(state=...)`, the hooks' `working` / `waiting`, and renames carrying the state
 - status: states, liveness, `--all`, the `--json` keys
 - native wake: `hook-watch` waking, giving up, handing over to a newer watcher, following a session's address, standing down for `wake.json`, the rate limit, a stop signal; the Claude Code hook command's exit codes run for real; Codex routes kept by the hooks and `codex queue` run by senders (with a stand-in `codex`); agy's registration request, private credential store and `agy agentapi send-message` run by senders (with a stand-in `agy`); the opencode plugin's watcher under Node
@@ -1051,6 +1057,39 @@ stops `spawn` with an error naming it; `status` warns and carries on.
       "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "worktree_links": []},
       "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "worktree_links": []}
     }
+  },
+  "dispatch": {
+    "env_file": null,
+    "max_spawns_per_run": 2,
+    "working_hours": {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "19:00"},
+    "label": {"template": "t{gid_suffix}-{slug}", "gid_suffix_length": 8},
+    "handoff_channel": "{label}",
+    "templates_dir": null,
+    "prompts_dir": null,
+    "title_max_chars": 120,
+    "overlap_max_items": 10,
+    "fetch_timeout_seconds": 120,
+    "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify"],
+    "defaults": {"client": "claude", "model": null, "worktree": null, "fetch": false, "clone": false, "remote": true},
+    "types": {
+      "refinement": {"action": "spawn", "playbook": "refinement"},
+      "follow-up": {"action": "spawn", "playbook": "follow-up"},
+      "implementation": {"action": "notify", "playbook": "implementation"}
+    },
+    "rules": [
+      {"type": "refinement", "section": ["(?i)refine"]},
+      {"type": "follow-up", "handled_as": ["refinement", "follow-up"], "new_comment": true},
+      {"type": "implementation", "section": ["(?i)^(to ?do|ready|in progress)"]}
+    ],
+    "sources": {
+      "asana": {"enabled": false, "base_url": "https://app.asana.com/api/1.0", "token_env": "ASANA_TOKEN", "workspace": null, "lookahead_days": 0, "page_size": 100, "max_pages": 10, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "ignore_own_comments": true, "comment_authors": [], "projects": {}}
+    },
+    "notifiers": {
+      "log": {"file": null},
+      "macos": {"enabled": true, "osascript_bin": "osascript", "title": "agent-bus", "timeout_seconds": 10},
+      "email": {"enabled": false, "host": null, "port": 465, "security": "tls", "username": null, "password_env": null, "from": null, "to": [], "subject_prefix": "[agent-bus]", "timeout_seconds": 30}
+    },
+    "timer": {"name": "agent-bus-dispatch", "interval_minutes": 15, "command": ["{agent_bus_bin}", "dispatch", "run"], "environment": {}, "output_file": null, "launchctl_bin": "launchctl", "systemctl_bin": "systemctl", "timeout_seconds": 30}
   }
 }
 ```
@@ -1168,6 +1207,203 @@ process or session id) keeps the state it reported, `done` included; the
 `live`, `spawned`, `last_seen`, `topic`, `pending_count`, `repo_path`,
 `repo_id`, `work_dir`, `tmux_session`, `tmux_window`, `model` and
 `remote`.
+
+---
+
+## Dispatching tasks (`agent-bus dispatch`)
+
+`agent-bus dispatch run` reads your tasks from a task source (first source:
+Asana), decides per task what to do with fixed rules from `config.json`, and
+either starts a session for it with `agent-bus spawn` or only notifies you.
+There is no model in the decision loop. It is meant to run from a timer, and
+it is off until you enable a source.
+
+One run does, in order:
+
+1. Takes a run lock. When another run holds it, the run exits 0 and does nothing.
+2. Checks `dispatch.working_hours`. Outside them it stops (`--ignore-hours` skips the check).
+3. Sends notifications for sessions it spawned earlier whose state changed (needs review, done, ended without done).
+4. Fetches the incomplete tasks assigned to the token's user that are due on or before today plus `lookahead_days`.
+5. Maps each task to a repo through `projects`: the repo comes from the first of the task's memberships whose project id is a key of `projects`. A task can sit in several projects at once, so map only the projects that belong to one repo and leave shared process projects (a board every repo uses, for example) unmapped; a rule's `project` scope is separate from this mapping and can name such a shared project. A task in no configured project is ignored and not stored.
+6. Classifies the task: rules are tried in order and the first match wins.
+7. Spawns a session with a prompt rendered from a playbook, or notifies only, according to the action of the task's type.
+
+```bash
+agent-bus dispatch run [--dry-run] [--json] [--ignore-hours]
+agent-bus dispatch status [--json]
+agent-bus dispatch install-timer [--load] [--bin-path PATH]
+agent-bus dispatch uninstall-timer [--unload] [--bin-path PATH]
+```
+
+`run --dry-run` prints one decision per mapped task (type, action, result,
+reason, label) and changes nothing. It applies `max_spawns_per_run` and the
+session cap as a real run would, counting each would-be spawn, so the
+report matches what a run does: it makes read-only HTTP requests, but
+spawns nothing, sends no notification and creates no state file, prompt file
+or lock. Start there. `--json` prints the decisions as JSON.
+
+### Setup
+
+Export the token under the variable name you configure, or put it in an
+env file (see below), then add a `dispatch` block to
+`~/.claude-agent-bus/config.json`:
+
+```json
+{
+  "dispatch": {
+    "env_file": "~/.claude-agent-bus/dispatch.env",
+    "templates_dir": "~/.claude-agent-bus/playbooks",
+    "sources": {
+      "asana": {
+        "enabled": true,
+        "token_env": "ASANA_TOKEN",
+        "projects": {
+          "1000000000000001": {"repo": "example-org/repo-a", "worktree": "origin/main", "fetch": true}
+        }
+      }
+    }
+  }
+}
+```
+
+The token is read from the environment variable named by `token_env`. Only
+the name lives in the config; the value is never stored in the config, the
+log or `dispatch.db`, and error messages name the variable only.
+
+Launchd and systemd do not inherit your shell environment, so for timer runs
+put the token (and the mail password) in `dispatch.env`, as `KEY=VALUE`
+lines. The file must be owner-only (`chmod 600`); agent-bus refuses a file
+that others can read. A variable already set in the process environment wins
+over the file.
+
+### Configuration reference
+
+All keys sit under `dispatch` and deep-merge over the shipped defaults.
+Lists replace on merge, so a custom `rules` replaces the shipped list.
+An invalid value makes the config fail to load, naming the dotted key.
+
+| Key | Meaning (default) |
+| --- | --- |
+| `env_file` | Optional `KEY=VALUE` file read before each run, mode 600 (`null`) |
+| `max_spawns_per_run` | Spawn limit per run (`2`). The bus-wide `spawn.max_sessions` applies too |
+| `working_hours.days` / `start` / `end` | Days and local time window in which runs act (`mon`-`fri`, `09:00`-`19:00`) |
+| `label.template` | Session label template (`t{gid_suffix}-{slug}`) |
+| `label.gid_suffix_length` | Characters of the task id used for `{gid_suffix}` (`8`) |
+| `handoff_channel` | Handoff channel name given to the session (`{label}`) |
+| `templates_dir` | Directory of playbook files that override the built-ins (`null`) |
+| `prompts_dir` | Where rendered prompt files are written (`dispatch-prompts` beside the database) |
+| `title_max_chars` | Cap on task text copied into a prompt (`120`) |
+| `overlap_max_items` | Cap on the list of other in-flight or handled tasks of the same project (`10`) |
+| `fetch_timeout_seconds` | Timeout for `git fetch` before a spawn (`120`) |
+| `notify_on` | Which events notify: `waiting`, `done`, `ended`, `spawn_failed`, `notify` (all five) |
+| `defaults` | Per-project defaults: `client` (`claude`), `model`, `worktree`, `fetch`, `clone`, `remote` |
+| `types.<type>.action` | `spawn`, `notify` or `ignore` per type |
+| `types.<type>.playbook` | Playbook name for the type (same as the type) |
+| `rules` | Ordered classification rules, see below |
+| `sources.asana.enabled` | Turn the source on (`false`) |
+| `sources.asana.base_url` | API base URL (`https://app.asana.com/api/1.0`) |
+| `sources.asana.token_env` | Name of the environment variable holding the token (`ASANA_TOKEN`) |
+| `sources.asana.workspace` | Optional workspace id to restrict the query (`null`) |
+| `sources.asana.lookahead_days` | Include tasks due up to this many days ahead (`0`: due today or overdue) |
+| `sources.asana.page_size` / `max_pages` | Paging of the API reads (`100`, `10`) |
+| `sources.asana.timeout_seconds` | HTTP timeout (`30`) |
+| `sources.asana.max_retry_wait_seconds` | Longest wait before the single retry after HTTP 429, whatever `Retry-After` asks (`30`). Redirects are never followed, so the token is never sent to another host. |
+| `sources.asana.ignore_own_comments` | Comments by the token's user do not count as new comments (`true`) |
+| `sources.asana.comment_authors` | Allowlist of user gids (digit strings). When non-empty, only comments by these users count as new comments; empty (`[]`) means any author. Recommended for unattended setups: otherwise anyone who can comment on a task can start a follow-up session |
+| `sources.asana.projects` | Project id to repo: a string, or an object with `repo` and optional `client`, `model`, `worktree`, `fetch`, `clone`, `remote`, `playbooks` |
+| `notifiers.log.file` | Log file (`dispatch.log` beside the database) |
+| `notifiers.macos.*` | `enabled`, `osascript_bin`, `title`, `timeout_seconds` |
+| `notifiers.email.*` | `enabled` (`false`), `host`, `port` (`465`), `security`, `username`, `password_env`, `from`, `to`, `subject_prefix`, `timeout_seconds` |
+| `timer.name` | Name of the launchd job or systemd unit (`agent-bus-dispatch`) |
+| `timer.interval_minutes` | Minutes between runs (`15`) |
+| `timer.command` | Command the timer runs; `{agent_bus_bin}` is the resolved binary |
+| `timer.environment` | Extra environment variables written into the unit (`{}`) |
+| `timer.output_file` | Timer stdout/stderr file (`dispatch-timer.log` beside the database) |
+| `timer.launchctl_bin` / `systemctl_bin` / `timeout_seconds` | Binaries and timeout used by `--load` and `--unload` |
+
+### Rules, types and actions
+
+A rule has a `type` and conditions; all conditions of a rule must hold.
+
+- `section`: list of regular expressions matched against the task's section names.
+- `title`: list of regular expressions matched against the title.
+- `project`: list of project ids; the rule then matches only through the task's memberships in those projects, and its `section` patterns are tested only against those memberships' sections.
+- `handled_as`: the task was already handled as one of these types.
+- `new_comment`: `true` when the newest comment is newer than the last handled one.
+
+The first matching rule wins; no match means `ignore`. A rule without
+`new_comment: true` never matches a type the task was already handled as, so
+a task is not handled twice as the same type. The shipped rules send
+sections matching `refine` to `refinement`, handled tasks with a new comment
+to `follow-up`, and `to do` / `ready` / `in progress` sections to
+`implementation`.
+
+Each type has an action: `spawn` starts a session, `notify` only notifies
+(once per task), `ignore` does nothing. `refinement` and `follow-up` spawn;
+`implementation` is notify-only by default, and
+`dispatch.types.implementation.action` set to `spawn` makes it spawn.
+A task whose session is live or in an active state is skipped.
+
+The label is built from `label.template` with `{gid}`, `{gid_suffix}`,
+`{slug}` (from the title) and `{type}`. It is at most 24 characters and
+starts with a letter. The full task id goes into the prompt and the state
+file.
+
+### Playbooks
+
+A playbook is a prompt template named after the type (`refinement`,
+`follow-up`, `implementation`). Generic ones ship with the package. A file
+`<name>.md` in `dispatch.templates_dir` replaces the built-in of that name,
+so your real prompts can live outside any repo. A project may pick other
+names with `playbooks`, e.g. `{"refinement": "my-refinement"}`.
+
+Placeholders are written `$name`: `task_url`, `task_gid`, `task_title`,
+`task_type`, `source`, `project_name`, `project_gid`, `section_names`,
+`due_on`, `modified_at`, `newest_comment_at`, `repo`, `label`,
+`handoff_channel`, `overlap`, `head_sha` and `base_ref`. A literal dollar is
+`$$`. A prompt must not start with `-`. The rendered prompt is written to a
+private file and passed to `spawn` as `--prompt-file`.
+
+### Notifiers
+
+- `log` always writes, to `dispatch.log` beside the database.
+- `macos` runs `osascript` with the text as an argument on macOS and does nothing elsewhere.
+- `email` needs `host`, `from`, `to` and `security`, and `username` and `password_env` together or not at all: `tls` (port 465, implicit TLS) or `starttls` (port 587). The certificate is verified and there is no plaintext fallback: when TLS cannot be established nothing is sent. The password is read from the variable named by `password_env`.
+
+Messages carry only the session name, the state, the task title and the
+link. Each transition (needs review, done, ended without done, spawn
+failed) and each notify-only task is notified once. A notification is
+recorded as sent only when at least one enabled notifier succeeded; when
+none did, it stays pending and the next run retries it (the failure is
+reported on stderr and the run exits 1, without secrets).
+
+The state database, the log and the prompt files hold task titles and links,
+so dispatch creates them owner-only (files `0600`, directories it creates
+`0700`). The timer output file (`timer.output_file`) also holds task titles;
+keep it in a private directory.
+
+### Timer
+
+`install-timer` writes a launchd plist (macOS, in `~/Library/LaunchAgents`)
+or a systemd user service and timer (Linux, in `~/.config/systemd/user`)
+that run `agent-bus dispatch run`, and prints each path it wrote. The
+schedule comes from `working_hours` and `timer.interval_minutes` (default:
+Monday to Friday, every 15 minutes, 09:00 to 19:00). Nothing is loaded or
+enabled without `--load`. The `PATH` of the shell that runs `install-timer`
+is written into the unit, so run it from a shell where `tmux` and your
+clients resolve. `uninstall-timer` removes the files and unloads them only
+with `--unload`.
+
+### State and limits
+
+State lives in `dispatch.db` beside the bus database (it follows
+`AGENT_BUS_DB`), with its own migrations; the bus database is untouched.
+`dispatch status` lists every known task with its type, outcome, session
+address and that session's current state.
+
+- A task is only seen while it is inside the due window, so follow-up only works on tasks still due today or overdue (or within `lookahead_days`).
+- A follow-up waits while the earlier session for the task is still open.
+- Runs stop spawning at `dispatch.max_spawns_per_run` or when `spawn.max_sessions` is reached.
 
 ---
 
@@ -1360,7 +1596,10 @@ holding turns open.
 
 ## Privacy & security
 
-- All state is local. No network calls leave your machine.
+- All state is local, and nothing leaves your machine unless dispatch is
+  enabled. Then agent-bus calls the configured task source over HTTPS
+  (read-only GET requests) and, when the email notifier is on, the
+  configured SMTP server over TLS.
 - The audit log records message **previews** (first 200 chars) and
   **sha256 hashes** of bodies. Treat both the DB and the audit log as
   containing message content, and back them up / protect them
@@ -1374,6 +1613,17 @@ holding turns open.
   have it (`--no-remote` turns it off), so a spawned session can act, and
   be reached from other devices, without asking first. Spawn only on repos
   and prompts you would run unattended.
+- Task titles and comments are untrusted data. Dispatch writes them only
+  into the prompt file, labelled as such, never into a command line.
+  Dispatched sessions run in the client's auto permission mode, so map only
+  repos and playbooks you would run unattended. The built-in playbooks tell
+  the session to do nothing outward-facing without your approval. Every
+  tracker value in a prompt is flattened to one line, truncated to
+  `title_max_chars` and stripped of runs of three or more dashes, so it
+  cannot forge the untrusted-data markers. Anyone who can comment on a
+  handled task can start a follow-up session; set
+  `sources.asana.comment_authors` to your own gid (and trusted colleagues)
+  for unattended setups.
 - The one secret agent-bus keeps itself — the token an agy session
   registers so that it can be woken — is never written to the database or
   the audit log; see [Native wake](#native-wake-the-default).

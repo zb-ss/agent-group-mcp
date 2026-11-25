@@ -160,6 +160,9 @@ def _validate(cfg: dict[str, Any]) -> None:
                 f"spawn.clients.{client}.worktree_links must be a list of "
                 f'objects {{"source": "...", "target": "..."}} with string values'
             )
+    from .dispatch import settings as dispatch_settings  # lazy: import cycle
+
+    dispatch_settings.validate(cfg.get("dispatch"))
 
 
 def load(*, path: Path | None = None) -> dict[str, Any]:

@@ -938,6 +938,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true", help="Emit JSON rows.")
     s.set_defaults(func=cmd_status)
 
+    from .dispatch import cli as dispatch_cli
+    dispatch_cli.register(sub)
+
     # optional serve helper (so `agent-bus serve` works besides python -m)
     s = sub.add_parser(
         "serve", help="Run the MCP stdio server (same as python -m agent_bus.server)."
