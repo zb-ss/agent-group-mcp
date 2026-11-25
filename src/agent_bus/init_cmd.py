@@ -32,7 +32,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
-from . import clients, identity
+from . import clients, identity, paths
 from .clients.base import WiringStatus
 from .clients.claude import (  # noqa: F401  (public names that lived here)
     ALLOW_TOOLS,
@@ -114,6 +114,8 @@ def find_git_repos(
     root = root.expanduser().resolve()
     if not root.exists():
         return []
+    if root.name == paths.WORKTREES_DIR:
+        return []  # a clone's spawn worktrees, never repos of their own
     if is_git_repo(root):
         return [root]
 
@@ -121,6 +123,9 @@ def find_git_repos(
         ".git", "node_modules", ".venv", "venv", "__pycache__",
         ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
         "vendor", "build", "dist", ".next", ".nuxt",
+        # spawn's default worktrees live in `<clone>/.worktrees`; they are
+        # not repos of their own
+        paths.WORKTREES_DIR,
     }
     out: list[Path] = []
     stack: list[tuple[Path, int]] = [(root, 0)]
@@ -287,6 +292,9 @@ def _describe(plan: InitPlan, storage: Storage | None) -> None:
             plan.notes.append(f"{c.client}: config file is not valid JSON, left alone")
         elif c.action is Action.SKIP_HANDWRITTEN and plan.is_change:
             plan.notes.append(f"{c.client}: hand-written entry left alone")
+        elif c.is_change:
+            extra = getattr(clients.wiring(c.client), "plan_notes", None)
+            plan.notes.extend(extra(plan.repo) if extra else [])
     if storage is None or not plan.is_change:
         return
     others = sorted({

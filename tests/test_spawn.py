@@ -5,6 +5,7 @@ the command runner."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -149,7 +150,7 @@ def test_claude_model_and_no_remote():
         ("codex", "m1", 'codex -m m1 "$(cat /tmp/p.txt)"; exec'),
         ("agy", None, 'agy --mode auto --remote-control -i "$(cat /tmp/p.txt)"; exec'),
         ("agy", "m1", 'agy --mode auto --model m1 --remote-control -i "$(cat /tmp/p.txt)"; exec'),
-        ("opencode", None, 'opencode --auto --prompt "$(cat /tmp/p.txt)"; exec'),
+        ("opencode", None, 'opencode --standalone --auto --prompt "$(cat /tmp/p.txt)"; exec'),
     ],
 )
 def test_other_clients(client, model, tail):
@@ -809,7 +810,9 @@ def test_carry_over_parent_part_is_refused_even_when_it_stays_inside(storage, cf
         _go(storage, cfg, prompt, worktree="main")
 
 
-def test_tracked_wiring_file_is_noted(storage, cfg, prompt, repo, tmp_path):
+def test_tracked_settings_file_gets_the_hooks_through_local_settings(
+    storage, cfg, prompt, repo, tmp_path
+):
     _wire(repo)
     tracked = tmp_path / "worktrees" / "repo-a" / "fix-login" / ".claude" / "settings.json"
 
@@ -822,21 +825,188 @@ def test_tracked_wiring_file_is_noted(storage, cfg, prompt, repo, tmp_path):
             return done
 
     result, _ = _go(storage, cfg, prompt, _Tracked(), worktree="main")
-    (note,) = [n for n in result.notes if "tracks it" in n]
-    assert str(tracked) in note and "hooks" in note
+    assert any("hooks added through .claude/settings.local.json" in n for n in result.notes)
+    assert not [n for n in result.notes if "tracks it" in n]
     assert not tracked.is_symlink() and tracked.read_text() == "{}"
-    assert not [n for n in result.notes if ".mcp.json" in n and "tracks it" in n]
+    local = tracked.with_name("settings.local.json")
+    assert local.is_file() and not local.is_symlink()
+    data = json.loads(local.read_text())
+    assert data["enabledMcpjsonServers"] == ["agent-bus"]
+    assert "UserPromptSubmit" in data["hooks"] and "Stop" in data["hooks"]
+    assert "mcp__agent-bus__whoami" in data["permissions"]["allow"]
+    assert "AGENT_BUS_NAME=repo-a/claude agent-bus hook-stop" in json.dumps(data["hooks"])
+
+
+def test_tracked_mcp_file_is_still_noted(storage, cfg, prompt, repo, tmp_path):
+    _wire(repo)
+    tracked = tmp_path / "worktrees" / "repo-a" / "fix-login" / ".mcp.json"
+
+    class _Tracked(FakeRun):
+        def __call__(self, argv, **kw):
+            done = super().__call__(argv, **kw)
+            if "worktree" in argv:
+                tracked.parent.mkdir(parents=True, exist_ok=True)
+                tracked.write_text("{}")
+            return done
+
+    result, _ = _go(storage, cfg, prompt, _Tracked(), worktree="main")
+    (note,) = [n for n in result.notes if "tracks it" in n]
+    assert str(tracked) in note
+
+
+def test_worktree_local_settings_start_from_the_clones_and_keep_its_keys(
+    storage, cfg, prompt, repo, tmp_path
+):
+    _wire(repo)
+    local = repo / ".claude" / "settings.local.json"
+    local.write_text(json.dumps({"model": "m", "enabledMcpjsonServers": ["other"]}))
+    result, _ = _go(storage, cfg, prompt, worktree="main")
+    mine = Path(result.work_dir) / ".claude" / "settings.local.json"
+    data = json.loads(mine.read_text())
+    assert data["model"] == "m" and data["enabledMcpjsonServers"] == ["other", "agent-bus"]
+    assert "hooks" not in data  # the carried-over settings.json already has them
+    assert json.loads(local.read_text())["enabledMcpjsonServers"] == ["other"]  # clone untouched
+
+
+def test_worktree_local_settings_replace_a_link_into_the_clone(storage, cfg, prompt, repo, tmp_path):
+    _wire(repo)
+    clone_local = repo / ".claude" / "settings.local.json"
+    clone_local.write_text('{"model": "m"}')
+    cfg["spawn"]["carry_over"] = [".claude/settings.local.json"]
+    result, _ = _go(storage, cfg, prompt, worktree="main")
+    mine = Path(result.work_dir) / ".claude" / "settings.local.json"
+    assert mine.is_file() and not mine.is_symlink()
+    assert json.loads(clone_local.read_text()) == {"model": "m"}  # the clone's file is untouched
+
+
+def test_unreadable_worktree_local_settings_are_left_alone(storage, cfg, prompt, repo, tmp_path):
+    _wire(repo)
+    target = tmp_path / "worktrees" / "repo-a" / "fix-login"
+    (target / ".claude").mkdir(parents=True)
+    (target / ".claude" / "settings.local.json").write_text("{not json")
+    fake = FakeRun()
+    fake.common_dirs[str(target)] = str(repo / ".git")
+    result, _ = _go(storage, cfg, prompt, fake, worktree="main")
+    assert (target / ".claude" / "settings.local.json").read_text() == "{not json"
+    assert any("not writing" in n for n in result.notes)
+
+
+def test_dry_run_reports_the_local_settings_and_writes_nothing(storage, cfg, prompt, repo, tmp_path):
+    _wire(repo)
+    result, _ = _go(storage, cfg, prompt, worktree="main", dry_run=True)
+    assert any("would write" in n and "settings.local.json" in n for n in result.notes)
+    assert not (tmp_path / "worktrees").exists()
+
+
+def test_local_settings_are_excluded_only_when_git_would_show_them(
+    storage, cfg, prompt, repo, tmp_path
+):
+    _wire(repo)
+
+    class _Visible(FakeRun):
+        def __call__(self, argv, **kw):
+            if "check-ignore" in argv:
+                self.calls.append((list(argv), {}))
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return super().__call__(argv, **kw)
+
+    _go(storage, cfg, prompt, _Visible(), worktree="main")
+    exclude = (repo / ".git" / "info" / "exclude").read_text().splitlines()
+    assert exclude == ["/.claude/settings.local.json"]
+
+
+def test_local_settings_already_ignored_are_not_excluded_again(storage, cfg, prompt, repo):
+    _wire(repo)
+    _go(storage, cfg, prompt, worktree="main")  # the fake answers "ignored"
+    assert not (repo / ".git" / "info" / "exclude").exists()
 
 
 def test_tracked_wiring_file_is_noted_for_a_reused_worktree(storage, cfg, prompt, repo, tmp_path):
     _wire(repo)
     target = tmp_path / "worktrees" / "repo-a" / "fix-login"
-    (target / ".claude").mkdir(parents=True)
-    (target / ".claude" / "settings.json").write_text("{}")
+    target.mkdir(parents=True)
+    (target / ".mcp.json").write_text("{}")
     fake = FakeRun()
     fake.common_dirs[str(target)] = str(repo / ".git")
     result, _ = _go(storage, cfg, prompt, fake, worktree="main")
     assert any("tracks it" in n for n in result.notes)
+
+
+# --------------------------- default worktree place --------------------------
+
+
+def test_default_worktree_is_inside_the_clone_and_excluded(storage, cfg, prompt, repo):
+    cfg["spawn"]["worktree_root"] = None
+    result, fake = _go(storage, cfg, prompt, worktree="main")
+    target = repo / ".worktrees" / "fix-login"
+    assert result.work_dir == str(target)
+    assert ["git", "-C", str(repo), "worktree", "add", "--detach", "--", str(target), "main"] in (
+        fake.argvs("git", "-C")
+    )
+    assert (repo / ".git" / "info" / "exclude").read_text().splitlines() == ["/.worktrees/"]
+
+
+def test_the_exclude_entry_is_added_once_and_keeps_other_lines(storage, cfg, prompt, repo):
+    cfg["spawn"]["worktree_root"] = None
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir()
+    exclude.write_text("*.swp")  # no trailing newline
+    _go(storage, cfg, prompt, worktree="main")
+    _go(storage, cfg, prompt, name="other-job", worktree="main")
+    assert exclude.read_text().splitlines() == ["*.swp", "/.worktrees/"]
+
+
+def test_default_worktree_dry_run_writes_nothing(storage, cfg, prompt, repo):
+    cfg["spawn"]["worktree_root"] = None
+    result, _ = _go(storage, cfg, prompt, worktree="main", dry_run=True)
+    assert result.work_dir == str(repo / ".worktrees" / "fix-login")
+    assert not (repo / ".worktrees").exists() and not (repo / ".git" / "info").exists()
+
+
+def test_default_worktree_folder_of_another_repo_is_refused(storage, cfg, prompt, repo):
+    cfg["spawn"]["worktree_root"] = None
+    target = repo / ".worktrees" / "fix-login"
+    target.mkdir(parents=True)
+    fake = FakeRun()
+    fake.common_dirs[str(target)] = str(repo.parent / "elsewhere" / ".git")
+    assert "not a git worktree" in str(_fail(storage, cfg, prompt, fake, worktree="main"))
+
+
+def test_default_worktree_cannot_leave_the_clone_through_a_link(storage, cfg, prompt, repo, tmp_path):
+    cfg["spawn"]["worktree_root"] = None
+    (tmp_path / "outside").mkdir()
+    (repo / ".worktrees").symlink_to(tmp_path / "outside")
+    assert "resolves outside" in str(_fail(storage, cfg, prompt, worktree="main"))
+
+
+def test_a_configured_root_keeps_the_group_layout_and_no_exclude(storage, cfg, prompt, repo, tmp_path):
+    result, _ = _go(storage, cfg, prompt, worktree="main")
+    assert result.work_dir == str(tmp_path / "worktrees" / "repo-a" / "fix-login")
+    assert not (repo / ".git" / "info" / "exclude").exists()
+
+
+# ----------------------------- user-level wiring -----------------------------
+
+
+def test_codex_wired_for_the_user_gets_the_folder_name_note(
+    storage, cfg, prompt, repo, tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('[mcp_servers.agent-bus]\ncommand = "agent-bus"\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    result, _ = _go(storage, cfg, prompt, client="codex", dry_run=True)
+    assert not any("is not wired" in n for n in result.notes)
+    (note,) = [n for n in result.notes if "AGENT_BUS_SESSION" in n]
+    assert "user account" in note and "will not link" in note
+
+
+def test_codex_without_any_wiring_keeps_the_not_wired_note(
+    storage, cfg, prompt, repo, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty"))
+    result, _ = _go(storage, cfg, prompt, client="codex", dry_run=True)
+    assert any("is not wired for codex" in n for n in result.notes)
 
 
 def test_name_starting_with_a_dash_is_refused(storage, cfg, prompt):

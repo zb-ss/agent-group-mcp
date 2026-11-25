@@ -8,10 +8,13 @@ and a client that follows the standard hook contract needs no dialect.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable, Mapping
 
 from . import agy, claude, codex, opencode
-from .base import ClientWiring, HookDialect, PushRegistration, StandardHookDialect
+from .base import (
+    ClientWiring, HookDialect, PushRegistration, StandardHookDialect, WorktreePrep,
+)
 
 _HOOK_DIALECTS: dict[str, HookDialect] = {
     agy.CLIENT_ID: agy.AgyHookDialect(),
@@ -128,3 +131,21 @@ def wirable_clients() -> tuple[str, ...]:
 def wiring(client: str) -> ClientWiring:
     """Raises KeyError for a client `init` cannot wire."""
     return _WIRINGS[client]
+
+
+def prepare_worktree(
+    client: str, clone: Path, worktree: Path, *, name: str, bin_path: str, dry_run: bool = False
+) -> WorktreePrep:
+    """The client's extra worktree setup, if it has any (see `ClientWiring`);
+    nothing to do for a client without it."""
+    step = getattr(_WIRINGS[client], "prepare_worktree", None)
+    if step is None:
+        return WorktreePrep()
+    return step(clone, worktree, name=name, bin_path=bin_path, dry_run=dry_run)
+
+
+def wired_for_user(client: str) -> bool:
+    """Whether `client` is wired once per user account (not per repo), so a
+    repo without its own wiring can still join the bus."""
+    check = getattr(_WIRINGS.get(client), "wired_for_user", None)
+    return bool(check()) if check else False

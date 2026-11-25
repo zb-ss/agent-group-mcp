@@ -29,7 +29,7 @@
         "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
       "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "worktree_links": []},
       "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "worktree_links": []},
-      "opencode": {"command": ["opencode", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "worktree_links": []}
+      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "worktree_links": []}
     }
   }
 }

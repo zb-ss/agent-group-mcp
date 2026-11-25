@@ -133,6 +133,15 @@ def test_resolve_scans_roots_when_roster_empty(storage, cfg, tmp_path):
     assert found.alias == "repo-a"
 
 
+def test_scanning_roots_never_finds_a_clones_spawn_worktrees(storage, cfg, tmp_path):
+    a = make_repo(tmp_path / "scan", "repo-a")
+    (a / ".worktrees" / "fix-login").mkdir(parents=True)
+    (a / ".worktrees" / "fix-login" / ".git").write_text("gitdir: elsewhere\n")
+    cfg["roots"] = [str(tmp_path / "scan"), str(a / ".worktrees")]
+    found = repo_identity._candidates(storage, cfg, FakeGit({a: "git@github.com:example-org/repo-a.git"}), scan=True)
+    assert [c.path for c in found] == [a.resolve()]
+
+
 def test_roster_wins_over_roots(storage, cfg, tmp_path):
     a, _b, git = roster(storage, tmp_path)
     other = make_repo(tmp_path / "scan", "repo-a-copy")

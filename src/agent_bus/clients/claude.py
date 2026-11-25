@@ -1,7 +1,10 @@
 """Claude Code.
 
 MCP servers live in the repo's `.mcp.json`; hooks and tool permissions in
-`.claude/settings.json`. Hooks follow the standard contract, fire on
+`.claude/settings.json`. Claude Code starts a `.mcp.json` server only once
+it is approved, and an unattended session cannot answer the prompt, so
+`init` also lists the server in `enabledMcpjsonServers` of the untracked
+`.claude/settings.local.json`. Hooks follow the standard contract, fire on
 `UserPromptSubmit` and `Stop`, and inherit Claude Code's environment.
 Claude Code tells its MCP servers and hooks which session they serve in
 `CLAUDE_CODE_SESSION_ID`.
@@ -25,7 +28,7 @@ from typing import Mapping
 
 from .. import settings
 from . import base
-from .base import UnreadableConfigError, WiringState, WiringStatus
+from .base import UnreadableConfigError, WiringState, WiringStatus, WorktreePrep
 
 CLIENT_ID = "claude"
 SESSION_KEY_ENV = "CLAUDE_CODE_SESSION_ID"
@@ -58,6 +61,12 @@ MAX_HOOK_TIMEOUT_SECONDS = (2**31 - 1) // 1000
 # The watcher gives up this much before Claude Code's timeout, so that it
 # ends on its own rather than being killed.
 WATCH_TIMEOUT_MARGIN_SECONDS = 30
+
+# Untracked, per-user settings. Claude Code reads it beside settings.json and
+# concatenates the hook lists of both.
+SETTINGS_REL = Path(".claude") / "settings.json"
+LOCAL_SETTINGS_REL = Path(".claude") / "settings.local.json"
+ENABLED_SERVERS_KEY = "enabledMcpjsonServers"
 
 ALLOW_TOOLS = (
     "mcp__agent-bus__whoami",
@@ -182,6 +191,37 @@ def _is_ours(block: object) -> bool:
     return bool(base.group_owners(block) & {CLIENT_ID, ""})
 
 
+def local_settings_path(repo: Path) -> Path:
+    return repo / LOCAL_SETTINGS_REL
+
+
+def _stays_inside(root: Path, path: Path) -> bool:
+    return path.resolve().is_relative_to(root.resolve())
+
+
+def enable_server(config: dict) -> bool:
+    """List the agent-bus server in `enabledMcpjsonServers`, keeping every
+    other key and entry. True when `config` changed."""
+    listed = config.get(ENABLED_SERVERS_KEY)
+    if isinstance(listed, list) and base.SERVER_KEY in listed:
+        return False
+    kept = listed if isinstance(listed, list) else []
+    config[ENABLED_SERVERS_KEY] = [*kept, base.SERVER_KEY]
+    return True
+
+
+def has_agent_bus_hooks(config: dict) -> bool:
+    """Whether `config` carries the prompt and stop hooks this adapter
+    writes, whichever name or binary they point at."""
+    hooks = config.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    return all(
+        isinstance(hooks.get(event), list) and any(_is_ours(b) for b in hooks[event])
+        for event, _ in HOOK_EVENTS
+    )
+
+
 class ClaudeWiring:
     client_id = CLIENT_ID
 
@@ -202,6 +242,7 @@ class ClaudeWiring:
         try:
             for path in self.files(repo):
                 base.load_json_object(path)
+            self._load_local_settings(repo)
             data = base.load_json_object(repo / ".mcp.json")
         except UnreadableConfigError:
             return WiringState(WiringStatus.UNREADABLE)
@@ -211,17 +252,39 @@ class ClaudeWiring:
             return WiringState(WiringStatus.ABSENT)
         env = entry.get("env") if isinstance(entry, dict) else None
         name = env.get("AGENT_BUS_NAME") if isinstance(env, dict) else None
+        command = entry.get("command") if isinstance(entry, dict) else None
         status = (
             WiringStatus.MANAGED if is_managed_mcp_entry(entry)
             else WiringStatus.HANDWRITTEN
         )
-        return WiringState(status, name)
+        return WiringState(status, name, bin_path=command if isinstance(command, str) else None)
+
+    @staticmethod
+    def _load_local_settings(repo: Path) -> dict | None:
+        """The repo's `.claude/settings.local.json` as a dict, or None when
+        that file or its folder resolves outside the repo (a symlinked
+        `.claude`, say): enabling the server there would write outside it."""
+        path = local_settings_path(repo)
+        if not _stays_inside(repo, path):
+            return None
+        return base.load_json_object(path)
+
+    def plan_notes(self, repo: Path) -> list[str]:
+        """What `init` should tell the person about this repo, beyond the plan."""
+        if _stays_inside(repo, local_settings_path(repo)):
+            return []
+        return [
+            f"claude: {LOCAL_SETTINGS_REL} resolves outside the repo, so the agent-bus "
+            f"server is not enabled there; approve it in Claude Code, or add "
+            f'"{base.SERVER_KEY}" to {ENABLED_SERVERS_KEY} yourself'
+        ]
 
     def apply(self, repo: Path, *, name: str, bin_path: str) -> None:
         mcp_path, settings_path = self.files(repo)
         # parse both before writing either: never leave a repo half-wired
         mcp = base.load_json_object(mcp_path)
         config = base.load_json_object(settings_path)
+        local = self._load_local_settings(repo)
 
         servers = mcp.get("mcpServers")
         if not isinstance(servers, dict):
@@ -234,6 +297,70 @@ class ClaudeWiring:
 
         base.write_json_object(mcp_path, mcp)
         base.write_json_object(settings_path, config)
+        if local is not None and enable_server(local):
+            base.write_json_object(local_settings_path(repo), local)
+
+    def prepare_worktree(
+        self, clone: Path, worktree: Path, *, name: str, bin_path: str, dry_run: bool = False
+    ) -> WorktreePrep:
+        """Give a worktree what Claude Code needs to join the bus there.
+
+        A worktree has none of the clone's untracked files, and a repo that
+        tracks `.claude/settings.json` hands it a committed copy without our
+        hooks. A worktree-local `.claude/settings.local.json` (a regular
+        file, never a link into the clone) approves the server and, where
+        the committed settings lack them, carries the hooks and tool
+        permissions; Claude Code merges it over settings.json."""
+        target = local_settings_path(worktree)
+        covered = [SETTINGS_REL]
+        if dry_run:
+            return WorktreePrep(
+                [f"would write {target}: enables the agent-bus server and adds the "
+                 f"hooks the worktree's settings lack"], covered=covered,
+            )
+        if not _stays_inside(worktree, target.parent):
+            return WorktreePrep([
+                f"not writing {target}: its folder resolves outside the worktree, so the "
+                f"session may lack the agent-bus server approval and hooks"
+            ])
+        try:
+            config = self._local_start(clone, target)
+            committed = self._committed_settings(worktree)
+        except UnreadableConfigError as exc:
+            return WorktreePrep([f"not writing {target}: {exc}"])
+        notes = [f"enabled the agent-bus server in {target}"] if enable_server(config) else []
+        if committed is not None and not has_agent_bus_hooks(committed):
+            self._merge_permissions(config)
+            self._merge_hooks(config, name=name, bin_path=bin_path)
+            notes.append(f"agent-bus hooks added through {LOCAL_SETTINGS_REL} in the worktree")
+        if not notes and target.exists() and not target.is_symlink():
+            return WorktreePrep(covered=covered)
+        if target.is_symlink():
+            target.unlink()
+        base.write_json_object(target, config)
+        return WorktreePrep(notes, written=[LOCAL_SETTINGS_REL], covered=covered)
+
+    @staticmethod
+    def _local_start(clone: Path, target: Path) -> dict:
+        """The settings to build on: the worktree's own local file when it
+        has one (read through a link too), else a copy of the clone's. An
+        unreadable clone file only means starting empty; an unreadable
+        worktree file is not ours to replace."""
+        if target.exists():
+            return base.load_json_object(target)
+        try:
+            return base.load_json_object(local_settings_path(clone))
+        except UnreadableConfigError:
+            return {}
+
+    @staticmethod
+    def _committed_settings(worktree: Path) -> dict | None:
+        """The worktree's `.claude/settings.json`; None when it cannot be read
+        as JSON, in which case hooks are left to the person."""
+        try:
+            return base.load_json_object(worktree / SETTINGS_REL)
+        except UnreadableConfigError:
+            return None
 
     @staticmethod
     def _merge_permissions(config: dict) -> None:

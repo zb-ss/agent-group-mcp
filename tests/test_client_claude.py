@@ -175,3 +175,49 @@ def test_anything_else_is_silent_success(tmp_path, exit_code):
 
 def test_a_missing_binary_does_not_wake(tmp_path):
     assert _run_watch_command(tmp_path, None).returncode == 0
+
+
+def test_inspect_reports_the_wired_binary(tmp_path):
+    repo = _repo(tmp_path)
+    _wire(repo)
+    state = clients.wiring("claude").inspect(repo)
+    assert state.name == "acme/claude" and state.bin_path == BIN
+
+
+def test_prepare_worktree_is_a_no_op_for_clients_without_one(tmp_path):
+    prep = clients.prepare_worktree(
+        "codex", tmp_path, tmp_path / "wt", name="acme/codex", bin_path=BIN
+    )
+    assert prep.notes == [] and prep.written == [] and prep.covered == []
+
+
+def test_has_agent_bus_hooks_needs_both_events():
+    assert not claude.has_agent_bus_hooks({})
+    assert not claude.has_agent_bus_hooks({"hooks": {"Stop": "not a list"}})
+    block = claude.build_hook_block(name="acme/claude", bin_path=BIN, subcommand="hook-stop")
+    assert not claude.has_agent_bus_hooks({"hooks": {"Stop": [block]}})
+    full = {"hooks": {"Stop": [block], "UserPromptSubmit": [block]}}
+    assert claude.has_agent_bus_hooks(full)
+
+
+def test_prepare_worktree_adds_hooks_with_the_clones_name_and_binary(tmp_path):
+    clone, worktree = _repo(tmp_path), tmp_path / "wt"
+    (worktree / ".claude").mkdir(parents=True)
+    (worktree / ".claude" / "settings.json").write_text('{"model": "m"}')
+    prep = clients.prepare_worktree("claude", clone, worktree, name="acme/claude", bin_path=BIN)
+    local = json.loads((worktree / ".claude" / "settings.local.json").read_text())
+    assert local["enabledMcpjsonServers"] == ["agent-bus"]
+    assert f"AGENT_BUS_NAME=acme/claude {BIN} hook-stop" in json.dumps(local["hooks"])
+    assert prep.written == [claude.LOCAL_SETTINGS_REL]
+    assert (worktree / ".claude" / "settings.json").read_text() == '{"model": "m"}'
+
+
+def test_prepare_worktree_is_idempotent(tmp_path):
+    clone, worktree = _repo(tmp_path), tmp_path / "wt"
+    worktree.mkdir()
+    for _ in range(2):
+        clients.prepare_worktree("claude", clone, worktree, name="acme/claude", bin_path=BIN)
+    local = json.loads((worktree / ".claude" / "settings.local.json").read_text())
+    assert local["enabledMcpjsonServers"] == ["agent-bus"]
+    assert len(local["hooks"]["UserPromptSubmit"]) == 1
+    assert local["permissions"]["allow"].count("mcp__agent-bus__whoami") == 1

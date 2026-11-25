@@ -444,7 +444,7 @@ tool names do not depend on which client you are in.
 
 | Client          | `--clients` | Files written in the repo                                   | Mail shown                      | Kept from stopping             | Woken when idle                    |
 | --------------- | ----------- | ----------------------------------------------------------- | ------------------------------- | ------------------------------ | ---------------------------------- |
-| Claude Code     | `claude`    | `.mcp.json`, `.claude/settings.json`                        | `UserPromptSubmit` hook         | `Stop` hook                    | background `asyncRewake` hook      |
+| Claude Code     | `claude`    | `.mcp.json`, `.claude/settings.json`, `.claude/settings.local.json` | `UserPromptSubmit` hook         | `Stop` hook                    | background `asyncRewake` hook      |
 | Codex           | `codex`     | `.codex/config.toml`, `.codex/hooks.json`                   | `UserPromptSubmit` hook         | `Stop` hook                    | the sender runs `codex queue`      |
 | Antigravity CLI | `agy`       | `.agents/plugins/agent-bus/` (a workspace plugin)           | `PreInvocation` hook            | `Stop` hook                    | the sender runs `agy agentapi`     |
 | opencode        | `opencode`  | `.opencode/opencode.json`, `.opencode/plugins/agent-bus.js` | plugin, before each model call  | not possible — see below       | plugin                             |
@@ -459,6 +459,15 @@ What differs per client:
   That hook is written only for Claude Code 2.1.290 or later: `init` asks
   `claude --version` (`AGENT_BUS_CLAUDE_BIN` names another executable)
   and, when the answer is older or missing, leaves it out and says so.
+  Claude Code starts a repo's `.mcp.json` server only once it is approved,
+  and an unattended (spawned) session cannot answer that prompt. `init`
+  therefore also adds `"agent-bus"` to `enabledMcpjsonServers` in the
+  untracked `.claude/settings.local.json`, keeping every other key and
+  entry and rewriting nothing when it is already there. A file that is not
+  a JSON object is never overwritten (the repo is skipped like any
+  unreadable config). When that file, or its folder, resolves outside the
+  repo, it is not written: the plan says so and you approve the server
+  yourself. Keep it out of git like the other wiring files.
 - **Codex** — loads a repo's `.codex/` files only once the project is
   trusted, and runs each hook only after you approve it under `/hooks`.
   Approval is tied to the hook's definition, so the hook commands carry no
@@ -947,21 +956,38 @@ agent-bus status
   exactly what the spawn wrote is removed and any earlier record or state
   is restored.
 - **`--worktree <base-ref>`** runs the session in a new detached git
-  worktree (`git worktree add --detach -- <dir> <base-ref>`), `<bus folder>/worktrees/<repo>/<label>` by default
-  (`spawn.worktree_root`). No fetch is done, so the ref is used as it is
+  worktree (`git worktree add --detach -- <dir> <base-ref>`). By default
+  (`spawn.worktree_root` is `null`) it is `<clone>/.worktrees/<label>`, and
+  `/.worktrees/` is added to the repository's shared `info/exclude` (never
+  to a tracked file), once, so git does not list it. With
+  `spawn.worktree_root` set, it is `<root>/<group>/<label>` as before and
+  nothing is excluded. No fetch is done, so the ref is used as it is
   locally. An existing worktree directory is reused only when it is
   a git worktree of that clone; anything else at that path is refused.
+  Why inside the clone: Claude Code, Codex and Antigravity CLI ask whether
+  to trust any new folder, which an unattended session cannot answer.
+  Claude Code and Codex treat a folder inside a trusted clone as trusted,
+  so the worktree starts without a prompt; Antigravity CLI asks again
+  (answer it in the tmux window); opencode never asks. The trade-off: tools
+  that scan or mount the main folder (IDEs, containers, file watchers) also
+  see `.worktrees/`. Repo discovery (`init --scan`, `repos.roots`) skips
+  `.worktrees` folders, so they are never taken for repos.
   Worktrees lose untracked files, so the client's wiring files and every
   existing entry of `spawn.carry_over` are symlinked in from the clone
   (an entry must be a relative path without `..`; the entry itself may be a
   symlink). A path that already exists in the worktree is left alone and
-  nothing is deleted. Known limitation: when the repo tracks a wiring file
-  (for example `.claude/settings.json`), the worktree keeps the committed
-  copy, so the session has no agent-bus hooks (no state reports, no
-  hook-delivered mail); spawn prints a note naming the file, and
-  `spawn.carry_over` cannot change that. Keeping the hooks in an untracked
-  local settings file is a possible later change. Clients may
-  ask you to trust the new folder on first start.
+  nothing is deleted. For Claude Code, spawn also writes a worktree-local
+  `.claude/settings.local.json` (a regular file, never a link into the
+  clone). It starts from the clone's own file when that is a JSON object,
+  lists `agent-bus` in `enabledMcpjsonServers` so the server starts without
+  an approval prompt, and, when the worktree's `.claude/settings.json` (for
+  example a committed copy) lacks the agent-bus hooks, adds those hooks and
+  the agent-bus tool permissions, with the clone's wiring name and binary.
+  Spawn says "hooks added through .claude/settings.local.json" when it did
+  that, and adds the file to the shared `info/exclude` only if
+  `git check-ignore` says git would list it. A wiring file the repo tracks
+  that this does not make up for (for example `.mcp.json`) keeps its
+  committed copy; spawn prints a note naming it.
   Client state kept outside the repo is linked by the client's
   `worktree_links` list (`source` and `target` templates with
   `{clone_key}`, `{work_dir_key}`, `{clone}`, `{work_dir}`). The Claude
@@ -1023,7 +1049,7 @@ stops `spawn` with an error naming it; `status` warns and carries on.
         "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
       "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "worktree_links": []},
       "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "worktree_links": []},
-      "opencode": {"command": ["opencode", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "worktree_links": []}
+      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "worktree_links": []}
     }
   }
 }
@@ -1061,6 +1087,22 @@ stops `spawn` with an error naming it; `status` warns and carries on.
   from the tmux session, so a spawned client does not think it is a child
   of the session that started it (the tmux server keeps the environment of
   whoever started it).
+- `spawn.worktree_root` is `null` by default: worktrees go to
+  `<clone>/.worktrees/<label>` (see `--worktree`). A path puts them under
+  `<root>/<group>/<label>` instead.
+- The opencode template starts `opencode --standalone --auto`. By default
+  opencode runs its sessions through a shared background service, whose MCP
+  servers keep the environment of the launch that started the service: a
+  later spawn would join the bus with an earlier spawn's token and be taken
+  for a stranger. `--standalone` runs a private server with the environment
+  of the launching process.
+- Codex is usually wired once per user (`[mcp_servers.agent-bus]` in
+  `~/.codex/config.toml`, or under `$CODEX_HOME`). When spawn finds that, it
+  does not claim the repo is unwired; it notes that Codex does not pass
+  `AGENT_BUS_SESSION` to its MCP servers, so the session is named after the
+  folder rather than the label and `agent-bus status` will not link it to the
+  spawn. A per-repo Codex wiring (`agent-bus init --clients codex`) passes
+  the variable through.
 - `spawn.carry_over` lists untracked files or folders of the repo to
   symlink into a worktree, for example `[".tool-config", "local-notes"]`.
 - Each client has four fragments, lists of arguments, plus `worktree_links`:

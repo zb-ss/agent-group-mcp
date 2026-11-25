@@ -60,6 +60,9 @@ PASSED_THROUGH_ENV = (
     "AGENT_BUS_SESSION", "AGENT_BUS_INSTANCE", "AGENT_BUS_DB", "AGENT_BUS_AUDIT_LOG",
 )
 
+# Where Codex keeps its per-user config; it honours this variable itself.
+CODEX_HOME_ENV = "CODEX_HOME"
+
 BLOCK_START = "# >>> agent-bus: managed by `agent-bus init`, regenerated on every run >>>"
 BLOCK_END = "# <<< agent-bus <<<"
 
@@ -166,12 +169,32 @@ def _splice(text: str, block: str) -> str:
     return text + ("\n" if text else "") + block
 
 
+def user_config_path() -> Path:
+    home = os.environ.get(CODEX_HOME_ENV, "").strip()
+    return (Path(home).expanduser() if home else Path.home() / ".codex") / "config.toml"
+
+
+def user_level_server() -> bool:
+    """Whether the user's own Codex config declares an agent-bus MCP server.
+    Read-only and forgiving: a missing, unreadable or malformed file is "no"."""
+    try:
+        config = tomllib.loads(user_config_path().read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return False
+    return _server_table(config) is not None
+
+
 class CodexWiring:
     client_id = CLIENT_ID
     limitations = (
         "Codex reads a repo's .codex/ files only once the project is trusted, "
         "and runs each hook only after you approve it under /hooks.",
     )
+
+    @staticmethod
+    def wired_for_user() -> bool:
+        """Codex is usually wired once per user, not per repo."""
+        return user_level_server()
 
     def files(self, repo: Path) -> list[Path]:
         return [repo / ".codex" / "config.toml", repo / ".codex" / "hooks.json"]

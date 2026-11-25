@@ -169,6 +169,13 @@ include `set_session` so it can name its inbox. No thread id needs to be
 hardcoded in the config or added to the MCP environment. After upgrading,
 restart the existing Codex MCP connections so they load the fix.
 
+**Claude Code** — needs no step from you for the MCP server: `init` also
+lists `agent-bus` in `enabledMcpjsonServers` of the untracked
+`.claude/settings.local.json`, which approves the `.mcp.json` server. Without
+that entry Claude Code never starts the server and the session never joins
+the bus. If that file (or its folder) points outside the repo, `init` leaves
+it alone and says so; approve the server in Claude Code yourself.
+
 **Antigravity CLI** — open the repository with `agy` and trust the folder
 when asked. The workspace plugin loads immediately after that; no restart
 needed.
@@ -199,6 +206,7 @@ points at):
 ```
 .mcp.json
 **/.claude/settings.json
+**/.claude/settings.local.json
 **/.codex/config.toml
 **/.codex/hooks.json
 **/.agents/plugins/agent-bus/
@@ -442,6 +450,16 @@ agent-bus status          # state, client, tmux window; --all adds ended and lon
 tmux attach -t agents     # one window per session
 ```
 
+`--worktree <base-ref>` puts the session in a git worktree at
+`<clone>/.worktrees/<label>` (excluded through the repository's
+`info/exclude`; `spawn.worktree_root` moves it elsewhere). Inside the clone it
+inherits the clone's folder trust in Claude Code and Codex, so no trust prompt
+blocks an unattended session; Antigravity CLI asks again, and opencode never
+asks. IDEs, containers and file watchers that mount the main folder also see
+`.worktrees/`. For Claude Code, spawn writes a worktree-local
+`.claude/settings.local.json` that approves the server and, if the worktree's
+committed `.claude/settings.json` lacks the agent-bus hooks, carries them.
+
 Spawned sessions are started in the client's auto permission mode, with
 Remote Control on where the client has it (`--no-remote` turns it off). To
 change the commands, the cap of five sessions, or the folders searched for
@@ -487,7 +505,9 @@ updates after a restart.
 | An idle agy session is not woken | Its agent has not run `agent-bus wake-register` (the user declined, or refused the permission), an agy whose `agentapi` has no `send-message`, a `wake.json` entry for the agent, `AGENT_BUS_NATIVE_WAKE=0`, or the hourly limit | Check `agent-bus tail` for `unregistered`; ask the agent to run `agent-bus wake-register --client agy` and allow it; set `AGENT_BUS_AGY_BIN` if the sender cannot run `agy` |
 | `spawn` says tmux was not found | tmux is not installed or not on `PATH` | Install tmux, or set `spawn.tmux_bin`; spawn printed the command to run by hand |
 | A spawned worktree session lacks the project memory | Memory lives outside the repo, per folder | Claude links it by default through `spawn.clients.claude.worktree_links` (source `~/.claude/projects/{clone_key}/memory`, target `~/.claude/projects/{work_dir_key}/memory`); the source must exist. Set the list to `[]` in `config.json` to switch it off |
-| A spawned session stays `starting`, then disappears | The repo is not wired for that client, or the worktree lacks the wiring; or the client is waiting on a folder-trust or MCP-approval prompt: it shows `starting`, then `ended` after `spawn.startup_grace_seconds`, and becomes live again once it joins | Run `agent-bus init` for the repo and client. In a worktree, an untracked wiring file is linked in automatically; a wiring file the repo tracks keeps its committed copy there (spawn prints a note naming it), so the session runs without agent-bus hooks and `spawn.carry_over` cannot change that. That is a known limitation of this version. For clients that prompt, answer the prompt in the tmux window, or raise `spawn.startup_grace_seconds` in `config.json` |
+| A spawned session stays `starting`, then disappears | The repo is not wired for that client, or the worktree lacks the wiring; or the client is waiting on a folder-trust or MCP-approval prompt: it shows `starting`, then `ended` after `spawn.startup_grace_seconds`, and becomes live again once it joins | Run `agent-bus init` for the repo and client (for Claude Code this also approves the server). In a worktree, untracked wiring files are linked in, and for Claude Code spawn writes a worktree-local `.claude/settings.local.json` (server approval, plus the hooks when the committed `.claude/settings.json` lacks them); other tracked wiring files keep their committed copy and spawn prints a note naming them. Answer a folder-trust prompt in the tmux window (Antigravity CLI asks in a new folder; Claude Code and Codex do not inside `<clone>/.worktrees`), or raise `spawn.startup_grace_seconds` in `config.json` |
+| A spawned Codex session is not linked to the spawn in `status` | Codex is wired once per user and does not pass `AGENT_BUS_SESSION` to MCP servers, so it registers under the folder's name | Wire the repo with `agent-bus init --clients codex`, which passes the variable through |
+| A spawned opencode session joins as a stranger | opencode's shared background service gave its MCP server the environment of an earlier launch | The default template uses `opencode --standalone`; keep it in custom templates |
 | `spawn` exits 4 | The cap (`spawn.max_sessions`, default 5) is reached | Wait, have a finished session report `done`, or raise the cap in `config.json` |
 | `spawn --repo` says the repo is ambiguous | Two different clones match | Give the full id or the bus name, or remove the stray clone from `repos.roots` |
 | A woken agent and another keep waking each other | Two agents answering every message | The hourly limit (`AGENT_BUS_WAKES_PER_HOUR`, default 20) stops it; lower it if needed |

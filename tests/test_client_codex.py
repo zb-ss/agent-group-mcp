@@ -324,3 +324,33 @@ def test_config_writes_leave_no_half_written_file(tmp_path, codex):
     codex.apply(repo, name="repo-a/codex", bin_path=BIN)
     leftovers = [p.name for p in (repo / ".codex").iterdir() if "tmp" in p.name]
     assert leftovers == []
+
+
+def test_wired_for_user_reads_the_users_codex_config(tmp_path, monkeypatch, codex):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    assert codex.wired_for_user() is False  # no file
+    (tmp_path / "codex-home").mkdir()
+    config = tmp_path / "codex-home" / "config.toml"
+    config.write_text('[mcp_servers.other]\ncommand = "x"\n')
+    assert codex.wired_for_user() is False
+    config.write_text('[mcp_servers.agent-bus]\ncommand = "agent-bus"\n')
+    assert codex.wired_for_user() is True
+
+
+def test_wired_for_user_survives_a_broken_config(tmp_path, monkeypatch, codex):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text("[mcp_servers\n")
+    assert codex.wired_for_user() is False
+
+
+def test_codex_home_defaults_to_the_users_dot_codex(tmp_path, monkeypatch, codex):
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text('[mcp_servers.agent-bus]\ncommand = "a"\n')
+    assert codex.wired_for_user() is True
+
+
+def test_other_clients_are_not_wired_for_the_user():
+    assert clients.wired_for_user("claude") is False
+    assert clients.wired_for_user("opencode") is False

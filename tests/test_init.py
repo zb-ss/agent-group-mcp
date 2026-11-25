@@ -141,6 +141,24 @@ def test_find_git_repos_skips_noisy_dirs(tmp_path):
     assert repos == [repo.resolve()]
 
 
+def test_find_git_repos_never_returns_a_clones_worktrees(tmp_path):
+    clone = tmp_path / "repo-a"
+    (clone / ".git").mkdir(parents=True)
+    worktree = clone / ".worktrees" / "fix-login"
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: ../../.git/worktrees/fix-login\n")
+    assert init_cmd.find_git_repos(tmp_path) == [clone.resolve()]
+    # a scan root that is the worktree folder itself finds nothing either
+    assert init_cmd.find_git_repos(clone / ".worktrees") == []
+
+
+def test_find_git_repos_skips_a_worktree_folder_outside_a_repo(tmp_path):
+    stray = tmp_path / "group" / ".worktrees" / "job"
+    stray.mkdir(parents=True)
+    (stray / ".git").write_text("gitdir: elsewhere\n")
+    assert init_cmd.find_git_repos(tmp_path) == []
+
+
 # --------------------------- plan + apply ----------------------------
 
 
@@ -554,3 +572,71 @@ def test_plan_keeps_pin_advice_when_repo_ids_differ(tmp_path, storage, monkeypat
     note = next(n for n in plan.notes if "/code/websites/foo" in n)
     assert "pin a name with" in note
     assert "another clone" not in note
+
+
+# ----------------------- approving the server for Claude Code -------------
+
+
+def _local_settings(repo: Path) -> dict:
+    return json.loads((repo / ".claude" / "settings.local.json").read_text())
+
+
+def test_init_enables_the_server_in_the_local_settings(tmp_path):
+    repo = _make_repo(tmp_path, "acme.dev")
+    init_cmd.apply_plan(init_cmd.plan_for_repo(repo), bin_path="/usr/local/bin/agent-bus")
+    assert _local_settings(repo) == {"enabledMcpjsonServers": ["agent-bus"]}
+
+
+def test_enabling_keeps_every_other_key_and_entry_without_duplicates(tmp_path):
+    repo = _make_repo(tmp_path, "acme.dev")
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "settings.local.json").write_text(json.dumps(
+        {"model": "m", "enabledMcpjsonServers": ["other"], "permissions": {"allow": ["x"]}}
+    ))
+    for _ in range(2):
+        init_cmd.apply_plan(init_cmd.plan_for_repo(repo), bin_path="/usr/local/bin/agent-bus")
+    assert _local_settings(repo) == {
+        "model": "m", "enabledMcpjsonServers": ["other", "agent-bus"],
+        "permissions": {"allow": ["x"]},
+    }
+
+
+def test_an_already_enabled_file_is_not_rewritten(tmp_path):
+    repo = _make_repo(tmp_path, "acme.dev")
+    (repo / ".claude").mkdir()
+    path = repo / ".claude" / "settings.local.json"
+    path.write_text('{"enabledMcpjsonServers":["agent-bus"]}')  # deliberately compact
+    init_cmd.apply_plan(init_cmd.plan_for_repo(repo), bin_path="/usr/local/bin/agent-bus")
+    assert path.read_text() == '{"enabledMcpjsonServers":["agent-bus"]}'
+
+
+def test_local_settings_that_are_not_json_block_the_wiring_and_stay_as_they_are(tmp_path):
+    repo = _make_repo(tmp_path, "acme.dev")
+    (repo / ".claude").mkdir()
+    path = repo / ".claude" / "settings.local.json"
+    path.write_text("{oops")
+    plan = init_cmd.plan_for_repo(repo)
+    assert plan.action == init_cmd.Action.SKIP_UNREADABLE
+    assert path.read_text() == "{oops" and not (repo / ".mcp.json").exists()
+
+
+def test_local_settings_outside_the_repo_are_not_written_and_the_plan_says_so(tmp_path):
+    repo = _make_repo(tmp_path, "acme.dev")
+    outside = tmp_path / "shared-claude"
+    outside.mkdir()
+    (repo / ".claude").symlink_to(outside)
+    plan = init_cmd.plan_for_paths([repo], scan=False)[0]
+    assert any("resolves outside the repo" in n for n in plan.notes)
+    init_cmd.apply_plan(plan, bin_path="/usr/local/bin/agent-bus")
+    assert (repo / ".mcp.json").exists()
+    assert not (outside / "settings.local.json").exists()
+
+
+def test_a_symlinked_local_settings_file_pointing_outside_is_not_followed(tmp_path):
+    repo = _make_repo(tmp_path, "acme.dev")
+    (repo / ".claude").mkdir()
+    target = tmp_path / "elsewhere.json"
+    target.write_text("{}")
+    (repo / ".claude" / "settings.local.json").symlink_to(target)
+    init_cmd.apply_plan(init_cmd.plan_for_repo(repo), bin_path="/usr/local/bin/agent-bus")
+    assert target.read_text() == "{}"

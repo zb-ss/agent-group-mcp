@@ -323,10 +323,7 @@ def _address(
         state = clients.wiring(client).inspect(clone)
         wired_name = state.name
         if wired_name is None:
-            notes.append(
-                f"{clone} is not wired for {client}: the session will not appear on "
-                f"the bus until `agent-bus init {clone} --clients {client}` is run"
-            )
+            notes.append(_unwired_note(client, clone))
     if wired_name is not None:
         parsed = identity.parse_or_none(wired_name) if isinstance(wired_name, str) else None
         if parsed is None or parsed.client is None:
@@ -337,6 +334,21 @@ def _address(
         return parsed.group, parsed.client
     parsed = identity.parse(resolution.client_address(storage, clone, client))
     return parsed.group, parsed.client or client
+
+
+def _unwired_note(client: str, clone: Path) -> str:
+    """Why a clone with no wiring of its own may still join the bus."""
+    if clients.wired_for_user(client):
+        return (
+            f"{client} is wired for your user account, not for {clone}: it does not "
+            f"pass AGENT_BUS_SESSION to MCP servers, so the session is named after "
+            f"the folder instead of its label, and `agent-bus status` will not link "
+            f"it to this spawn"
+        )
+    return (
+        f"{clone} is not wired for {client}: the session will not appear on "
+        f"the bus until `agent-bus init {clone} --clients {client}` is run"
+    )
 
 
 def _wiring_rels(request: SpawnRequest, clone: Path) -> list[Path]:
@@ -423,12 +435,16 @@ def _check_worktree_of(
 
 
 def _note_tracked_wiring(
-    request: SpawnRequest, clone: Path, target: Path, notes: list[str]
+    request: SpawnRequest, clone: Path, target: Path, notes: list[str],
+    covered: Sequence[Path] = (),
 ) -> None:
     """A repo that tracks a wiring file keeps its committed copy in the
     worktree, and nothing is rewritten: say so, since the session then lacks
-    the agent-bus hooks (or its server entry)."""
+    the agent-bus hooks (or its server entry). Files the client's own
+    worktree step compensates for (`covered`) are not worth a warning."""
     for rel in _wiring_rels(request, clone):
+        if rel in covered:
+            continue
         mine, theirs = target / rel, clone / rel
         if mine.is_symlink() or not mine.is_file() or not theirs.is_file():
             continue
@@ -454,26 +470,112 @@ def _carry_over_link(source: Path, dest: Path, target: Path, notes: list[str]) -
     os.symlink(source, dest)
 
 
+def _default_worktree_target(clone: Path, label: str) -> Path:
+    """`<clone>/.worktrees/<label>`. Folders inside a trusted clone inherit
+    its trust in most clients, which an unattended session cannot grant."""
+    target = clone / paths.WORKTREES_DIR / label
+    # a `.worktrees` link to elsewhere would put the worktree outside the
+    # clone, where no trust is inherited
+    if not target.resolve().is_relative_to(clone.resolve()):
+        raise SpawnError(f"the worktree folder {target} resolves outside {clone}")
+    return target
+
+
+def _exclude_worktrees_dir(clone: Path, *, timeout: float, run: commands.Runner) -> None:
+    """Keep git from listing `.worktrees/` as untracked, through the shared
+    `info/exclude` of the repository: it is never tracked, so no tracked
+    file changes. Idempotent."""
+    common = _git_common_dir(clone, timeout=timeout, run=run)
+    if common is None:
+        raise SpawnError(f"cannot find the git directory of {clone}")
+    _append_exclude(common, f"/{paths.WORKTREES_DIR}/")
+
+
+def _append_exclude(common_dir: Path, pattern: str) -> None:
+    """Add `pattern` as a line of `<common_dir>/info/exclude` unless it is there."""
+    exclude = common_dir / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+    if pattern in text.splitlines():
+        return
+    separator = "" if not text or text.endswith("\n") else "\n"
+    exclude.write_text(f"{text}{separator}{pattern}\n", encoding="utf-8")
+
+
+def _exclude_unless_ignored(
+    clone: Path, target: Path, written: Sequence[Path], *, timeout: float, run: commands.Runner
+) -> None:
+    """Exclude files a worktree step created, but only those git would
+    otherwise list (`git check-ignore`); a tracked `.gitignore` is never edited."""
+    for rel in written:
+        try:
+            done = run(["git", "-C", str(target), "check-ignore", "-q", "--", str(rel)], timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        common = _git_common_dir(clone, timeout=timeout, run=run)
+        if done.returncode == 1 and common is not None:
+            _append_exclude(common, f"/{rel.as_posix()}")
+
+
+def _prepare_client_worktree(
+    request: SpawnRequest, clone: Path, target: Path, *,
+    timeout: float, run: commands.Runner, notes: list[str],
+) -> None:
+    """The client's own worktree step (if any), then the note for wiring files
+    the repo tracks that the step did not make up for."""
+    covered: Sequence[Path] = ()
+    if request.client in clients.wirable_clients():
+        state = clients.wiring(request.client).inspect(clone)
+        if state.name is not None:
+            prep = clients.prepare_worktree(
+                request.client, clone, target, name=state.name,
+                bin_path=state.bin_path or _default_bin(), dry_run=request.dry_run,
+            )
+            notes.extend(prep.notes)
+            covered = prep.covered
+            _exclude_unless_ignored(clone, target, prep.written, timeout=timeout, run=run)
+    _note_tracked_wiring(request, clone, target, notes, covered)
+
+
+def _default_bin() -> str:
+    from . import init_cmd  # lazy, as in _wire_fresh_clone
+
+    return init_cmd.detect_agent_bus_bin()
+
+
 def _work_dir(
     request: SpawnRequest, clone: Path, group: str, label: str, *,
     cfg: Mapping, run: commands.Runner, notes: list[str],
 ) -> Path:
     if request.worktree is None:
         return clone
-    spawn_cfg = cfg["spawn"]
-    configured = spawn_cfg["worktree_root"]
-    root = Path(configured).expanduser() if configured else paths.db_path().parent / "worktrees"
-    target = _worktree_target(root, group, label)
-    entries = _carry_over_paths(request, clone, cfg)
+    configured = cfg["spawn"]["worktree_root"]
     timeout = cfg["repos"]["git_timeout_seconds"]
+    if configured:
+        target = _worktree_target(Path(configured).expanduser(), group, label)
+    else:
+        target = _default_worktree_target(clone, label)
+    entries = _carry_over_paths(request, clone, cfg)
     if target.exists():
         _check_worktree_of(target, clone, timeout=timeout, run=run)
         notes.append(f"reusing existing worktree {target}")
-        _note_tracked_wiring(request, clone, target, notes)
-        return target
-    if request.dry_run:
+    elif request.dry_run:
         notes.append(f"would create worktree {target} at {request.worktree}")
-        return target
+    else:
+        _create_worktree(request, clone, target, entries, default=not configured,
+                         timeout=timeout, run=run, notes=notes)
+    _prepare_client_worktree(
+        request, clone, target, timeout=timeout, run=run, notes=notes,
+    )
+    return target
+
+
+def _create_worktree(
+    request: SpawnRequest, clone: Path, target: Path, entries: Sequence[Path], *,
+    default: bool, timeout: float, run: commands.Runner, notes: list[str],
+) -> None:
+    if default:
+        _exclude_worktrees_dir(clone, timeout=timeout, run=run)
     target.parent.mkdir(parents=True, exist_ok=True)
     _git(
         ["git", "-C", str(clone), "worktree", "add", "--detach", "--", str(target), request.worktree],
@@ -481,8 +583,6 @@ def _work_dir(
     )
     for rel in entries:
         _carry_over_link(clone / rel, target / rel, target, notes)
-    _note_tracked_wiring(request, clone, target, notes)
-    return target
 
 
 def path_key(path: Path) -> str:
