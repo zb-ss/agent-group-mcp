@@ -6,6 +6,7 @@ the command runner."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -478,10 +479,33 @@ def test_memory_is_linked_into_the_worktree(storage, cfg, prompt, repo, home):
     result, _ = _go(storage, cfg, prompt, worktree="main")
     target = _memory(home, Path(result.work_dir))
     assert target.is_symlink() and target.resolve() == source.resolve()
+    # relative, so the link still resolves where the home folder has another path
+    assert os.readlink(target) == f"../{spawn.path_key(repo)}/memory"
     assert result.to_dict()["links"] == [
         {"source": str(source), "target": str(target), "created": True}
     ]
     assert any(n.startswith("linked ") for n in result.notes)
+
+
+def test_memory_link_is_relative_through_a_symlinked_state_folder(
+    storage, cfg, prompt, repo, home, tmp_path
+):
+    # ~/.claude is a link into a synced folder, as with a dotfiles checkout
+    real = tmp_path / "dotfiles" / "claude"
+    (real / "projects").mkdir(parents=True)
+    (home / ".claude").symlink_to(real)
+    source = _memory(home, repo)
+    source.mkdir(parents=True)
+    result, _ = _go(storage, cfg, prompt, worktree="main")
+    target = _memory(home, Path(result.work_dir))
+    assert os.readlink(target) == f"../{spawn.path_key(repo)}/memory"
+    assert target.resolve() == source.resolve()
+    # the synced copy works wherever the folder lands
+    moved = tmp_path / "elsewhere"
+    real.rename(moved)
+    moved_target = moved / "projects" / target.parent.name / "memory"
+    assert moved_target.resolve() == (moved / "projects" / source.parent.name / "memory").resolve()
+    assert moved_target.exists()
 
 
 def test_no_worktree_no_link(storage, cfg, prompt, repo, home):

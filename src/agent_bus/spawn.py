@@ -634,6 +634,16 @@ def _render_link(client: str, entry: Mapping, values: Mapping[str, str]) -> tupl
     return Path(source), Path(target)
 
 
+def _relative_link_text(source: Path, target: Path) -> str:
+    """What a link at `target` stores to reach `source`: a relative path, so the
+    link survives when the home folder is synced to a machine whose home path
+    differs (`/Users/me` and `/home/me`). It is computed between the physical
+    folders, because the system resolves a relative link from the folder the
+    link really sits in, which a symlinked parent can move."""
+    real_source = Path(os.path.realpath(source.parent)) / source.name
+    return os.path.relpath(real_source, os.path.realpath(target.parent))
+
+
 def _link_outside_state(
     request: SpawnRequest, clone: Path, work_dir: Path, *, cfg: Mapping, notes: list[str]
 ) -> list[dict[str, Any]]:
@@ -655,7 +665,7 @@ def _link_outside_state(
             notes.append(f"would link {target} -> {source}")
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(source, target)
+            os.symlink(_relative_link_text(source, target), target)
             created = True
             notes.append(f"linked {target} -> {source}")
         links.append({"source": str(source), "target": str(target), "created": created})

@@ -999,8 +999,10 @@ agent-bus status
   `{clone_key}`, `{work_dir_key}`, `{clone}`, `{work_dir}`). The Claude
   default links `~/.claude/projects/<clone key>/memory` to the worktree's
   key, so project memory carries over; a key is the absolute path with every
-  non-alphanumeric character replaced by `-`. Nothing is linked if the source
-  is missing or the target exists. Set
+  non-alphanumeric character replaced by `-`. Links are relative (for
+  memory, `../<clone key>/memory`), so they still resolve when the client's
+  state folder is synced to a machine with another home path. Nothing is
+  linked if the source is missing or the target exists. Set
   `spawn.clients.claude.worktree_links` to `[]` to switch it off.
 - **`--dry-run`** prints the address, folder and command, and changes
   nothing (no tmux, no clone, no worktree, no link, no database write,
