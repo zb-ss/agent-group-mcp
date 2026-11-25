@@ -578,3 +578,255 @@ def test_cli_agents_lists_sessions_under_their_client(bus_paths, fake_procs):
         "session", False,
     )
     assert by_name["repo-a/claude"]["live"] is None
+
+
+# ------------------------------ spawn / status ------------------------------
+
+
+def _bus_env(bus_paths, **extra):
+    env = {
+        "AGENT_BUS_DB": str(bus_paths["db"]),
+        "AGENT_BUS_AUDIT_LOG": str(bus_paths["log"]),
+    }
+    env.update(extra)
+    return env
+
+
+def _spawn_fixture(bus_paths, tmp_path):
+    """A scratch repo on the roster plus a prompt file."""
+    from agent_bus.storage import Storage
+
+    repo = tmp_path / "repo-a"
+    (repo / ".git").mkdir(parents=True)
+    Storage().ensure_agent("repo-a/claude", str(repo))
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("do the thing\n")
+    return repo, prompt
+
+
+def _spawn_args(prompt, name="fix-login", *extra):
+    return ["spawn", "--repo", "repo-a", "--client", "claude", "--name", name,
+            "--prompt-file", str(prompt), *extra]
+
+
+def _stub_tmux(tmp_path):
+    """A tmux that logs its arguments; has-session fails, the rest succeeds."""
+    bindir = tmp_path / "stubbin"
+    bindir.mkdir()
+    log = tmp_path / "tmux.log"
+    exe = bindir / "tmux"
+    exe.write_text(
+        '#!/bin/sh\necho "$@" >> "%s"\n[ "$1" = has-session ] && exit 1\nexit 0\n' % log
+    )
+    exe.chmod(0o755)
+    return bindir, log
+
+
+def _path_with(bindir):
+    return os.pathsep.join([str(bindir), os.environ.get("PATH", "")])
+
+
+def test_cli_status_is_empty_on_a_fresh_bus(bus_paths):
+    env = _bus_env(bus_paths)
+    r = _run_cli(["status", "--json"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == []
+    r = _run_cli(["status"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    assert "(no sessions running)" in r.stdout
+
+
+def test_cli_spawn_dry_run_writes_nothing(bus_paths, tmp_path):
+    from agent_bus.storage import Storage
+
+    _, prompt = _spawn_fixture(bus_paths, tmp_path)
+    r = _run_cli(_spawn_args(prompt, "fix-login", "--dry-run", "--json"),
+                 env_extra=_bus_env(bus_paths))
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["name"] == "repo-a/claude-fix-login"
+    assert "AGENT_BUS_SESSION=fix-login" in out["command"]
+    assert out["launched"] is False
+    assert Storage().list_spawns() == []
+    assert Storage().repo_ids() == {}
+
+
+def test_cli_spawn_launches_into_tmux_and_status_lists_it(bus_paths, tmp_path):
+    _, prompt = _spawn_fixture(bus_paths, tmp_path)
+    bindir, log = _stub_tmux(tmp_path)
+    env = _bus_env(bus_paths, PATH=_path_with(bindir))
+    r = _run_cli(_spawn_args(prompt), env_extra=env)
+    assert r.returncode == 0, r.stderr
+    assert "new-session -d -s agents -n fix-login" in log.read_text()
+    r = _run_cli(["status", "--json"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    rows = {row["name"]: row for row in json.loads(r.stdout)}
+    row = rows["repo-a/claude-fix-login"]
+    assert row["state"] == "starting"
+    assert row["tmux_session"] == "agents"
+    assert row["tmux_window"] == "fix-login"
+
+
+def test_cli_spawn_without_tmux_prints_the_manual_command(bus_paths, tmp_path):
+    _, prompt = _spawn_fixture(bus_paths, tmp_path)
+    (bus_paths["db"].parent / "config.json").write_text(
+        json.dumps({"spawn": {"tmux_bin": "no-such-tmux-binary"}})
+    )
+    r = _run_cli(_spawn_args(prompt), env_extra=_bus_env(bus_paths))
+    assert r.returncode == 1
+    assert "tmux" in r.stderr
+    assert r.stdout.startswith("cd ")
+
+
+def test_cli_spawn_rejects_bad_usage(bus_paths, tmp_path):
+    _, prompt = _spawn_fixture(bus_paths, tmp_path)
+    env = _bus_env(bus_paths)
+    r = _run_cli(["spawn", "--repo", "repo-a", "--client", "claude"], env_extra=env)
+    assert r.returncode == 2
+    bad = _spawn_args(prompt)
+    bad[bad.index("claude")] = "nosuch"
+    assert _run_cli(bad, env_extra=env).returncode == 2
+
+
+def test_cli_spawn_refuses_option_like_name_and_prompt(bus_paths, tmp_path):
+    from agent_bus.storage import Storage
+
+    _, prompt = _spawn_fixture(bus_paths, tmp_path)
+    env = _bus_env(bus_paths)
+    args = _spawn_args(prompt)
+    args[args.index("fix-login")] = "--name=-bad"
+    args.remove("--name")
+    r = _run_cli(args, env_extra=env)
+    assert r.returncode == 2 and "must not start with" in r.stderr
+    prompt.write_text("- item")
+    r = _run_cli(_spawn_args(prompt, "fix-login", "--dry-run"), env_extra=env)
+    assert r.returncode == 2 and "starts with '-'" in r.stderr
+    assert Storage().list_spawns() == []
+
+
+def test_cli_malformed_config_stops_spawn_but_not_status(bus_paths, tmp_path):
+    _, prompt = _spawn_fixture(bus_paths, tmp_path)
+    (bus_paths["db"].parent / "config.json").write_text("{not json")
+    env = _bus_env(bus_paths)
+    r = _run_cli(_spawn_args(prompt, "fix-login", "--dry-run"), env_extra=env)
+    assert r.returncode == 1
+    assert "config.json" in r.stderr
+    r = _run_cli(["status"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    assert "config.json" in r.stderr
+
+
+def test_cli_spawn_stops_at_the_concurrency_cap(bus_paths, tmp_path):
+    _, prompt = _spawn_fixture(bus_paths, tmp_path)
+    (bus_paths["db"].parent / "config.json").write_text(
+        json.dumps({"spawn": {"max_sessions": 1}})
+    )
+    bindir, log = _stub_tmux(tmp_path)
+    env = _bus_env(bus_paths, PATH=_path_with(bindir))
+    assert _run_cli(_spawn_args(prompt, "first"), env_extra=env).returncode == 0
+    r = _run_cli(_spawn_args(prompt, "second"), env_extra=env)
+    assert r.returncode == 4
+    assert "second" not in log.read_text()
+
+
+def test_cli_config_show_prints_defaults_without_a_file(bus_paths):
+    env = {"AGENT_BUS_DB": str(bus_paths["db"])}
+    r = _run_cli(["config", "show", "--json"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert data["exists"] is False
+    assert data["path"].endswith("config.json")
+    assert data["config"]["spawn"]["max_sessions"] == 5
+
+
+def test_cli_config_show_reflects_a_user_override(bus_paths):
+    env = {"AGENT_BUS_DB": str(bus_paths["db"])}
+    (bus_paths["db"].parent / "config.json").write_text(
+        json.dumps({"spawn": {"max_sessions": 2}})
+    )
+    r = _run_cli(["config", "show", "--json"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert data["exists"] is True
+    assert data["config"]["spawn"]["max_sessions"] == 2
+    assert "claude" in data["config"]["spawn"]["clients"]
+
+
+def test_cli_spawn_template_typo_is_an_exit_code_not_a_traceback(bus_paths, tmp_path):
+    _, prompt = _spawn_fixture(bus_paths, tmp_path)
+    bus_paths["db"].parent.joinpath("config.json").write_text(
+        json.dumps({"spawn": {"clients": {"claude": {"command": ["claude", "{nmae}"]}}}})
+    )
+    r = _run_cli(_spawn_args(prompt, "fix-login", "--dry-run"), env_extra=_bus_env(bus_paths))
+    assert r.returncode == 1 and "Traceback" not in r.stderr and "nmae" in r.stderr
+
+
+def test_cli_spawn_bad_clone_url_template_is_a_config_error(bus_paths, tmp_path):
+    _, prompt = _spawn_fixture(bus_paths, tmp_path)
+    bus_paths["db"].parent.joinpath("config.json").write_text(
+        json.dumps({"repos": {"clone_url": "https://{host}/{owner}.git"}})
+    )
+    r = _run_cli(_spawn_args(prompt, "fix-login", "--dry-run"), env_extra=_bus_env(bus_paths))
+    assert r.returncode == 1 and "Traceback" not in r.stderr and "clone_url" in r.stderr
+
+
+def test_cli_spawn_invalid_client_key_exits_with_usage_code(bus_paths, tmp_path):
+    _, prompt = _spawn_fixture(bus_paths, tmp_path)
+    bus_paths["db"].parent.joinpath("config.json").write_text(
+        json.dumps({"spawn": {"clients": {"claude-yolo": {
+            "command": ["x"], "prompt": ["{prompt}"]}}}})
+    )
+    args = _spawn_args(prompt, "fix-login", "--dry-run")
+    args[args.index("claude")] = "claude-yolo"
+    r = _run_cli(args, env_extra=_bus_env(bus_paths))
+    assert r.returncode == 2 and "Traceback" not in r.stderr
+
+
+def test_cli_spawn_refuses_an_opted_out_repo(bus_paths, tmp_path):
+    repo, prompt = _spawn_fixture(bus_paths, tmp_path)
+    (repo / ".agent-bus-ignore").write_text("")
+    r = _run_cli(_spawn_args(prompt, "fix-login", "--dry-run"), env_extra=_bus_env(bus_paths))
+    assert r.returncode == 1 and ".agent-bus-ignore" in r.stderr
+
+
+def test_cli_status_hides_long_finished_sessions_unless_all(bus_paths):
+    from agent_bus.storage import SpawnRecord, Storage
+
+    store = Storage()
+    store.ensure_agent("repo-a/claude-fix-login", "/srv/code/repo-a")
+    store.record_spawn(SpawnRecord(
+        name="repo-a/claude-fix-login", client="claude", repo_id=None,
+        repo_path="/srv/code/repo-a", work_dir="/srv/code/repo-a", model=None,
+        prompt_file="/tmp/p.txt", tmux_session="agents", tmux_window="fix-login",
+        remote=False, spawned_at="2020-01-01T00:00:00.000000Z",
+    ))
+    store.set_state("repo-a/claude-fix-login", "done")
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE agents SET state_at = '2020-01-02T00:00:00.000000Z' WHERE name = ?",
+            ("repo-a/claude-fix-login",),
+        )
+    env = _bus_env(bus_paths)
+
+    r = _run_cli(["status", "--json"], env_extra=env)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == []
+    r = _run_cli(["status", "--json", "--all"], env_extra=env)
+    assert [row["name"] for row in json.loads(r.stdout)] == ["repo-a/claude-fix-login"]
+
+
+def test_status_passes_the_git_budget_from_config(bus_paths, monkeypatch, capsys):
+    import argparse
+
+    from agent_bus import cli, config, repo_identity
+
+    config.config_path().write_text(
+        json.dumps({"repos": {"status_budget_seconds": 2.5}}), encoding="utf-8"
+    )
+    seen = {}
+    monkeypatch.setattr(
+        repo_identity, "refresh_missing",
+        lambda store, cfg, **kw: seen.update(kw),
+    )
+    cli.cmd_status(argparse.Namespace(all=False, json=True))
+    assert seen == {"budget_seconds": 2.5}

@@ -118,6 +118,18 @@ in repo `tools`. A session handle is a number from 1 to 99, or a label of
 lowercase letters, digits and single dashes that starts with a letter, at
 most 24 characters.
 
+**Repo identity.** Besides its name, a repo has an id: its normalised git
+remote URL, written `host/path` — lowercase, with no scheme, user, port,
+trailing `/` or `.git`, and with host aliases applied (`repos.host_aliases`
+in [`config.json`](#configuration-configjson); `ssh.github.com` counts as
+`github.com`). `git@github.com:Example-Org/Repo-A.git` and
+`https://github.com/example-org/repo-a` are both `github.com/example-org/repo-a`,
+on every machine. Group names are unchanged: they stay the local alias
+(`--name`, then `.agent-bus-name`, then the folder name). The id is an extra
+key, cached in the `repos` table, that `agent-bus spawn --repo` and
+`agent-bus status` use to find a repo's clone on the machine they run on:
+first from the roster, then by scanning `repos.roots`.
+
 ---
 
 ## MCP tools
@@ -126,11 +138,11 @@ All tools are auto-attributed to the server's identity.
 
 | Tool                                         | Returns                                                                                                                                |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `whoami()`                                   | `{name, group, client, client_address, session, instance, topic, repo_path, registered_at, last_seen, mcp_client, group_members, warnings}` |
-| `list_agents(group=None)`                    | `[{name, kind, group, client, topic, repo_path, last_seen, pending_count, live}, …]`; pass a bare repo name as `group` to see one repo; `kind` is `session`, `client` or `agent`, and `live` says whether a running server holds a session |
+| `whoami()`                                   | `{name, group, client, client_address, session, instance, topic, state, state_at, repo_path, registered_at, last_seen, mcp_client, group_members, warnings}` |
+| `list_agents(group=None)`                    | `[{name, kind, group, client, topic, state, state_at, repo_path, last_seen, pending_count, live}, …]`; pass a bare repo name as `group` to see one repo; `kind` is `session`, `client` or `agent`, and `live` says whether a running server holds a session |
 | `send_message(to, body, thread_id=None)`     | `{to, kind, message_ids, recipients, thread_id, sent_at}`, plus `message_id` when exactly one agent received it and `note` when no running session is there to read it |
 | `read_inbox(mark_read=True, limit=50)`       | Unread messages for this session — its own, plus any sent to its client address that no other session took — oldest first: `[{message_id, from, to, addressed_to, kind, claimed_by, body, sent_at, thread_id, read_at, delivered_at}]` |
-| `set_session(label=None, topic=None)`        | Renames this session to `<repo>/<client>-<label>` and/or sets the topic shown in `list_agents`: `{name, client_address, topic}`         |
+| `set_session(label=None, topic=None, state=None)` | Renames this session to `<repo>/<client>-<label>` and/or sets the topic shown in `list_agents`, and/or reports its state (`working`, `waiting` or `done`; anything else is rejected): `{name, client_address, topic, state}` |
 | `read_thread(thread_id, limit=100)`          | Full conversation across participants, ordered by `sent_at`.                                                                           |
 | `tail_audit(limit=50)`                       | Last N audit-log entries (any agent).                                                                                                  |
 
@@ -235,12 +247,16 @@ back to one shared identity per client and repo.
 
 ```sql
 agents(name PK, repo_path, registered_at, last_seen,
-       group_name NULL, client NULL, topic NULL)
+       group_name NULL, client NULL, topic NULL,
+       state NULL, state_at NULL)
 messages(message_id PK, from_agent, to_agent, body, thread_id,
          sent_at, read_at NULL, delivered_at NULL,
          addressed_to NULL, fanout_id NULL, to_group NULL, claimed_by NULL)
 sessions(server_pid, server_started, client_address,   -- PK
          name, repo_path, lineage, session_key NULL, started_at, last_seen)
+repos(repo_path PK, repo_id NULL, checked_at)       -- cached remote ids
+spawns(name PK, client, repo_id NULL, repo_path, work_dir, model NULL,
+       prompt_file, tmux_session, tmux_window, remote, spawned_at)
 -- Indices on (to_agent, read_at), (thread_id, sent_at),
 -- agents(group_name), messages(fanout_id) and sessions(client_address).
 -- Startup: PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
@@ -384,13 +400,14 @@ Tab-completes slash commands. Command history persists at
 
 ### Non-chat subcommands
 
-`inbox`, `agents`, and `tail` use the same per-agent colors and column
+`inbox`, `agents`, `status` and `tail` use the same per-agent colors and column
 alignment by default. Add `--json` to any of them for raw,
 machine-readable output (shape stable across releases):
 
 ```bash
 agent-bus inbox --json
 agent-bus agents --json
+agent-bus status --json
 agent-bus tail --json | jq '.[] | select(.op=="send")'
 ```
 
@@ -427,7 +444,7 @@ tool names do not depend on which client you are in.
 
 | Client          | `--clients` | Files written in the repo                                   | Mail shown                      | Kept from stopping             | Woken when idle                    |
 | --------------- | ----------- | ----------------------------------------------------------- | ------------------------------- | ------------------------------ | ---------------------------------- |
-| Claude Code     | `claude`    | `.mcp.json`, `.claude/settings.json`                        | `UserPromptSubmit` hook         | `Stop` hook                    | background `asyncRewake` hook      |
+| Claude Code     | `claude`    | `.mcp.json`, `.claude/settings.json`, `.claude/settings.local.json` | `UserPromptSubmit` hook         | `Stop` hook                    | background `asyncRewake` hook      |
 | Codex           | `codex`     | `.codex/config.toml`, `.codex/hooks.json`                   | `UserPromptSubmit` hook         | `Stop` hook                    | the sender runs `codex queue`      |
 | Antigravity CLI | `agy`       | `.agents/plugins/agent-bus/` (a workspace plugin)           | `PreInvocation` hook            | `Stop` hook                    | the sender runs `agy agentapi`     |
 | opencode        | `opencode`  | `.opencode/opencode.json`, `.opencode/plugins/agent-bus.js` | plugin, before each model call  | not possible — see below       | plugin                             |
@@ -442,6 +459,15 @@ What differs per client:
   That hook is written only for Claude Code 2.1.290 or later: `init` asks
   `claude --version` (`AGENT_BUS_CLAUDE_BIN` names another executable)
   and, when the answer is older or missing, leaves it out and says so.
+  Claude Code starts a repo's `.mcp.json` server only once it is approved,
+  and an unattended (spawned) session cannot answer that prompt. `init`
+  therefore also adds `"agent-bus"` to `enabledMcpjsonServers` in the
+  untracked `.claude/settings.local.json`, keeping every other key and
+  entry and rewriting nothing when it is already there. A file that is not
+  a JSON object is never overwritten (the repo is skipped like any
+  unreadable config). When that file, or its folder, resolves outside the
+  repo, it is not written: the plan says so and you approve the server
+  yourself. Keep it out of git like the other wiring files.
 - **Codex** — loads a repo's `.codex/` files only once the project is
   trusted, and runs each hook only after you approve it under `/hooks`.
   Approval is tied to the hook's definition, so the hook commands carry no
@@ -780,6 +806,7 @@ recovery requires SQLite + audit cross-reference.
 | `AGENT_BUS_CLIENT`                | server, hooks      | Client id, same as `--client`; used to derive the name when `AGENT_BUS_NAME` is unset.   |
 | `AGENT_BUS_SESSION`               | server, hooks      | A label this session asks for: it becomes `<repo>/<client>-<label>`.                    |
 | `AGENT_BUS_INSTANCE`              | server, hooks      | `1`..`99`: the session number this session asks for.                                     |
+| `AGENT_BUS_SPAWN_TOKEN`           | server             | Set by `agent-bus spawn` in the command it launches; proves the session is the one that spawn started, however late it joins. Not for hand use. |
 | `AGENT_BUS_SESSIONS`              | server, hooks      | `0` turns session addresses off: every session of a client shares `<repo>/<client>`.     |
 | `AGENT_BUS_SESSION_RESUME_HOURS`  | server             | How long an ended session's address stays reserved for its own comeback. Default `1`, `0` disables. |
 | `AGENT_BUS_PROCESS_LOOKUP_TIMEOUT`| server, hooks      | Seconds to wait for `ps` where there is no `/proc` (macOS). Default `2`.                 |
@@ -823,6 +850,11 @@ The suite covers:
 - `hook-stop` with pending → exit 0, valid JSON with `decision: "block"` and bodies in `reason`
 - `hook-user-prompt` with pending → bodies in stdout, inbox empty after
 - `agent-bus tail -f` integration: send a message in a subprocess, assert it appears within 1s
+- config: shipped defaults, deep merge of a user file, unreadable or malformed files
+- repo identity: URL normalisation (ssh, https, ports, host aliases), resolving a repo from the roster and from scanned roots
+- spawn: command rendering per client, the tmux calls (with a stand-in `tmux`), the cap, cloning, worktrees and their carried-over files, dry runs, registration on the bus
+- state reporting: `set_session(state=...)`, the hooks' `working` / `waiting`, and renames carrying the state
+- status: states, liveness, `--all`, the `--json` keys
 - native wake: `hook-watch` waking, giving up, handing over to a newer watcher, following a session's address, standing down for `wake.json`, the rate limit, a stop signal; the Claude Code hook command's exit codes run for real; Codex routes kept by the hooks and `codex queue` run by senders (with a stand-in `codex`); agy's registration request, private credential store and `agy agentapi send-message` run by senders (with a stand-in `agy`); the opencode plugin's watcher under Node
 
 ---
@@ -842,6 +874,302 @@ PRs welcome. The codebase is small and intentionally stays that way.
 - Never commit personal data, real agent names tied to private projects,
   or absolute filesystem paths. The `.gitignore` already excludes
   `*.db`, `audit.log`, `chat_history`, and `.claude-agent-bus/`.
+
+## Spawning sessions (`agent-bus spawn`)
+
+```bash
+agent-bus spawn --repo <name> --client <claude|codex|agy|opencode> [--model M] \
+    --name <session> --prompt-file F [--worktree <base-ref>] [--clone] \
+    [--no-remote] [--dry-run] [--json]
+```
+
+`spawn` opens one tmux window per session, all in one tmux session
+(`agents` by default), named after the session. The client starts
+interactively in the repo's folder with the contents of the prompt file as
+its first message, and the window stays open with a login shell after the
+client exits, so you can read what happened. Attach with
+`tmux attach -t agents`.
+
+```bash
+echo "Fix the login redirect loop and open a pull request." > /tmp/prompt.txt
+agent-bus spawn --repo repo-a --client claude --name fix-login --prompt-file /tmp/prompt.txt --dry-run
+agent-bus spawn --repo repo-a --client claude --name fix-login --prompt-file /tmp/prompt.txt
+agent-bus status
+```
+
+- **`--repo`** takes a repo's bus name, its id (`github.com/example-org/repo-a`),
+  a remote URL, or a unique ending of the id (`example-org/repo-a`,
+  `repo-a`). It is resolved to a clone on this machine from the roster,
+  then by scanning `repos.roots`. A git worktree is never chosen over its
+  main clone, and two different clones that match give exit 2 with both
+  paths listed. A repo that is not on this machine exits 1 (see Missing
+  clone).
+- **Address.** The session becomes `<repo>/<client>-<label>`, for example
+  `repo-a/claude-fix-login`; the label is `--name`, at most 24 characters
+  (lowercase letters, digits and single dashes, starting with a letter; a
+  `--name` that starts with `-` is refused with exit 2).
+  Spawn registers it on the roster in state `starting` and starts the
+  client with `AGENT_BUS_SESSION=<label>`, so the client's MCP server
+  claims exactly that address. The repo must be wired for that client
+  (`agent-bus init`). The prompt file is passed to the client as one
+  argument, so a file whose first character is `-` (a list item, `---` front
+  matter) is refused with exit 2: start it with text, a space or a blank
+  line.
+- **tmux** is needed for this command only; it is not a dependency of the
+  package, and `status` never uses it. Without tmux, spawn exits 1, writes
+  nothing to the bus and prints the `cd <dir> && <command>` line to run by
+  hand.
+- **Remote Control** is on by default for the clients that have it
+  (`claude`, `agy`). `--no-remote` turns it off.
+- **Cap.** At most `spawn.max_sessions` (default 5) spawned sessions can
+  be active (`starting`, `running`, `working` or `waiting`). Another spawn
+  exits 4 and names the running ones. A session that reported `done`, or
+  has ended, does not count. Spawning a name whose address is still active
+  exits 1.
+- **Missing clone.** A repo that is not on this machine is cloned only
+  with `--clone`, into `repos.clone_root`. Without it, spawn exits 1 and
+  prints the `git clone -- <url> <dir>` command. The clone runs as
+  `git clone -- <url> <temporary sibling>` and the folder is renamed into
+  place only when git succeeds, so a failed or timed-out clone leaves
+  nothing behind. A folder that already exists at the destination is reused
+  only when it is a complete clone of that repo (`git rev-parse --verify
+  HEAD` succeeds); a partial one is refused, naming the directory. The
+  folder name is the last part of the repo id and must start with a letter,
+  digit or underscore (`.git.git` or `.cargo` are refused; repeated `.git`
+  suffixes are dropped). When that folder already holds a different repo,
+  the clone goes to `<owner>-<name>` beside it (spawn says so); if that is
+  taken too, spawn refuses and names both paths. A repo cloned this way is
+  wired for the spawned client, so the new session can join the bus, except
+  when a wiring file's folder is a symlink leading outside the clone: spawn
+  then writes nothing and says how to wire it by hand. With neither
+  `repos.clone_root` nor `repos.roots` set, `--clone` exits 2 naming the
+  key.
+- **Opted-out repos.** A repo with a `.agent-bus-ignore` file is refused
+  (exit 1): a session there can never join the bus.
+- **Early checks.** The command template and the `worktree_links` entries
+  are rendered with sample values first, so a typo in `config.json` fails
+  before anything is cloned, created or linked. A client key that is not a
+  valid client id exits 2. Expected failures print `agent-bus: <message>`
+  and the notes gathered so far, never a traceback.
+- **Registration.** The roster rows, the `starting` state and the spawn
+  record are written just before the tmux window opens. If tmux refuses,
+  exactly what the spawn wrote is removed and any earlier record or state
+  is restored.
+- **`--worktree <base-ref>`** runs the session in a new detached git
+  worktree (`git worktree add --detach -- <dir> <base-ref>`). By default
+  (`spawn.worktree_root` is `null`) it is `<clone>/.worktrees/<label>`, and
+  `/.worktrees/` is added to the repository's shared `info/exclude` (never
+  to a tracked file), once, so git does not list it. With
+  `spawn.worktree_root` set, it is `<root>/<group>/<label>` as before and
+  nothing is excluded. No fetch is done, so the ref is used as it is
+  locally. An existing worktree directory is reused only when it is
+  a git worktree of that clone; anything else at that path is refused.
+  Why inside the clone: Claude Code, Codex and Antigravity CLI ask whether
+  to trust any new folder, which an unattended session cannot answer.
+  Claude Code and Codex treat a folder inside a trusted clone as trusted,
+  so the worktree starts without a prompt; Antigravity CLI asks again
+  (answer it in the tmux window); opencode never asks. The trade-off: tools
+  that scan or mount the main folder (IDEs, containers, file watchers) also
+  see `.worktrees/`. Repo discovery (`init --scan`, `repos.roots`) skips
+  `.worktrees` folders, so they are never taken for repos.
+  Worktrees lose untracked files, so the client's wiring files and every
+  existing entry of `spawn.carry_over` are symlinked in from the clone
+  (an entry must be a relative path without `..`; the entry itself may be a
+  symlink). A path that already exists in the worktree is left alone and
+  nothing is deleted. For Claude Code, spawn also writes a worktree-local
+  `.claude/settings.local.json` (a regular file, never a link into the
+  clone). It starts from the clone's own file when that is a JSON object,
+  lists `agent-bus` in `enabledMcpjsonServers` so the server starts without
+  an approval prompt, and, when the worktree's `.claude/settings.json` (for
+  example a committed copy) lacks the agent-bus hooks, adds those hooks and
+  the agent-bus tool permissions, with the clone's wiring name and binary.
+  Spawn says "hooks added through .claude/settings.local.json" when it did
+  that, and adds the file to the shared `info/exclude` only if
+  `git check-ignore` says git would list it. A wiring file the repo tracks
+  that this does not make up for (for example `.mcp.json`) keeps its
+  committed copy; spawn prints a note naming it.
+  Client state kept outside the repo is linked by the client's
+  `worktree_links` list (`source` and `target` templates with
+  `{clone_key}`, `{work_dir_key}`, `{clone}`, `{work_dir}`). The Claude
+  default links `~/.claude/projects/<clone key>/memory` to the worktree's
+  key, so project memory carries over; a key is the absolute path with every
+  non-alphanumeric character replaced by `-`. Nothing is linked if the source
+  is missing or the target exists. Set
+  `spawn.clients.claude.worktree_links` to `[]` to switch it off.
+- **`--dry-run`** prints the address, folder and command, and changes
+  nothing (no tmux, no clone, no worktree, no link, no database write,
+  not even the repo id cache). `--json`
+  prints the same as an object.
+
+Exit codes: `0` started (or dry run), `1` could not start (no tmux, no
+local clone of the repo, name already active, a malformed `config.json` or
+a template typo), `2` bad usage (ambiguous repo, unknown client, a model
+for a client that has no model option, a `--name` or prompt file that
+starts with `-`, `--clone` with no clone folder configured), `4` the cap is
+reached.
+
+### Configuration (`config.json`)
+
+Settings live in `config.json` beside the database
+(`~/.claude-agent-bus/config.json`). It is optional: the shipped defaults
+below apply, and your file is merged over them key by key. Objects merge,
+lists and scalars replace, and `null` removes a fragment. A malformed file
+stops `spawn` with an error naming it; `status` warns and carries on.
+`agent-bus config show [--json]` prints the file path and the effective merged config.
+
+```json
+{
+  "repos": {
+    "remote": "origin",
+    "host_aliases": {"ssh.github.com": "github.com", "altssh.gitlab.com": "gitlab.com"},
+    "roots": [],
+    "scan_depth": 6,
+    "clone_root": null,
+    "clone_url": "git@{host}:{path}.git",
+    "git_timeout_seconds": 30,
+    "id_recheck_seconds": 3600,
+    "status_budget_seconds": 5,
+    "clone_timeout_seconds": 600
+  },
+  "status": {
+    "hide_done_after_seconds": 86400
+  },
+  "spawn": {
+    "max_sessions": 5,
+    "startup_grace_seconds": 120,
+    "tmux_bin": "tmux",
+    "tmux_session": "agents",
+    "tmux_timeout_seconds": 10,
+    "after_exit": "exec $SHELL -l",
+    "strip_env": ["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_CHILD_NOTES_DIR", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT", "CLAUDE_PLUGIN_DATA"],
+    "worktree_root": null,
+    "carry_over": [],
+    "clients": {
+      "claude": {"command": ["claude", "-n", "{name}", "--permission-mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control", "{name}"], "prompt": ["{prompt}"],
+        "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
+      "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "worktree_links": []},
+      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "worktree_links": []},
+      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "worktree_links": []}
+    }
+  }
+}
+```
+
+- `repos.roots`: folders scanned (to `scan_depth`) for clones the roster
+  does not know, for example `["~/code"]`. `repos.clone_root` is where
+  `--clone` clones to; `clone_url` builds the URL from `{host}` and
+  `{path}` of the repo id, and any other placeholder or stray brace is
+  rejected when the config is loaded. `id_recheck_seconds` is how long a
+  cached repo id is trusted before `status` asks git again; an id is never
+  cached from a failed or timed-out lookup, and a repo whose remote was
+  added or changed later is found again. A repo with no `origin` is
+  remembered as such for `repos.id_recheck_seconds`, so `status` and `spawn`
+  do not ask git about it each time; `status` spends at most
+  `repos.status_budget_seconds` (default 5) on git lookups per call.
+- `--repo` matches any group name the roster holds for a clone. Repo URLs
+  with a query, a fragment, or an ambiguous authority (`#`, `?`, `\`,
+  whitespace, a userinfo or host starting with `-`) are not accepted as
+  remotes; the clone URL passed to git is rebuilt from the parsed parts.
+- Spawn puts a per-spawn token, `AGENT_BUS_SPAWN_TOKEN`, in the launched
+  client's environment; the session's MCP server presents it when it joins.
+  The session that carries the token keeps its `starting` state and spawn
+  record however long it takes to join (a client may wait on a folder-trust
+  or MCP-approval prompt). A session that claims a spawned address without
+  the matching token is not the session spawn started: it never inherits the
+  state, and the spawn record is removed, so it shows as a normal session.
+  Until it joins, a spawned session shows `starting`, then `ended` once
+  `spawn.startup_grace_seconds` has passed; it is live again, with its tmux
+  location and counted against `spawn.max_sessions`, as soon as it joins. A
+  dead spawned session that already reported `working` or `waiting` shows as
+  `ended` even inside the startup
+  grace (only a session that never reported shows `starting`).
+- `spawn.strip_env` lists variables removed from the launched client and
+  from the tmux session, so a spawned client does not think it is a child
+  of the session that started it (the tmux server keeps the environment of
+  whoever started it).
+- `spawn.worktree_root` is `null` by default: worktrees go to
+  `<clone>/.worktrees/<label>` (see `--worktree`). A path puts them under
+  `<root>/<group>/<label>` instead.
+- The opencode template starts `opencode --standalone --auto`. By default
+  opencode runs its sessions through a shared background service, whose MCP
+  servers keep the environment of the launch that started the service: a
+  later spawn would join the bus with an earlier spawn's token and be taken
+  for a stranger. `--standalone` runs a private server with the environment
+  of the launching process.
+- Codex is usually wired once per user (`[mcp_servers.agent-bus]` in
+  `~/.codex/config.toml`, or under `$CODEX_HOME`). When spawn finds that, it
+  does not claim the repo is unwired; it notes that Codex does not pass
+  `AGENT_BUS_SESSION` to its MCP servers, so the session is named after the
+  folder rather than the label and `agent-bus status` will not link it to the
+  spawn. A per-repo Codex wiring (`agent-bus init --clients codex`) passes
+  the variable through.
+- `spawn.carry_over` lists untracked files or folders of the repo to
+  symlink into a worktree, for example `[".tool-config", "local-notes"]`.
+- Each client has four fragments, lists of arguments, plus `worktree_links`:
+  `command` always
+  runs, `model` is added with `--model`, `remote` unless `--no-remote`, and
+  `prompt` last. A fragment set to `null` is not available: `--model` for a
+  client with `"model": null` exits 2. Placeholders: `{name}` (the
+  `--name`), `{label}`, `{address}`, `{model}`, `{repo}`, `{dir}` (the work
+  folder), `{prompt_file}`, and `{prompt}`. Every argument is shell-quoted
+  except `{prompt}`, which becomes `"$(cat <prompt file>)"`, so the prompt
+  never appears in the tmux command line. `worktree_links` is described
+  under `--worktree` above (`[]` turns it off).
+
+For example, to lower the cap and give Codex its working folder:
+
+```json
+{
+  "spawn": {
+    "max_sessions": 3,
+    "clients": {"codex": {"command": ["codex", "-C", "{dir}"]}}
+  }
+}
+```
+
+These commands run as your user, so the file is as sensitive as a shell rc
+file. The default templates start clients in their auto permission mode.
+
+## Session status (`agent-bus status`)
+
+`agent-bus status` shows, per repo, every live session and every spawned
+session: its client, state, when it was last seen, the tmux
+`session:window` it runs in, its folder when that differs from the repo's,
+and its topic. Ended sessions are hidden, and so are finished ones (no
+running server, state `done`) once their last report is older than
+`status.hide_done_after_seconds` (default one day; see *Configuration*).
+`--all` shows both; nothing is deleted from the database. With nothing to
+show it prints `(no sessions running)`.
+
+Sessions report their state over the bus; nothing is read from terminal
+panes.
+
+| State | Where it comes from |
+| --- | --- |
+| `starting` | `spawn` registered the session; the client has not connected yet |
+| `running` | the session is live but has not reported a state |
+| `working` | the prompt hook, at the start of a turn, `set_session(state="working")`, or a wake: when the background watcher or a push hands mail over and wakes a session it is `working` (also when it was `done`; a follow-up is new work) |
+| `waiting` | the stop hook when a turn really ends (the session waits for you), or `set_session(state="waiting")` |
+| `done` | the agent called `set_session(state="done")`; it stays `done` until the next prompt |
+| `ended` | the session registry: no running server holds the session, whatever state it last reported |
+
+A stop hook that holds the turn open to deliver mail changes nothing, and a
+hook that cannot tell which session it serves writes no state. Renaming a
+session with `set_session(label=...)` carries its state and spawn record to
+the new name, replacing whatever a previous holder of that label left
+behind. A session that takes over a kept label starts without a state, and
+a reconnect or restart of the same session's MCP server (same client
+process or session id) keeps the state it reported, `done` included; the
+`starting` state `spawn` wrote lasts until the session's first report. Tell spawned agents in the prompt to call
+`set_session(state="done")` when their task is finished.
+
+`agent-bus status --json` emits one object per session with the keys
+`name`, `group`, `client`, `label`, `state`, `reported_state`, `state_at`,
+`live`, `spawned`, `last_seen`, `topic`, `pending_count`, `repo_path`,
+`repo_id`, `work_dir`, `tmux_session`, `tmux_window`, `model` and
+`remote`.
+
+---
 
 ## Waking idle agents
 
@@ -1040,6 +1368,12 @@ holding turns open.
 - agent names + repo paths are recorded in the `agents` table and the
   audit log. Don't put secrets in agent names. Don't broadcast
   credentials over the bus.
+- `config.json` holds commands that `agent-bus spawn` runs as you, so
+  treat it like a shell rc file. The default templates start clients in
+  their auto permission mode, with Remote Control on for the clients that
+  have it (`--no-remote` turns it off), so a spawned session can act, and
+  be reached from other devices, without asking first. Spawn only on repos
+  and prompts you would run unattended.
 - The one secret agent-bus keeps itself — the token an agy session
   registers so that it can be woken — is never written to the database or
   the audit log; see [Native wake](#native-wake-the-default).

@@ -488,3 +488,52 @@ def test_a_session_entry_in_wake_json_counts_once_the_session_is_found(
     rc, err = _watch_as(storage, monkeypatch, client_proc, fake, key="a")
     assert (rc, err) == (0, "")
     assert storage.pending_count(agent=f"{SHARED}-1") == 1
+
+
+# ----------------------------- the wake reports state -----------------------
+
+SESSION = "repo-a/claude-fix-login"
+
+
+def test_a_watch_wake_sets_the_session_working_even_over_done(storage, fake_procs, monkeypatch):
+    storage.upsert_agent("peer/codex", "/repo/peer")
+    name, client_proc = _session(storage, fake_procs, key="a")
+    storage.set_state(name, "done")
+    storage.send_message(from_agent="peer/codex", to=name, body="one more thing")
+
+    rc, _ = _watch_as(storage, monkeypatch, client_proc, FakeTime(), key="a")
+
+    assert rc == WAKE_EXIT_CODE
+    assert storage.get_agent(name).state == "working"
+
+
+def test_no_state_is_set_when_the_watcher_does_not_wake(storage, fake_procs, monkeypatch):
+    storage.upsert_agent("peer/codex", "/repo/peer")
+    name, client_proc = _session(storage, fake_procs, key="a")
+    monkeypatch.setenv("AGENT_BUS_WAKES_PER_HOUR", "1")
+    WakeRoutes(storage).record_wake(name, DRIVER_WATCH)
+    storage.set_state(name, "done")
+    storage.send_message(from_agent="peer/codex", to=name, body="too many")
+
+    rc, _ = _watch_as(storage, monkeypatch, client_proc, FakeTime(), key="a", max_seconds=10)
+
+    assert rc == 0
+    assert storage.get_agent(name).state == "done"
+
+
+def test_a_wake_on_a_client_address_writes_no_state(storage):
+    storage.upsert_agent("repo-a/claude", "/srv/code/repo-a")
+    WakeRoutes(storage).record_wake("repo-a/claude", DRIVER_WATCH)
+    assert storage.get_agent("repo-a/claude").state is None
+
+
+def test_a_state_write_failure_does_not_fail_the_wake(storage, monkeypatch, capsys):
+    import sqlite3
+
+    def boom(name):
+        raise sqlite3.OperationalError("database is locked")
+
+    storage.upsert_agent(SESSION, "/srv/code/repo-a")
+    monkeypatch.setattr(storage, "note_woken", boom)
+    WakeRoutes(storage).record_wake(SESSION, DRIVER_WATCH)
+    assert "could not record this session's state" in capsys.readouterr().err

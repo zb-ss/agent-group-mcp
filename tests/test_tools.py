@@ -81,6 +81,14 @@ def test_whoami(mcp_alpha):
     assert out["registered_at"]
 
 
+def test_whoami_reports_the_state_and_when_it_was_set(storage, mcp_alpha):
+    assert _call(mcp_alpha, "whoami", {})["state"] is None
+    storage.set_state("alpha", "working")
+    out = _call(mcp_alpha, "whoami", {})
+    assert out["state"] == "working"
+    assert out["state_at"] == storage.get_agent("alpha").state_at
+
+
 def test_list_agents_includes_pending_counts(mcp_alpha, mcp_beta):
     _call(mcp_alpha, "send_message", {"to": "beta", "body": "yo"})
     out = _call(mcp_beta, "list_agents", {})

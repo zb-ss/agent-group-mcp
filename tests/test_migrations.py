@@ -208,3 +208,103 @@ def test_many_clients_opening_a_pre_wal_database_at_once(legacy_db, bus_paths):
             "SELECT COUNT(*) FROM agents WHERE name LIKE 'agent-%'"
         ).fetchone()[0]
     assert written == 6 * 20
+
+
+# ----------------------- step 5: state, repos, spawns -----------------------
+
+STEP_5_AGENT_COLUMNS = {"state", "state_at"}
+STEP_5_TABLES = {"repos", "spawns"}
+
+
+def _tables(db: Path) -> set[str]:
+    with sqlite3.connect(db) as conn:
+        return {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+
+def test_target_version_is_step_five():
+    assert migrations.target_version() == 1005
+
+
+def test_fresh_db_has_step_five_objects(bus_paths, storage):
+    assert _user_version(bus_paths["db"]) == 1005
+    assert STEP_5_AGENT_COLUMNS <= _columns(bus_paths["db"], "agents")
+    assert STEP_5_TABLES <= _tables(bus_paths["db"])
+
+
+def test_legacy_db_gets_step_five_objects(legacy_db):
+    from agent_bus.storage import Storage
+
+    Storage().init_schema()
+
+    assert _user_version(legacy_db) == 1005
+    assert STEP_5_AGENT_COLUMNS <= _columns(legacy_db, "agents")
+    assert STEP_5_TABLES <= _tables(legacy_db)
+
+
+def _step_four_db(db: Path) -> None:
+    conn = sqlite3.connect(db, isolation_level=None)
+    try:
+        for migration in migrations.MIGRATIONS[:4]:
+            migration.apply(conn)
+        conn.execute(
+            "INSERT INTO agents (name, repo_path, registered_at, last_seen, "
+            "group_name, client) VALUES "
+            "('repo-a/claude', '/code/repo-a', 't', 't', 'repo-a', 'claude'), "
+            "('repo-a/claude-docs', '/code/repo-a', 't', 't', 'repo-a', NULL), "
+            "('solo', '/code/solo', 't', 't', NULL, NULL)"
+        )
+        conn.execute("PRAGMA user_version = 1004")
+    finally:
+        conn.close()
+
+
+def test_step_four_db_migrates_without_renaming_anything(bus_paths):
+    from agent_bus.storage import Storage
+
+    db = bus_paths["db"]
+    _step_four_db(db)
+    with sqlite3.connect(db) as conn:
+        before = conn.execute(
+            "SELECT name, group_name FROM agents ORDER BY name"
+        ).fetchall()
+
+    Storage().init_schema()
+
+    assert _user_version(db) == 1005
+    assert STEP_5_AGENT_COLUMNS <= _columns(db, "agents")
+    assert STEP_5_TABLES <= _tables(db)
+    with sqlite3.connect(db) as conn:
+        after = conn.execute(
+            "SELECT name, group_name FROM agents ORDER BY name"
+        ).fetchall()
+        states = conn.execute("SELECT state, state_at FROM agents").fetchall()
+    assert after == before
+    assert set(states) == {(None, None)}
+    assert [b.name for b in _backups(db)] == [db.name + ".pre-migrate-1004"]
+
+
+def test_pre_step_five_statements_still_work(bus_paths):
+    from agent_bus.storage import Storage
+
+    Storage().init_schema()
+    with sqlite3.connect(bus_paths["db"]) as conn:
+        conn.execute(
+            "INSERT INTO agents (name, repo_path, registered_at, last_seen, "
+            "group_name, client, topic) "
+            "VALUES ('x/claude', '/code/x', 't', 't', 'x', 'claude', 'hello')"
+        )
+        row = conn.execute(
+            "SELECT name, repo_path, registered_at, last_seen, group_name, "
+            "client, topic FROM agents WHERE name = 'x/claude'"
+        ).fetchone()
+    assert row == ("x/claude", "/code/x", "t", "t", "x", "claude", "hello")
+
+
+def test_repos_table_has_no_unused_index(bus_paths, storage):
+    with sqlite3.connect(bus_paths["db"]) as conn:
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+    assert "idx_repos_id" not in names

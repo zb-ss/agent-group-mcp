@@ -121,6 +121,21 @@ class WiringState:
     # False when even --force cannot help: the entry is in a format we can
     # only rewrite between our own markers, and this one has none.
     can_force: bool = True
+    # the agent-bus executable the wiring points at, when the adapter can tell
+    bin_path: str | None = None
+
+
+@dataclass(frozen=True)
+class WorktreePrep:
+    """What an optional `prepare_worktree` step did (or would do) in a fresh
+    worktree. `written` are paths relative to the worktree that the step
+    created, so the caller can keep git from listing them; `covered` are the
+    clone's wiring files whose committed copy in the worktree it now
+    compensates for, so the caller need not warn about them."""
+
+    notes: list[str] = field(default_factory=list)
+    written: list[Path] = field(default_factory=list)
+    covered: list[Path] = field(default_factory=list)
 
 
 class ClientWiring(Protocol):
@@ -139,6 +154,11 @@ class ClientWiring(Protocol):
     def apply(self, repo: Path, *, name: str, bin_path: str) -> None:
         """Write the MCP server entry and the hooks, preserving everything
         in those files that is not ours."""
+
+    # Optional, found by `clients.prepare_worktree` / `clients.wired_for_user`
+    # (a client without them is treated as having none):
+    #   prepare_worktree(clone, worktree, *, name, bin_path, dry_run) -> WorktreePrep
+    #   wired_for_user() -> bool   (the client is wired once per user account)
 
 
 def is_managed_server(command: object, args: object) -> bool:

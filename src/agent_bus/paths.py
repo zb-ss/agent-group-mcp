@@ -12,6 +12,11 @@ from pathlib import Path
 from . import DEFAULT_AUDIT_PATH, DEFAULT_DB_PATH
 
 
+# Where `spawn --worktree` puts a session's worktree by default, inside the
+# clone: a folder the clone's client already trusts passes that trust on.
+WORKTREES_DIR = ".worktrees"
+
+
 def db_path() -> Path:
     raw = os.environ.get("AGENT_BUS_DB") or DEFAULT_DB_PATH
     return Path(raw).expanduser()

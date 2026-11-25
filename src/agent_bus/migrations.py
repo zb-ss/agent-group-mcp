@@ -195,11 +195,48 @@ def _add_wake_routes(conn: sqlite3.Connection) -> None:
     )
 
 
+def _add_state_repos_and_spawns(conn: sqlite3.Connection) -> None:
+    """Explicit session state, cached repo ids and spawn records.
+
+    `agents.state` NULL means written by an older binary or never reported.
+    `repos` caches each clone's normalised remote id. `spawns` records what
+    `agent-bus spawn` started and where."""
+    _add_column_if_missing(conn, "agents", "state", "TEXT")
+    _add_column_if_missing(conn, "agents", "state_at", "TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS repos (
+            repo_path   TEXT PRIMARY KEY,
+            repo_id     TEXT,
+            checked_at  TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spawns (
+            name          TEXT PRIMARY KEY,
+            client        TEXT NOT NULL,
+            repo_id       TEXT,
+            repo_path     TEXT NOT NULL,
+            work_dir      TEXT NOT NULL,
+            model         TEXT,
+            prompt_file   TEXT NOT NULL,
+            tmux_session  TEXT NOT NULL,
+            tmux_window   TEXT NOT NULL,
+            remote        INTEGER NOT NULL,
+            spawned_at    TEXT NOT NULL
+        )
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "base tables (0.4.x schema)", _create_base_tables),
     Migration(2, "group addressing columns", _add_group_addressing_columns),
     Migration(3, "sessions table and agent topics", _add_sessions),
     Migration(4, "wake routes and wake history", _add_wake_routes),
+    Migration(5, "session state, repo ids and spawn records", _add_state_repos_and_spawns),
 )
 
 

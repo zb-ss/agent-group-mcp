@@ -23,7 +23,10 @@ def registry(storage, fake_procs):
     return SessionRegistry(storage)
 
 
-def _start(registry, fake_procs, address=CLAUDE, *, key=None, pinned=None, client=None):
+def _start(
+    registry, fake_procs, address=CLAUDE, *, key=None, pinned=None, client=None,
+    token=None,
+):
     """Start a session: a client process and its server. Returns
     (name, server, client process)."""
     server, lineage = fake_procs.session()
@@ -32,6 +35,7 @@ def _start(registry, fake_procs, address=CLAUDE, *, key=None, pinned=None, clien
     claim = registry.claim(
         client_address=address, repo_path=REPO, server=server,
         lineage=lineage, session_key=key, pinned=pinned,
+        spawn_token=token,
     )
     return claim.name, server, lineage[0]
 
@@ -369,6 +373,7 @@ def test_set_session_names_the_session_for_its_peers(storage, fake_procs):
     out = _call(second, "set_session", {"label": "release-notes", "topic": "changelog draft"})
     assert out == {
         "name": "shared/claude-release-notes", "client_address": CLAUDE, "topic": "changelog draft",
+        "state": None,
     }
     _call(first, "send_message", {"to": "shared/claude-release-notes", "body": "review?"})
     assert [m["body"] for m in _call(second, "read_inbox", {})] == ["review?"]
@@ -377,6 +382,43 @@ def test_set_session_names_the_session_for_its_peers(storage, fake_procs):
     assert roster["shared/claude-release-notes"]["live"] is True
     assert roster["shared/claude-release-notes"]["topic"] == "changelog draft"
     assert roster[CLAUDE]["kind"] == "client"
+
+
+def test_set_session_reports_a_state(storage, fake_procs):
+    mcp = _server(storage, fake_procs)
+    out = _call(mcp, "set_session", {"label": "docs", "state": "done"})
+    assert out["state"] == "done"
+    assert storage.get_agent(out["name"]).state == "done"
+
+    out = _call(mcp, "set_session", {"state": " Waiting "})
+    assert out["state"] == "waiting"
+
+
+def test_set_session_rejects_an_unknown_state(storage, fake_procs):
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    mcp = _server(storage, fake_procs)
+    with pytest.raises(ToolError) as caught:
+        _call(mcp, "set_session", {"label": "docs", "state": "idle"})
+    for allowed in ("working", "waiting", "done"):
+        assert allowed in str(caught.value)
+
+
+def test_a_label_carries_the_state_and_the_spawn_record(storage, registry, fake_procs):
+    from agent_bus.storage import SpawnRecord
+
+    name, server, _ = _start(registry, fake_procs)
+    storage.set_state(name, "working")
+    storage.record_spawn(SpawnRecord(
+        name=name, client="claude", repo_id=None, repo_path=REPO, work_dir=REPO,
+        model=None, prompt_file="/tmp/p.txt", tmux_session="agents",
+        tmux_window="one", remote=False, spawned_at="2026-01-01T00:00:00Z",
+    ))
+
+    new = registry.rename(server, CLAUDE, "docs")
+    assert storage.get_agent(new).state == "working"
+    assert storage.get_spawn(new).tmux_window == "one"
+    assert storage.get_spawn(name) is None
 
 
 def test_set_session_needs_a_session(storage, fake_procs):
@@ -749,3 +791,215 @@ def identity_module():
     from agent_bus import identity
 
     return identity
+
+
+def test_rename_state_wins_over_a_stale_one_left_by_the_label(storage, registry, fake_procs):
+    old, old_server, _ = _start(registry, fake_procs, pinned="frontend")
+    storage.set_state(old, "done")
+    registry.release(old_server, CLAUDE)
+
+    name, server, _ = _start(registry, fake_procs)
+    storage.set_state(name, "working")
+    new = registry.rename(server, CLAUDE, "frontend")
+    assert new == old
+    assert storage.get_agent(new).state == "working"
+
+
+def test_claiming_a_kept_label_clears_the_stale_state(storage, registry, fake_procs):
+    old, old_server, _ = _start(registry, fake_procs, pinned="frontend")
+    storage.set_state(old, "done")
+    registry.release(old_server, CLAUDE)
+
+    name, _server, _ = _start(registry, fake_procs, pinned="frontend")
+    assert name == old
+    assert storage.get_agent(name).state is None
+
+
+# ----------------------- reported state across claims -----------------------
+
+
+def test_f8_a_renamed_session_is_not_done_because_the_label_was(storage, registry, fake_procs):
+    """Reproduction: a finished session's label, taken by a working one."""
+    old, old_server, _ = _start(registry, fake_procs, pinned="frontend")
+    storage.set_state(old, "done")
+    registry.release(old_server, CLAUDE)
+    name, server, _ = _start(registry, fake_procs)
+    storage.set_state(name, "working")
+
+    new = registry.rename(server, CLAUDE, "frontend")
+
+    assert new == old
+    assert storage.get_agent(new).state == "working"
+
+
+def test_rename_gives_the_label_the_sessions_own_empty_state(storage, registry, fake_procs):
+    old, old_server, _ = _start(registry, fake_procs, pinned="frontend")
+    storage.set_state(old, "done")
+    registry.release(old_server, CLAUDE)
+    _name, server, _ = _start(registry, fake_procs)  # reported nothing yet
+
+    new = registry.rename(server, CLAUDE, "frontend")
+
+    agent = storage.get_agent(new)
+    assert (agent.state, agent.state_at) == (None, None)
+
+
+def test_a_new_session_claiming_a_kept_label_starts_without_its_state(
+    storage, registry, fake_procs
+):
+    old, old_server, _ = _start(registry, fake_procs, pinned="frontend")
+    storage.set_state(old, "done")
+    registry.release(old_server, CLAUDE)
+
+    name, _server, _ = _start(registry, fake_procs, pinned="frontend")
+
+    agent = storage.get_agent(name)
+    assert (name, agent.state, agent.state_at) == (old, None, None)
+
+
+def test_a_claim_clears_a_state_no_session_row_explains(storage, registry, fake_procs):
+    storage.ensure_agent("shared/claude-frontend", REPO)
+    storage.set_state("shared/claude-frontend", "done")
+
+    name, _server, _ = _start(registry, fake_procs, pinned="frontend")
+
+    assert storage.get_agent(name).state is None
+
+
+def test_f17_a_restarted_server_of_the_same_client_keeps_its_state(
+    storage, registry, fake_procs
+):
+    """Reproduction: the pinned session's MCP server restarts after `done`."""
+    name, server, client = _start(registry, fake_procs, pinned="fix-login")
+    storage.set_state(name, "done")
+    stamp = storage.get_agent(name).state_at
+    fake_procs.kill(server)  # the server dies, its client lives on
+
+    again, *_ = _start(registry, fake_procs, pinned="fix-login", client=client)
+
+    agent = storage.get_agent(again)
+    assert (again, agent.state, agent.state_at) == (name, "done", stamp)
+
+
+def test_a_reconnect_with_the_same_session_id_keeps_its_state(storage, registry, fake_procs):
+    name, server, client = _start(registry, fake_procs, key="session-a", pinned="fix-login")
+    storage.set_state(name, "waiting")
+    fake_procs.kill(server, client)
+
+    again, *_ = _start(registry, fake_procs, key="session-a", pinned="fix-login")
+
+    assert (again, storage.get_agent(again).state) == (name, "waiting")
+
+
+def test_another_client_process_taking_the_label_does_not_keep_the_state(
+    storage, registry, fake_procs
+):
+    name, server, client = _start(registry, fake_procs, pinned="fix-login")
+    storage.set_state(name, "done")
+    fake_procs.kill(server, client)
+
+    again, *_ = _start(registry, fake_procs, pinned="fix-login")
+
+    assert (again, storage.get_agent(again).state) == (name, None)
+
+
+LONG_AGO = 3600.0  # far beyond any startup grace: only the token decides
+FIX = "shared/claude-fix"
+
+
+def _spawned(storage, name, seconds_ago, state="starting"):
+    """A spawn's leftovers at `name`: its state and its spawn record. Returns
+    the token the spawned client would carry (the record's stamp)."""
+    from datetime import datetime, timedelta, timezone
+
+    from agent_bus.storage import TIMESTAMP_FORMAT, SpawnRecord
+
+    when = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    stamp = when.strftime(TIMESTAMP_FORMAT)
+    storage.ensure_agent(name, REPO)
+    storage.set_state(name, state)
+    storage.record_spawn(SpawnRecord(
+        name=name, client="claude", repo_id=None, repo_path=REPO, work_dir=REPO,
+        model=None, prompt_file="/srv/code/p.txt", tmux_session="agents",
+        tmux_window="fix", remote=False, spawned_at=stamp,
+    ))
+    return stamp
+
+
+def test_the_spawned_session_claiming_with_its_token_keeps_state_and_record(
+    storage, registry, fake_procs
+):
+    token = _spawned(storage, FIX, seconds_ago=5)
+
+    name, *_ = _start(registry, fake_procs, pinned="fix", token=token)
+
+    assert name == FIX
+    assert storage.get_agent(name).state == "starting"
+    assert storage.get_spawn(name) is not None
+
+
+def test_a_late_first_claim_with_the_token_still_keeps_state_and_record(
+    storage, registry, fake_procs
+):
+    token = _spawned(storage, FIX, seconds_ago=LONG_AGO)
+
+    name, *_ = _start(registry, fake_procs, pinned="fix", token=token)
+
+    assert name == FIX
+    assert storage.get_agent(name).state == "starting"
+    assert storage.get_spawn(name).spawned_at == token
+
+
+def test_a_stranger_without_a_token_inside_the_grace_gets_no_record(
+    storage, registry, fake_procs
+):
+    _spawned(storage, FIX, seconds_ago=5)
+
+    name, *_ = _start(registry, fake_procs, pinned="fix")
+
+    assert name == FIX
+    assert storage.get_agent(name).state is None
+    assert storage.get_spawn(name) is None
+
+
+def test_a_stranger_with_a_wrong_token_gets_no_record(storage, registry, fake_procs):
+    _spawned(storage, FIX, seconds_ago=5)
+
+    name, *_ = _start(registry, fake_procs, pinned="fix", token="not-the-stamp")
+
+    assert storage.get_agent(name).state is None
+    assert storage.get_spawn(name) is None
+
+
+def test_a_token_without_a_spawn_record_inherits_no_state(storage, registry, fake_procs):
+    storage.ensure_agent(FIX, REPO)
+    storage.set_state(FIX, "done")
+
+    name, *_ = _start(registry, fake_procs, pinned="fix", token="left-over")
+
+    assert storage.get_agent(name).state is None
+
+
+def test_a_new_holder_of_an_old_finished_spawn_inherits_nothing(
+    storage, registry, fake_procs
+):
+    _spawned(storage, FIX, seconds_ago=LONG_AGO, state="done")
+
+    name, *_ = _start(registry, fake_procs, pinned="fix")
+
+    assert storage.get_agent(name).state is None
+    assert storage.get_spawn(name) is None
+
+
+def test_a_reconnect_of_the_spawned_session_keeps_its_state_and_spawn_record(
+    storage, registry, fake_procs
+):
+    name, server, client = _start(registry, fake_procs, pinned="fix")
+    token = _spawned(storage, name, seconds_ago=LONG_AGO, state="working")
+    fake_procs.kill(server)  # the server dies, its client lives on
+
+    again, *_ = _start(registry, fake_procs, pinned="fix", client=client, token=token)
+
+    assert again == name
+    assert storage.get_agent(again).state == "working"
+    assert storage.get_spawn(again) is not None

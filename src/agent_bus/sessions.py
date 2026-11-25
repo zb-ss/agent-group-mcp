@@ -47,7 +47,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import audit, clients, identity, procs, settings
 from .procs import Proc
-from .storage import Storage, register_in
+from .storage import STATE_STARTING, Storage, move_spawn_in, register_in
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 SESSION_COLUMNS = (
@@ -162,6 +162,45 @@ def _could_be_the_same_session(
     return key is None or row.session_key is None or row.session_key == key
 
 
+def _continues(
+    rows: list[SessionRow], name: str, client: Proc | None,
+    session_key: str | None, keyed: bool,
+) -> bool:
+    """True when a claim of `name` carries on a session that already held
+    it: an MCP server restart or reconnect of the same client. The test is
+    the one `_choose` uses for a resumed address, so the state that session
+    reported survives."""
+    for row in rows:
+        if row.name != name:
+            continue
+        same_process = client is not None and row.client_process == client
+        same_key = session_key is not None and row.session_key == session_key
+        if same_key or (not keyed and same_process):
+            return True
+    return False
+
+
+def _clear_previous_holder(
+    conn: sqlite3.Connection, name: str, spawn_token: str | None
+) -> None:
+    """A state left at this address is a previous holder's, not the new
+    session's. The one exception is the session spawn started: its claim
+    carries the token spawn stored in the spawn record (`spawned_at`), and it
+    keeps the `starting` state and the record however long it took to join
+    (a client may wait on a trust prompt). Any other claimant is a stranger:
+    the state is cleared and a spawn record it did not earn is deleted in the
+    same transaction, so `status` does not show it as spawned."""
+    row = conn.execute(
+        "SELECT spawned_at FROM spawns WHERE name = ?", (name,)
+    ).fetchone()
+    if row is not None and spawn_token is not None and row["spawned_at"] == spawn_token:
+        return
+    conn.execute(
+        "UPDATE agents SET state = NULL, state_at = NULL WHERE name = ?", (name,)
+    )
+    conn.execute("DELETE FROM spawns WHERE name = ?", (name,))
+
+
 class SessionRegistry:
     def __init__(self, storage: Storage) -> None:
         self.storage = storage
@@ -246,11 +285,16 @@ class SessionRegistry:
         lineage: list[Proc],
         session_key: str | None = None,
         pinned: str | None = None,
+        spawn_token: str | None = None,
     ) -> Claim:
         """Take a session address for the server `server` and register it.
 
         `pinned` is a handle asked for in advance. Ends the sessions of
-        this client whose servers are gone, giving up their addresses."""
+        this client whose servers are gone, giving up their addresses.
+
+        `spawn_token` is what `agent-bus spawn` put in the client's
+        environment (`AGENT_BUS_SPAWN_TOKEN`). It proves the claimant is the
+        session spawn started, so a slow start is still that session."""
         parsed = identity.parse(client_address)
         if parsed.client is None or parsed.is_session:
             raise SessionError(f"{client_address!r} is not a client address")
@@ -289,6 +333,11 @@ class SessionRegistry:
                     ),
                 )
                 register_in(conn, choice.name, repo_path, overwrite_repo=True, now=now)
+                if choice.name != client_address and not _continues(
+                    rows, choice.name, procs.client_of(lineage), session_key,
+                    clients.requires_session_key(parsed.client),
+                ):
+                    _clear_previous_holder(conn, choice.name, spawn_token)
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -535,7 +584,8 @@ class SessionRegistry:
                     (new, client_address),
                 )
                 topic = conn.execute(
-                    "SELECT topic FROM agents WHERE name = ?", (row.name,)
+                    "SELECT topic, state, state_at FROM agents WHERE name = ?",
+                    (row.name,),
                 ).fetchone()
                 register_in(conn, new, row.repo_path, overwrite_repo=True, now=now)
                 if topic is not None and topic["topic"] is not None:
@@ -543,6 +593,18 @@ class SessionRegistry:
                         "UPDATE agents SET topic = COALESCE(topic, ?) WHERE name = ?",
                         (topic["topic"], new),
                     )
+                if row.name != client_address:
+                    # the renaming session's own state wins over a stale one
+                    # a previous holder of the label left behind
+                    conn.execute(
+                        "UPDATE agents SET state = ?, state_at = ? WHERE name = ?",
+                        (
+                            topic["state"] if topic is not None else None,
+                            topic["state_at"] if topic is not None else None,
+                            new,
+                        ),
+                    )
+                    move_spawn_in(conn, row.name, new)
                 # mail at the shared client address belongs to every session
                 moved = 0 if row.name == client_address else _move_unread(conn, row.name, new)
                 _rewrite_sender(conn, row.name, new)

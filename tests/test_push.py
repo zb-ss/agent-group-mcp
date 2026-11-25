@@ -354,3 +354,41 @@ def test_a_route_from_before_a_reboot_is_dead(storage, monkeypatch):
     route = _route_from(storage, boot_id="boot-a", pid_ns="pid:[1]")
     assert not WakeRoutes(storage).alive(route)
     assert WakeRoutes(storage).covering([CODEX])[CODEX] == []
+
+
+def _numbered_codex_session(codex_session):
+    """The session `repo/codex-1`, claimed by a server of the stand-in client."""
+    from agent_bus.sessions import SessionRegistry
+
+    server, _lineage = codex_session["fake_procs"].session()
+    claim = SessionRegistry(codex_session["store"]).claim(
+        client_address=CODEX, repo_path="/repo", server=server,
+        lineage=[codex_session["client"]], session_key=THREAD,
+    )
+    return claim.name
+
+
+def test_a_push_wake_sets_the_session_working(codex_session):
+    store = codex_session["store"]
+    name = _numbered_codex_session(codex_session)
+    assert name != CODEX
+    _hook(store, stop=True)
+    store.set_state(name, "done")
+
+    store.send_message(from_agent="peer/claude", to=name, body="follow-up")
+
+    assert _pushed_args(codex_session["calls"])
+    assert store.get_agent(name).state == "working"
+
+
+def test_no_state_is_set_when_the_push_does_not_happen(codex_session, monkeypatch):
+    store = codex_session["store"]
+    name = _numbered_codex_session(codex_session)
+    monkeypatch.setenv("AGENT_BUS_WAKES_PER_HOUR", "1")
+    WakeRoutes(store).record_wake(name, DRIVER_PUSH)
+    _hook(store, stop=True)
+    store.set_state(name, "done")
+
+    store.send_message(from_agent="peer/claude", to=name, body="too many")
+
+    assert store.get_agent(name).state == "done"
