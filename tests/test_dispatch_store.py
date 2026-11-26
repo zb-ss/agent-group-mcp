@@ -265,3 +265,18 @@ def test_pending_candidates(bus_db):
     store.update("asana", "2", candidate_at=NOW, decision="ask")
     store.update("asana", "3", candidate_at=NOW, decision="skip")
     assert [r.task_id for r in store.pending_candidates()] == ["1", "2"]
+
+
+def test_triage_reads_on_an_unmigrated_database_are_empty_and_write_nothing(bus_db):
+    store = DispatchStore()
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(store.path)
+    MIGRATIONS[0].apply(conn)
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+    # no run has migrated this database yet (only dry runs, which never write)
+    assert store.pending_candidates() == []
+    assert store.list_events() == []
+    assert _version(store.path) == 1

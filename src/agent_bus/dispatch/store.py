@@ -128,6 +128,8 @@ MIGRATIONS = (
     Migration(3, "start commit column", _add_start_commit),
     Migration(4, "triage, routing and decision log", _add_m2),
 )
+# The step that adds the triage columns and the decision log.
+TRIAGE_STEP = next(m.step for m in MIGRATIONS if m.apply is _add_m2)
 
 _UPDATABLE = frozenset(
     {
@@ -169,6 +171,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+def _has_triage(conn: sqlite3.Connection) -> bool:
+    """Whether the triage columns and the decision log exist yet. A read never
+    migrates (dry runs and status must not write); a database no run has
+    migrated cannot hold candidates or decisions."""
+    return conn.execute("PRAGMA user_version").fetchone()[0] >= TRIAGE_STEP
 
 
 @dataclass(frozen=True)
@@ -284,6 +293,8 @@ class DispatchStore:
         if not self.path.exists():
             return []
         with self.connect() as conn:
+            if not _has_triage(conn):
+                return []
             rows = conn.execute(
                 "SELECT * FROM tasks WHERE candidate_at IS NOT NULL "
                 "AND (decision IS NULL OR decision = 'ask') "
@@ -305,6 +316,8 @@ class DispatchStore:
             query += " LIMIT ?"
             params.append(int(limit))
         with self.connect() as conn:
+            if not _has_triage(conn):
+                return []
             rows = conn.execute(query, params).fetchall()
         events = []
         for row in reversed(rows):
