@@ -7,26 +7,18 @@ to the bus except `actor_for`, which only reads the authority table.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
 
-from .. import authority, repo_identity, resolution, status
+from .. import repo_identity, resolution, status
 from . import runner, settings, store as store_mod
+from .actor import ACTOR_CLI, ACTOR_DISPATCHER, actor_for  # noqa: F401
 from .model import clean_text, clean_untrusted
 from .store import DispatchStore, TaskRecord
-
-ACTOR_DISPATCHER = "dispatcher"
-ACTOR_CLI = "cli"
 
 _SPAWNING = ("start", "resume")
 
 
 class DecisionError(Exception):
     """A decision or approval the rules refuse."""
-
-
-def actor_for(storage: Any, env: Mapping[str, str]) -> str:
-    role = storage.authority_role(env.get(resolution.AUTHORITY_TOKEN_ENV))
-    return ACTOR_DISPATCHER if role == authority.ROLE_DISPATCHER else ACTOR_CLI
 
 
 def find(store: DispatchStore, task_id: str, source: str | None = None) -> TaskRecord:
@@ -138,6 +130,7 @@ def decide(
     repo: str | None = None,
     client: str | None = None,
     model: str | None = None,
+    clone: bool = False,
     now: str,
     actor: str,
     rows: list | None = None,
@@ -154,8 +147,10 @@ def decide(
     if action not in settings.DECISIONS:
         raise DecisionError(f"unknown action {action!r}; use one of {', '.join(settings.DECISIONS)}")
     if action not in _SPAWNING:
-        if repo is not None or client is not None or model is not None:
-            raise DecisionError("--repo, --client and --model only apply to start and resume")
+        if repo is not None or client is not None or model is not None or clone:
+            raise DecisionError(
+                "--repo, --client, --model and --clone only apply to start and resume"
+            )
         decision_repo = None
     else:
         decision_repo = _chosen_repo(record, cfg, repo)
@@ -167,13 +162,14 @@ def decide(
         record.source, record.task_id,
         decision=action, decision_at=now, decision_reason=stored_reason,
         decision_repo=decision_repo, decision_client=client, decision_model=model,
+        decision_clone="1" if clone else None,
     )
     store.log_event(
         at=now, event=store_mod.EVENT_DECIDE, actor=actor,
         source=record.source, task_id=record.task_id,
         detail={
             "action": action, "reason": stored_reason, "repo": decision_repo,
-            "client": client, "model": model,
+            "client": client, "model": model, "clone": clone,
         },
     )
     return updated

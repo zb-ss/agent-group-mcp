@@ -288,7 +288,9 @@ Bus schema step 7 adds `messages.authority`, `spawns.role` and the
 earlier step upgrades with all rows intact. The dispatch database
 (`dispatch.db`) has its own steps; step 4 adds the task columns for the
 client of a session, the triage hand-off and the decision, and the
-`decision_log` table.
+`decision_log` table. Step 5 adds the `source_state`, `message_items`,
+`drafts` and `incidents` tables and the `tasks.decision_clone` column; reads
+of a database at an older step return nothing and never migrate it.
 
 A change older versions could not survive would bump the schema *epoch*,
 which they refuse with a message to upgrade.
@@ -425,7 +427,7 @@ agent-bus tail --json | jq '.[] | select(.op=="send")'
 Task dispatch has its own commands, described in
 [Dispatching tasks](#dispatching-tasks-agent-bus-dispatch):
 `dispatch run`, `dispatch status`, `dispatch approve`, `dispatch candidates`,
-`dispatch decide`, `dispatch decisions`, `dispatch install-timer` and
+`dispatch decide`, `dispatch drafts`, `dispatch decisions`, `dispatch install-timer` and
 `dispatch uninstall-timer`. The always-on dispatcher session has
 `dispatcher start|stop|status`, and `agent-bus resume` reopens an ended
 spawned session.
@@ -950,7 +952,9 @@ agent-bus status
   exits 1.
 - **Missing clone.** A repo that is not on this machine is cloned only
   with `--clone`, into `repos.clone_root`. Without it, spawn exits 1 and
-  prints the `git clone -- <url> <dir>` command. The clone runs as
+  prints the `git clone -- <url> <dir>` command. When a clone exists but is
+  in a folder spawn does not scan, the message also suggests adding that
+  folder to `repos.roots`. The clone runs as
   `git clone -- <url> <temporary sibling>` and the folder is renamed into
   place only when git succeeds, so a failed or timed-out clone leaves
   nothing behind. A folder that already exists at the destination is reused
@@ -1101,19 +1105,13 @@ stops `spawn` with an error naming it; `status` warns and carries on.
     "title_max_chars": 120,
     "overlap_max_items": 10,
     "fetch_timeout_seconds": 120,
-    "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify", "needs_approval", "worktree_removed"],
+    "schedule_tolerance_seconds": 30,
+    "message_retention_days": 30,
+    "drafts": {"sending_stale_minutes": 30},
+    "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify", "needs_approval", "worktree_removed", "message", "draft_ready", "needs_owner", "incident_opened", "incident_closed", "incident_report"],
     "dispatcher": {"client": "claude", "model": null, "label": "dispatcher", "group": "dispatcher", "dir": null, "playbook": "dispatcher", "remote": true, "keep_alive": false},
     "triage": {"enabled": true, "fallback_after_minutes": 60},
-    "routing": {
-      "enabled": false,
-      "clients": {
-        "claude": {"weight": 3, "types": {}, "per_complexity": 1, "models": []},
-        "codex": {"weight": 2, "types": {}, "per_complexity": 0, "models": []},
-        "agy": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}
-      },
-      "complexity": {"max": 5, "signals": []},
-      "overrides": []
-    },
+    "routing": {"enabled": false, "clients": {"claude": {"weight": 3, "types": {}, "per_complexity": 1, "models": []}, "codex": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}, "agy": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}}, "complexity": {"max": 5, "signals": []}, "overrides": []},
     "decision_model": {"enabled": false, "mode": "shadow", "endpoint": "http://localhost:11434/v1/systemone", "allow_remote": false, "model": null, "timeout_seconds": 20, "max_state_chars": 2000},
     "defaults": {"client": "claude", "model": null, "worktree": null, "fetch": false, "clone": false, "remote": true},
     "types": {
@@ -1127,14 +1125,29 @@ stops `spawn` with an error naming it; `status` warns and carries on.
       {"type": "implementation", "section": ["(?i)^(to ?do|ready|in progress)"]}
     ],
     "sources": {
-      "asana": {"enabled": false, "base_url": "https://app.asana.com/api/1.0", "token_env": "ASANA_TOKEN", "workspace": null, "lookahead_days": 0, "page_size": 100, "max_pages": 10, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "ignore_own_comments": true, "comment_authors": [], "unmapped_repos": [], "projects": {}}
+      "asana": {"enabled": false, "base_url": "https://app.asana.com/api/1.0", "token_env": "ASANA_TOKEN", "workspace": null, "lookahead_days": 0, "page_size": 100, "max_pages": 10, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "ignore_own_comments": true, "comment_authors": [], "unmapped_repos": [], "projects": {}, "schedule": null},
+      "slack": {"type": "slack", "enabled": false, "base_url": "https://slack.com/api", "token_env": "AGENT_BUS_SLACK_TOKEN", "owner_id": null, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "min_interval_seconds": 1.2, "max_calls_per_run": 40, "page_size": 200, "max_pages": 3, "initial_lookback_minutes": 0, "thread_lookback_hours": 24, "max_text_chars": 4000,
+        "schedule": {"interval_minutes": 15, "hours": "working"},
+        "mentions": {"enabled": true, "action": "draft", "use_search": true, "search_query": "<@{owner_id}>", "include_direct_messages": false, "conversation_types": ["public_channel", "private_channel", "mpim", "im"], "exclude_channels": [], "conversations_refresh_minutes": 720},
+        "channels": {}},
+      "maildir": {"type": "maildir", "enabled": false, "root": null, "folders": ["INBOX"], "drafts_folder": "Drafts", "address": null, "skip_bulk": true, "initial_lookback_minutes": 0, "max_items_per_run": 50, "max_body_chars": 4000, "link_template": null,
+        "schedule": {"interval_minutes": 15, "hours": "working"}, "default_action": "draft", "rules": []}
     },
     "notifiers": {
       "log": {"file": null},
       "macos": {"enabled": true, "osascript_bin": "osascript", "title": "agent-bus", "timeout_seconds": 10},
       "email": {"enabled": false, "host": null, "port": 465, "security": "tls", "username": null, "password_env": null, "from": null, "to": [], "subject_prefix": "[agent-bus]", "timeout_seconds": 30}
     },
-    "timer": {"name": "agent-bus-dispatch", "interval_minutes": 15, "command": ["{agent_bus_bin}", "dispatch", "run"], "environment": {}, "output_file": null, "launchctl_bin": "launchctl", "systemctl_bin": "systemctl", "timeout_seconds": 30}
+    "timer": {"name": "agent-bus-dispatch", "interval_minutes": 15, "command": ["{agent_bus_bin}", "dispatch", "run"], "environment": {}, "output_file": null, "launchctl_bin": "launchctl", "systemctl_bin": "systemctl", "timeout_seconds": 30, "always": false},
+    "scanner": {"enabled": false, "client": "opencode", "model": null, "playbook": "scanner", "batch_size": 10, "max_batches_per_run": 3, "max_item_chars": 4000, "max_draft_chars": 2000, "max_question_chars": 500, "timeout_seconds": 300, "dir": null,
+      "clients": {
+        "opencode": {"command": ["opencode", "run", "--file", "{prompt_file}", "{instruction}", "--standalone", "--agent", "scanner"],
+          "instruction": "Follow the instructions in the attached file exactly. Answer with one JSON object and nothing else.",
+          "pass_env": ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"],
+          "env": {"OPENCODE_CONFIG_CONTENT": {"permissions": [{"action": "*", "resource": "*", "effect": "deny"}],
+            "agents": {"scanner": {"permissions": [{"action": "*", "resource": "*", "effect": "deny"}]}}}},
+          "model_env": {"OPENCODE_CONFIG_CONTENT": {"model": "{model}"}}}}},
+    "incident": {"client": "claude", "model": null, "group": "ops", "dir": null, "label_prefix": "incident", "remote": true, "max_spawns_per_hour": 2, "max_running": 2, "max_open_hours": 24, "max_alert_chars": 1000, "max_report_chars": 3000, "max_key_chars": 200, "max_name_chars": 120, "max_time_chars": 60, "max_url_chars": 500, "tools_hint": "the server-management tools available in this session"}
   }
 }
 ```
@@ -1317,6 +1330,11 @@ process or session id) keeps the state it reported, `done` included; the
 Asana), classifies each task with fixed rules from `config.json`, and
 either starts a session for it with `agent-bus spawn` or only notifies you.
 It is meant to run from a timer, and it is off until you enable a source.
+Beside task sources it can read message sources (Slack, a local Maildir),
+triage new messages with a read-only scanner, keep reply drafts for your
+review and start an incident session for a monitoring alert; see
+[Message sources](#message-sources) and the sections after it. All of that
+is off by default.
 
 It works in one of two modes:
 
@@ -1349,7 +1367,12 @@ agent-bus dispatch run [--dry-run] [--json] [--ignore-hours]
 agent-bus dispatch status [--json]
 agent-bus dispatch approve <task-id>
 agent-bus dispatch candidates [--json]
-agent-bus dispatch decide <task-id> --action start|resume|skip|ask [--source S] [--reason TEXT] [--repo REPO] [--client C] [--model M]
+agent-bus dispatch decide <task-id> --action start|resume|skip|ask [--source S] [--reason TEXT] [--repo REPO] [--client C] [--model M] [--clone]
+agent-bus dispatch drafts list [--all] [--json]
+agent-bus dispatch drafts show <id> [--json]
+agent-bus dispatch drafts edit <id> --file FILE
+agent-bus dispatch drafts approve <id> [--yes]
+agent-bus dispatch drafts discard <id>
 agent-bus dispatch decisions [--json] [--event EVENT] [--limit N]
 agent-bus dispatch install-timer [--load] [--bin-path PATH]
 agent-bus dispatch uninstall-timer [--unload] [--bin-path PATH]
@@ -1419,7 +1442,10 @@ An invalid value makes the config fail to load, naming the dotted key.
 | `title_max_chars` | Cap on task text copied into a prompt (`120`) |
 | `overlap_max_items` | Cap on the list of other in-flight or handled tasks of the same project (`10`) |
 | `fetch_timeout_seconds` | Timeout for `git fetch` before a spawn (`120`) |
-| `notify_on` | Which events notify: `waiting`, `done`, `ended`, `spawn_failed`, `notify`, `needs_approval`, `worktree_removed` (all seven). A config that sets `notify_on` itself must list `needs_approval` and `worktree_removed` to get those alerts |
+| `notify_on` | Which events notify: `waiting`, `done`, `ended`, `spawn_failed`, `notify`, `needs_approval`, `worktree_removed`, and the message events `message`, `draft_ready`, `needs_owner`, `incident_opened`, `incident_closed`, `incident_report` (all thirteen). A config that sets `notify_on` itself must list every event it wants, see *Alerts* |
+| `schedule_tolerance_seconds` | Slack allowed before a source counts as due, so a timer that fires a little early still runs it (`30`) |
+| `message_retention_days` | Days a seen message item is kept before a real run prunes it; items a pending or sending draft or an open incident refers to are kept (`30`) |
+| `drafts.sending_stale_minutes` | Minutes after which a draft still `sending` counts as stale, and `drafts reset` may move it back to `pending` (`30`) |
 | `dispatcher.client` | Client the dispatcher runs on, any configured `spawn.clients` entry (`claude`) |
 | `dispatcher.model` | Model for the dispatcher (`null`: the client's default) |
 | `dispatcher.label` / `group` | Label and group of its bus address `<group>/<client>-<label>` (`dispatcher`, `dispatcher`) |
@@ -1457,16 +1483,19 @@ An invalid value makes the config fail to load, naming the dotted key.
 | `sources.asana.ignore_own_comments` | Comments by the token's user do not count as new comments (`true`) |
 | `sources.asana.comment_authors` | Allowlist of user gids (digit strings). When non-empty, only comments by these users count as new comments; empty (`[]`) means any author. Recommended for unattended setups: otherwise anyone who can comment on a task can start a follow-up session |
 | `sources.asana.unmapped_repos` | Repo patterns for tasks of projects not in `projects`; non-empty and a running dispatcher make such tasks candidates (`[]`: they are dropped) |
+| `sources.asana.schedule` | `null` (every run, inside `working_hours`) or `{interval_minutes, hours}`, see *Schedules* (`null`) |
 | `sources.asana.projects` | Project id to repo: a string, or an object with `repo` and optional `client`, `model`, `worktree`, `fetch`, `clone`, `remote`, `playbooks` |
 | `notifiers.log.file` | Log file (`dispatch.log` beside the database) |
 | `notifiers.macos.*` | `enabled`, `osascript_bin`, `title`, `timeout_seconds` |
 | `notifiers.email.*` | `enabled` (`false`), `host`, `port` (`465`), `security`, `username`, `password_env`, `from`, `to`, `subject_prefix`, `timeout_seconds` |
 | `timer.name` | Name of the launchd job or systemd unit (`agent-bus-dispatch`) |
 | `timer.interval_minutes` | Minutes between runs (`15`) |
+| `timer.always` | Fire every `interval_minutes` all week instead of on the working-hours slots, for 24/7 alert polling (`false`), see *Schedules* |
 | `timer.command` | Command the timer runs; `{agent_bus_bin}` is the resolved binary |
 | `timer.environment` | Extra environment variables written into the unit (`{}`) |
 | `timer.output_file` | Timer stdout/stderr file (`dispatch-timer.log` beside the database) |
 | `timer.launchctl_bin` / `systemctl_bin` / `timeout_seconds` | Binaries and timeout used by `--load` and `--unload` |
+| `sources.<name>.*`, `scanner.*`, `incident.*` | Message sources, the scanner and incident sessions: one table each in *Slack*, *Email (Maildir)*, *Scanner* and *Incidents* |
 
 ### Rules, types and actions
 
@@ -1693,7 +1722,7 @@ reads another process's environment or edits the database files.
 
 ```bash
 agent-bus dispatch candidates [--json]
-agent-bus dispatch decide TASK_ID --action start|resume|skip|ask [--source S] [--reason TEXT] [--repo REPO] [--client C] [--model M]
+agent-bus dispatch decide TASK_ID --action start|resume|skip|ask [--source S] [--reason TEXT] [--repo REPO] [--client C] [--model M] [--clone]
 agent-bus dispatch decisions [--json] [--event EVENT] [--limit N]
 ```
 
@@ -1709,8 +1738,10 @@ ready for work, and tasks of unmapped projects (below).
   message or resume as in *Follow-ups*, `skip` marks the task handled with
   the `--reason`, and `ask` keeps it pending (the dispatcher asks you).
   `--client` and `--model` (which needs `--client`) win over routing.
-  `--repo` names the repo of a task from an unmapped project. The next run
-  carries the decision out.
+  `--repo` names the repo of a task from an unmapped project. `--clone`
+  (with `start` or `resume`) lets the next spawn clone the repository when no
+  local clone exists, as `spawn --clone` does. The next run carries the
+  decision out.
 - `decisions` shows the decision log: candidates, decisions, approvals,
   executions and routing records. `--event` filters, `--limit` keeps the
   newest rows.
@@ -1788,6 +1819,398 @@ the model (for example `example-decision-model`).
   The endpoint must be on the local machine unless `allow_remote` is true,
   and a remote endpoint must use `https://`.
 - Review with `agent-bus dispatch decisions --event routing`.
+
+### Message sources
+
+Beside the task source, `dispatch.sources` can hold message sources: streams
+of chat messages or mail rather than tasks. Two types ship, `slack` and
+`maildir`. Every source is an instance with a `type`; the type defaults to
+the key, so `sources.slack` is a Slack source. A second instance names its
+type:
+
+```json
+{"dispatch": {"sources": {"slack-alerts": {"type": "slack", "enabled": true, "token_env": "AGENT_BUS_SLACK_ALERTS_TOKEN"}}}}
+```
+
+An instance whose name differs from its type starts from the packaged
+defaults of that type, not from your edits to the first instance. Each
+instance has its own cursor, schedule, rules and dedupe. Everything is off
+by default: with only Asana enabled a run behaves as before.
+
+A run fetches each due message source read-only, remembers its position (a
+cursor in `dispatch.db`), skips any message it has already seen, and applies
+the rules of the source to each new one. A rule's action is one of:
+
+- `ignore`: nothing happens.
+- `notify`: a thin alert (see *Alerts*).
+- `draft`: the scanner reads the message and may prepare a reply draft for your review (see *Scanner* and *Drafts*). Without an enabled scanner nothing is drafted: each such message gives you a thin `needs_owner` alert instead.
+- `respond` (Slack only): start an incident session with a named playbook (see *Incidents*).
+
+`run --dry-run` fetches, matches and reports with `would_*` results but
+advances no cursor and writes no item, draft or incident; it sends no alert,
+starts no session or scanner process and posts and writes nothing.
+
+`dispatch.message_retention_days` (default `30`) bounds how long the record
+of seen messages is kept: at the end of a real run (never a dry run), items
+older than that are pruned, except those a pending or sending draft or an
+open incident still refers to.
+
+### Schedules
+
+Each source has `schedule`: `{"interval_minutes": 15, "hours": "working"}`.
+`hours` is `working` (the days and times of `dispatch.working_hours`),
+`always`, or a window object of the same shape as `working_hours`
+(`{"days": [...], "start": "08:00", "end": "20:00"}`). A source is fetched
+only when its last run is at least `interval_minutes` ago (less
+`dispatch.schedule_tolerance_seconds`) and the hours allow it.
+`sources.asana.schedule` is `null` by default, meaning every run inside
+`working_hours`; set it to give tasks their own cadence.
+
+The task pipeline (spawns, notifications, cleanup, candidates) always stays
+inside `dispatch.working_hours`. A run outside those hours still fetches the
+message sources whose schedule says `always` or a window containing now.
+
+To poll alert channels around the clock, set `dispatch.timer.always` to
+`true` and `timer.interval_minutes` to a short value (for example `5`); the
+timer then fires every interval all week and each source's own schedule
+decides what is fetched. Run `agent-bus dispatch install-timer` again after
+changing `timer.always` or `timer.interval_minutes`; the units on disk are
+not rewritten otherwise. With `always` false the units are the
+working-hours units as before.
+
+Rules, incidents and tasks run under the run lock. Scanner batches run
+afterwards under a separate lock, so a slow model never delays alert polling.
+
+### Slack
+
+A Slack source reads with a user token (`xoxp-...`) through the Web API,
+using only the standard library. Put the token in the environment variable
+named by `token_env` (default `AGENT_BUS_SLACK_TOKEN`), for timer runs in
+the file named by `dispatch.env_file`. The value is never written to the
+config, store, log, prompts or the scanner's environment, and errors name
+the variable only.
+
+```json
+{
+  "dispatch": {
+    "env_file": "~/.claude-agent-bus/dispatch.env",
+    "sources": {
+      "slack": {
+        "enabled": true,
+        "owner_id": "U0000000001",
+        "schedule": {"interval_minutes": 15, "hours": "working"},
+        "mentions": {"action": "draft", "include_direct_messages": false},
+        "channels": {
+          "C0000000001": {
+            "rules": [
+              {
+                "name": "infra-critical",
+                "bot_ids": ["B0000000001"],
+                "mention": ["channel"],
+                "lifecycle": {"repeat": ["STILL OPEN"], "close": ["RESOLVED"], "key": "alert (\\w+)"},
+                "action": "respond",
+                "playbook": "incident"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Scopes the token needs: the history scopes of the conversations you read
+(`channels:history`, `groups:history`, `im:history`, `mpim:history`), the
+matching read scopes for `users.conversations` (`channels:read`,
+`groups:read`, `im:read`, `mpim:read`), `chat:write` to post a reply on
+approval, and `search:read` for the search path below.
+
+**Mentions of you, anywhere.** `mentions.enabled` (default on) keeps
+messages that mention `owner_id`:
+
+- When `mentions.use_search` is true and the `x-oauth-scopes` header of `auth.test` lists `search:read`, one `search.messages` query (`mentions.search_query`, default `<@{owner_id}>`) finds them in every conversation.
+- Otherwise the source scans the conversations you are a member of (`users.conversations`, filtered by `mentions.conversation_types` and `mentions.exclude_channels`, refreshed every `mentions.conversations_refresh_minutes`) with `conversations.history` since the cursor, and looks at thread replies of messages up to `thread_lookback_hours` old. Threads older than that are not scanned.
+- `mentions.include_direct_messages` (default `false`): when true, a message from someone else in a direct-message conversation with you counts as a mention even without `<@id>`.
+- `mentions.action` is `ignore`, `notify` or `draft` (default `draft`).
+
+When one member conversation fails during the scan for a reason other than
+membership (a missing scope, `access_denied`, a rate limit after the retry, a
+network error), the scan stops there but keeps everything read so far and
+advances those cursors. The failing conversation is checked last on the next
+run, and the run reports `<source>: conversations.history failed for <id>:
+<code>` with no message text. A conversation you left, lost or that was
+archived is dropped until the next conversations refresh and reported once
+per refresh. A failure before any conversation is read (`auth.test`,
+`users.conversations`) fails the source for that run.
+
+**Rate limits.** Calls are paced by `min_interval_seconds` and capped per run
+by `max_calls_per_run`. A `429` or `ratelimited` answer waits `Retry-After`
+(at most `max_retry_wait_seconds`) and retries once. Redirects are never
+followed.
+
+**Channel rules.** `channels.<channel id>.rules` is an ordered list; the first
+rule that matches a message wins. Channels with rules are read in addition
+to your mentions.
+
+| Rule key | Meaning |
+| --- | --- |
+| `name` | Required, unique in the list; lowercase letters, digits, dashes |
+| `action` | `ignore`, `notify`, `draft` or `respond` (required) |
+| `bot_ids` / `user_ids` | Match the author: a bot message with one of these bot ids, or a user message with one of these user ids |
+| `text` | Regular expressions; the message text must match one |
+| `mention` | Any of `owner`, `channel`, `here`: the message must contain that mention (`<!channel>`, `<!here>`) |
+| `thread` | `any` (default), `top` (top-level messages only) or `reply` |
+| `playbook` | Playbook name; required for `respond`, not allowed otherwise |
+| `lifecycle` | `open`, `repeat`, `close` (lists of regular expressions) and `key` (a regular expression; its first group, or the whole match, names the incident). Only with `notify` or `respond` |
+| `auto_post_report` | `respond` only: post the incident report as a thread reply without review (default `false`) |
+
+**Lifecycle.** With a `lifecycle` the rule follows one problem through
+open, repeat and close. A message matching `close` closes it, one matching
+`repeat` changes nothing, and one that meets the rule's other conditions
+(and `open`, when set) opens it. One incident exists per key
+(`<source>:<channel>:<rule>:<key text>`): a repeat, or a second open for a
+key that is open, starts nothing. A close message counts only when the
+rule's own author conditions (`bot_ids` or `user_ids`) match it, so a person
+quoting the word in the channel cannot close an incident. The example above
+starts one incident for a critical alert of the bot that mentions
+`<!channel>`, ignores its `STILL OPEN` reminders and closes on `RESOLVED`.
+Put real channel, bot and user ids only in your private config.
+
+A `respond` rule, and any rule whose `lifecycle` has a `close` pattern, must
+set `bot_ids` or `user_ids`; the config is refused otherwise. Without an
+author condition any member of the channel could start or close an incident
+session by posting the pattern. Open and close go through the same rule, so
+the close message must come from the same author as the alert.
+
+### Email (Maildir)
+
+The `maildir` source reads mail that a sync tool such as `mbsync` already
+placed in a local Maildir. Reading never changes the mailbox: nothing is
+moved, flagged or deleted. agent-bus does not fetch mail itself; run the
+sync tool on its own schedule, at least as often as the source's schedule.
+
+```json
+{
+  "dispatch": {
+    "sources": {
+      "maildir": {
+        "enabled": true,
+        "root": "~/Maildir/work",
+        "folders": ["INBOX"],
+        "drafts_folder": "Drafts",
+        "address": "me@example.com",
+        "rules": [
+          {"name": "important-sender", "from": ["^alice@example\\.com$"], "action": "draft"},
+          {"name": "newsletters", "subject": ["(?i)newsletter"], "action": "ignore"}
+        ]
+      }
+    }
+  }
+}
+```
+
+| Key | Meaning (default) |
+| --- | --- |
+| `root` | The Maildir root, required when enabled (`null`) |
+| `folders` | Folders under `root` to read (`["INBOX"]`) |
+| `drafts_folder` | Folder under `root` that receives approved drafts (`Drafts`; `null` turns delivery off) |
+| `address` | Your address: mail from it is skipped, and it is the `From` of a draft; required to place drafts (`null`) |
+| `skip_bulk` | Skip mail with bulk or list headers (`true`) |
+| `initial_lookback_minutes` | On the first run, how far back to read; `0` starts from now (`0`) |
+| `max_items_per_run` / `max_body_chars` | Bounds per run and per message body (`50`, `4000`) |
+| `link_template` | `https://` link with `{message_id}`, used in alerts; without it an alert has no link (`null`) |
+| `default_action` | Action when no rule matches: `ignore`, `notify` or `draft` (`draft`) |
+| `rules` | Ordered rules with `name`, `action`, and any of `from` (patterns on the sender address), `folder` (list of folder names), `subject` and `text` (patterns) |
+
+Email rules cannot use `respond`: mail never starts a session. An approved
+email draft is written as a new message with the Draft flag in
+`drafts_folder`; you open it in your mail client and send it yourself. With
+`mbsync` the Drafts folder must belong to a channel that pushes local
+changes to the server, or the draft stays local. agent-bus never sends mail
+and the email path does not use SMTP.
+
+### Scanner
+
+The scanner triages new messages whose rule says `draft`. It is off by
+default (`dispatch.scanner.enabled`). Per batch it runs one non-interactive
+client process, by default `opencode run`, that reads up to `batch_size`
+messages and returns one verdict per message:
+
+- `ignore`: nothing happens.
+- `reply`: a draft reply is stored, pending your review, and you get a thin alert.
+- `owner`: it needs you personally; thin alert.
+- `escalate`: the scanner needs information. Its question goes to the running dispatcher over the bus as a message marked as untrusted data; when no dispatcher runs you get a thin alert instead.
+
+The answer is validated against a schema (known item ids, known verdicts,
+bounded text) before anything is stored. A malformed answer is retried once;
+after that it is logged as a `scan` event and the items are marked
+`scan_failed`.
+
+| Key | Meaning (default) |
+| --- | --- |
+| `enabled` | Turn the scanner on (`false`) |
+| `client` | Entry of `scanner.clients` to run (`opencode`) |
+| `model` | Model name for the client, filled in through its `model_env` (`null`: the client's own default) |
+| `playbook` | Prompt template (`scanner`; override in `templates_dir`) |
+| `batch_size` / `max_batches_per_run` | Messages per client run, and runs per scan (`10`, `3`) |
+| `max_item_chars` / `max_draft_chars` / `max_question_chars` | Caps on a message in the prompt, a draft, a question (`4000`, `2000`, `500`) |
+| `timeout_seconds` | Time allowed per client run (`300`) |
+| `dir` | Scratch folder (`null`: `dispatch-scanner` beside the database) |
+| `clients.<name>.command` | Argument list; `{prompt_file}` and `{instruction}` are replaced |
+| `clients.<name>.instruction` | Short fixed instruction passed on the command line |
+| `clients.<name>.pass_env` | The only variables the client process inherits |
+| `clients.<name>.env` | Extra variables, here the OpenCode permission block (objects are written as JSON) |
+| `clients.<name>.model_env` | Variables set when `scanner.model` is set; `{model}` is replaced |
+
+Choose the model with `dispatch.scanner.model`, for example a local Ollama
+model in OpenCode's `provider/model` form. It is written into
+`OPENCODE_CONFIG_CONTENT` through `model_env`, the same mechanism `spawn`
+uses; no model id is built into the code.
+
+**Read-only by construction.** The client runs in an empty scratch folder
+with an environment reduced to `pass_env` (so it never sees your tokens),
+with a permission block that denies every action, for the run and for the
+named `scanner` agent, and never with `--auto`. The message text reaches it
+only inside the untrusted-data block of a prompt file created `0600`, never
+on the command line. It has no tools to run commands, edit files or call
+server tools; when it needs information it answers `escalate`.
+
+The packaged defaults were written against OpenCode 2.4.1 (its `run`
+flags `--file`, `--agent`, `--standalone` and `--auto` exist as used here).
+A canary run with these defaults (the permission block, `--agent scanner`, an
+environment limited to `PATH` and `HOME`, a cloud-hosted model through
+Ollama) asked to run a shell command and write a file: the model answered
+that it had no shell tool and the file was not created. The same run showed
+that OpenCode still offers a skill loader to the agent; it cannot run
+commands, and the scanner's output is validated before anything is stored
+regardless.
+For another major version, check `opencode run --help` for the flags in
+`clients.opencode.command` and OpenCode's documented permission
+configuration, and run a canary (a prompt asking the scanner to run a shell
+command) to confirm that the request is refused before you enable it.
+
+**Why `--standalone` and `--agent scanner`.** The OpenCode background
+service, which `opencode run` attaches to by default, was started with its own
+environment and ignores the `OPENCODE_CONFIG_CONTENT` of a later launch, so
+the deny-all permission block would not apply. `--standalone` runs a private
+server that reads it. The block denies everything both globally and for a
+dedicated `scanner` agent, and the command selects that agent: in OpenCode an
+agent-level allow rule (for example one in your own OpenCode config for the
+default agent) wins over a global deny, so a global deny alone is not enough.
+Keep both flags in a custom `command`.
+
+`agent-bus dispatch scanner check` runs that canary for you with the
+configured scanner, in its scratch folder: the prompt asks for a shell
+command, a file write and a tool call, then for the verdict JSON. It prints
+`scanner check passed` when the run exits cleanly, its output parses and no
+file was created, and exits 1 with the failed category otherwise. Run it after
+upgrading OpenCode.
+
+Another client can be configured as `scanner.clients.<name>`: give it a
+`command` that runs once and non-interactively, prints one JSON object, and
+has no way to use tools; pass it only the variables it needs and set
+`scanner.client` to its name. The verdict schema in the `scanner` playbook
+is the contract.
+
+### Drafts
+
+Drafts live in `dispatch.db`. Each has an id, a source, a rule, the target
+(a Slack thread, or the address, subject and message references of an email)
+and the text, which is untrusted model output.
+
+```bash
+agent-bus dispatch drafts list [--all] [--json]
+agent-bus dispatch drafts show <id> [--json]
+agent-bus dispatch drafts edit <id> --file FILE      # - reads stdin
+agent-bus dispatch drafts approve <id>
+agent-bus dispatch drafts discard <id>
+agent-bus dispatch drafts reset <id>      # a draft stuck in sending goes back to pending
+agent-bus dispatch incidents list [--all] [--json]
+agent-bus dispatch incidents close <id>   # close_reason manual; tells a live session
+```
+
+`incidents close` and `drafts reset` are allowed for the same actors as `drafts approve`. `drafts approve` from your own shell needs an interactive terminal: it prints the
+target (kind, Slack channel or mailbox folder, link, character count, never the
+text) and waits for a typed `yes`. `--yes` skips the prompt but is accepted only
+for the verified dispatcher; from a shell it is refused.
+
+`list` and `show` work anywhere. `edit`, `approve` and `discard` succeed
+only for the verified dispatcher (from its session) or from a shell that is
+not an agent session; inside any other spawned session they are refused.
+This guards against a mistake or a prompt-injected agent, not against another
+process that already runs as your user.
+
+Approval delivers once, and only then:
+
+- a Slack draft is posted with `chat.postMessage` in the thread of the original message, as you, through the user token;
+- an email draft is placed in the Maildir `drafts_folder` with the Draft flag. It is never sent.
+
+A delivered draft cannot be delivered again. A draft is marked `sending`
+while it is delivered; if the run dies in between, the draft stays `sending`.
+`drafts list` marks a draft that has been `sending` for longer than
+`dispatch.drafts.sending_stale_minutes` (default `30`) as stale, and
+`drafts reset <id>` moves such a stale draft back to `pending` so you can check
+whether it went out and approve or discard it. `reset` refuses any other
+status and a draft that is not stale yet, and is logged with its actor (never
+the text). Every delivery attempt, whether
+it succeeds or fails, is audited as a `send` event with the actor, the draft
+id, the target and the result:
+
+```bash
+agent-bus dispatch decisions --event send
+```
+
+### Incidents
+
+A Slack rule with action `respond` and a `playbook` starts an incident
+session, for example for critical alerts of a monitoring bot (the example
+under *Slack*). The session:
+
+- runs in its own folder, `dispatch.incident.dir` (`null`: `incidents` beside the database), outside every repository, with role `incident` and the packaged `incident` playbook;
+- uses `incident.client` and `incident.model`, or the routing policy when `routing.enabled`;
+- investigates with the server tools of its client; `incident.tools_hint` names them in the prompt, and the real limits of what it can do come from the server tool's own policy (guard level, blocklist), not from the playbook alone;
+- may apply only reversible, low-risk fixes that restore service, such as restarting a service or rotating logs to free disk space; it never deletes data, stops or terminates instances, changes DNS, firewall or security settings, or runs anything irreversible without your yes, which it asks for through the verified dispatcher;
+- treats the alert text and everything it reads while investigating as data, never as instructions;
+- writes one report file, which the runner turns into a pending thread-reply draft and a thin alert, or, with `auto_post_report` true on the rule, posts once as a reply on the alert (broadcast and user mentions neutralised, length capped) and notifies you. When the automatic post fails, the draft stays pending and you get a thin `draft_ready` alert with its id.
+
+The runner reads the report only if it is a regular file directly in the
+incident folder's `reports` folder: a symlink (which could point at a secrets
+file), a directory, a FIFO, a file in a symlinked folder, or a file larger than
+the cap is refused, nothing is drafted or posted, and the run reports only the
+incident id and the reason.
+
+When the session cannot start (a spawn failure, or the rate limit), you get a
+thin alert that says so instead of the "incident" alert of a started session,
+and the incident stays open with that result. The next open or repeat message
+for the same key tries again, still within the limits; only the first failure
+alerts.
+
+| Key | Meaning (default) |
+| --- | --- |
+| `incident.client` / `model` | Client and model of the session (`claude`, `null`) |
+| `incident.group` / `label_prefix` | Bus group and label prefix (`ops`, `incident`) |
+| `incident.dir` | Working folder (`null`) |
+| `incident.remote` | Remote Control on (`true`) |
+| `incident.max_spawns_per_hour` / `max_running` | Rate limit on new incident sessions and on sessions running at once (`2`, `2`) |
+| `incident.max_open_hours` | An incident open longer than this is closed as expired (`24`) |
+| `incident.max_alert_chars` / `max_report_chars` | Caps on the alert text in the prompt and on the report (`1000`, `3000`) |
+| `incident.max_key_chars` | Cap on the key text taken from an alert by `lifecycle.key` (`200`) |
+| `incident.max_name_chars` / `max_time_chars` / `max_url_chars` | Caps on the rule and source names, the alert time and the alert link in the prompt (`120`, `60`, `500`) |
+| `incident.tools_hint` | Words naming the session's server tools in the prompt |
+
+One incident exists per alert key. A close message reaches the live session
+as a bus message and closes the incident; it never authorises a fix. To use
+your own playbook, put `incident.md` in `dispatch.templates_dir`.
+
+### Alerts
+
+Message events use the same notifiers as tasks. The events are
+`message` (a `notify` rule matched), `draft_ready`, `needs_owner`,
+`incident_opened`, `incident_closed` and `incident_report`. An alert carries
+only the source name, a state, the rule name (and the draft id) and a link.
+It never carries message text, a subject or a sender. A config that sets
+`dispatch.notify_on` itself must list these events too, or they are not sent.
 
 ### Resuming a spawned session
 
@@ -1993,7 +2416,11 @@ holding turns open.
 - All state is local, and nothing leaves your machine unless dispatch is
   enabled. Then agent-bus calls the configured task source over HTTPS
   (read-only GET requests) and, when the email notifier is on, the
-  configured SMTP server over TLS.
+  configured SMTP server over TLS. With a message source enabled it also
+  reads the Slack Web API (and writes to it only when a reply is approved or
+  an incident report is posted, see below) or a local Maildir; with the
+  scanner on, a local client process (by default OpenCode) reads batches of
+  message text, which goes to whatever model that client is configured to use.
 - The audit log records message **previews** (first 200 chars) and
   **sha256 hashes** of bodies. Treat both the DB and the audit log as
   containing message content, and back them up / protect them
@@ -2025,6 +2452,28 @@ holding turns open.
   [Authority](#authority). The dispatcher is trusted like you: run it only
   where you would run an unattended session of your own, and note that the
   authority model does not defend against another process of your OS user.
+- Message text from Slack and email is data, like task text. It reaches the
+  scanner and incident sessions only inside labelled untrusted-data blocks of
+  private prompt files, flattened and bounded, and never on a command line.
+  The scanner has no tools: an empty scratch folder, an environment limited
+  to `pass_env`, a permission block that denies every action and no `--auto`;
+  its answer is schema-validated before it is stored. Incident sessions act
+  only within the playbook's bounds (reversible, low-risk restore-service
+  fixes), and the server tool's own policy remains the hard stop.
+- Posting to Slack happens only when you or the verified dispatcher approve a
+  draft, or when a rule sets `auto_post_report` for an incident report, which
+  is posted once with broadcast and user mentions neutralised and the length
+  capped. Slack tokens and mail passwords are read only from environment
+  variables named in the config and appear in no argument list, log, error,
+  prompt, database row or scanner environment.
+- Alerts about messages are thin (source, state, rule, link), never the text.
+  Email is never a command channel: no mail starts a session or approves
+  anything, email rules cannot use `respond`, and agent-bus never sends mail;
+  an approved email draft only lands in your Drafts folder.
+- The check that `drafts edit|approve|discard` come from the dispatcher or a
+  shell outside any agent session guards against mistakes and prompt
+  injection. It is not a boundary against a process that already runs as your
+  user.
 - With the decision model enabled, task titles and repo ids are sent to its
   configured endpoint; keep that endpoint local.
 

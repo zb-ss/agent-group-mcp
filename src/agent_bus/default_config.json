@@ -56,7 +56,10 @@
     "title_max_chars": 120,
     "overlap_max_items": 10,
     "fetch_timeout_seconds": 120,
-    "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify", "needs_approval", "worktree_removed"],
+    "schedule_tolerance_seconds": 30,
+    "message_retention_days": 30,
+    "drafts": {"sending_stale_minutes": 30},
+    "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify", "needs_approval", "worktree_removed", "message", "draft_ready", "needs_owner", "incident_opened", "incident_closed", "incident_report"],
     "dispatcher": {"client": "claude", "model": null, "label": "dispatcher", "group": "dispatcher", "dir": null, "playbook": "dispatcher", "remote": true, "keep_alive": false},
     "triage": {"enabled": true, "fallback_after_minutes": 60},
     "routing": {"enabled": false, "clients": {"claude": {"weight": 3, "types": {}, "per_complexity": 1, "models": []}, "codex": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}, "agy": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}}, "complexity": {"max": 5, "signals": []}, "overrides": []},
@@ -73,13 +76,28 @@
       {"type": "implementation", "section": ["(?i)^(to ?do|ready|in progress)"]}
     ],
     "sources": {
-      "asana": {"enabled": false, "base_url": "https://app.asana.com/api/1.0", "token_env": "ASANA_TOKEN", "workspace": null, "lookahead_days": 0, "page_size": 100, "max_pages": 10, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "ignore_own_comments": true, "comment_authors": [], "unmapped_repos": [], "projects": {}}
+      "asana": {"enabled": false, "base_url": "https://app.asana.com/api/1.0", "token_env": "ASANA_TOKEN", "workspace": null, "lookahead_days": 0, "page_size": 100, "max_pages": 10, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "ignore_own_comments": true, "comment_authors": [], "unmapped_repos": [], "projects": {}, "schedule": null},
+      "slack": {"type": "slack", "enabled": false, "base_url": "https://slack.com/api", "token_env": "AGENT_BUS_SLACK_TOKEN", "owner_id": null, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "min_interval_seconds": 1.2, "max_calls_per_run": 40, "page_size": 200, "max_pages": 3, "initial_lookback_minutes": 0, "thread_lookback_hours": 24, "max_text_chars": 4000,
+        "schedule": {"interval_minutes": 15, "hours": "working"},
+        "mentions": {"enabled": true, "action": "draft", "use_search": true, "search_query": "<@{owner_id}>", "include_direct_messages": false, "conversation_types": ["public_channel", "private_channel", "mpim", "im"], "exclude_channels": [], "conversations_refresh_minutes": 720},
+        "channels": {}},
+      "maildir": {"type": "maildir", "enabled": false, "root": null, "folders": ["INBOX"], "drafts_folder": "Drafts", "address": null, "skip_bulk": true, "initial_lookback_minutes": 0, "max_items_per_run": 50, "max_body_chars": 4000, "link_template": null,
+        "schedule": {"interval_minutes": 15, "hours": "working"}, "default_action": "draft", "rules": []}
     },
     "notifiers": {
       "log": {"file": null},
       "macos": {"enabled": true, "osascript_bin": "osascript", "title": "agent-bus", "timeout_seconds": 10},
       "email": {"enabled": false, "host": null, "port": 465, "security": "tls", "username": null, "password_env": null, "from": null, "to": [], "subject_prefix": "[agent-bus]", "timeout_seconds": 30}
     },
-    "timer": {"name": "agent-bus-dispatch", "interval_minutes": 15, "command": ["{agent_bus_bin}", "dispatch", "run"], "environment": {}, "output_file": null, "launchctl_bin": "launchctl", "systemctl_bin": "systemctl", "timeout_seconds": 30}
+    "timer": {"name": "agent-bus-dispatch", "interval_minutes": 15, "command": ["{agent_bus_bin}", "dispatch", "run"], "environment": {}, "output_file": null, "launchctl_bin": "launchctl", "systemctl_bin": "systemctl", "timeout_seconds": 30, "always": false},
+    "scanner": {"enabled": false, "client": "opencode", "model": null, "playbook": "scanner", "batch_size": 10, "max_batches_per_run": 3, "max_item_chars": 4000, "max_draft_chars": 2000, "max_question_chars": 500, "timeout_seconds": 300, "dir": null,
+      "clients": {
+        "opencode": {"command": ["opencode", "run", "--file", "{prompt_file}", "{instruction}", "--standalone", "--agent", "scanner"],
+          "instruction": "Follow the instructions in the attached file exactly. Answer with one JSON object and nothing else.",
+          "pass_env": ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"],
+          "env": {"OPENCODE_CONFIG_CONTENT": {"permissions": [{"action": "*", "resource": "*", "effect": "deny"}],
+            "agents": {"scanner": {"permissions": [{"action": "*", "resource": "*", "effect": "deny"}]}}}},
+          "model_env": {"OPENCODE_CONFIG_CONTENT": {"model": "{model}"}}}}},
+    "incident": {"client": "claude", "model": null, "group": "ops", "dir": null, "label_prefix": "incident", "remote": true, "max_spawns_per_hour": 2, "max_running": 2, "max_open_hours": 24, "max_alert_chars": 1000, "max_report_chars": 3000, "max_key_chars": 200, "max_name_chars": 120, "max_time_chars": 60, "max_url_chars": 500, "tools_hint": "the server-management tools available in this session"}
   }
 }

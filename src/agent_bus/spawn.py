@@ -197,24 +197,18 @@ def _fill_leaves(node: Any, values: Mapping[str, str]) -> Any:
     return node
 
 
-def _model_env(
-    template: Mapping, values: Mapping[str, str], model: str | None, client: str | None
+def env_from_template(
+    spec: Mapping, values: Mapping[str, str], *, where: str
 ) -> dict[str, str]:
-    """The variables that carry `--model` for a client without a model flag:
-    strings are filled, objects and lists are filled leaf by leaf and sent
-    as compact JSON."""
-    spec = template.get("model_env")
-    if model is None or not spec:
-        return {}
-    if not isinstance(spec, dict):
-        raise ConfigError(f"spawn.clients.{client or '?'}.model_env must be an object")
+    """Environment variables from a config template: strings are filled,
+    objects and lists are filled leaf by leaf and sent as compact JSON."""
     out: dict[str, str] = {}
     for variable, value in spec.items():
         try:
             filled = _fill_leaves(value, values)
         except (KeyError, IndexError, ValueError, AttributeError) as exc:
             raise ConfigError(
-                f"spawn.clients.{client or '?'}.model_env: cannot fill {variable!r} "
+                f"{where}: cannot fill {variable!r} "
                 f"({type(exc).__name__}: {exc}); placeholders are "
                 f"{', '.join('{' + k + '}' for k in values)}"
             ) from exc
@@ -222,6 +216,18 @@ def _model_env(
             filled if isinstance(filled, str) else json.dumps(filled, separators=(",", ":"))
         )
     return out
+
+
+def _model_env(
+    template: Mapping, values: Mapping[str, str], model: str | None, client: str | None
+) -> dict[str, str]:
+    """The variables that carry `--model` for a client without a model flag."""
+    spec = template.get("model_env")
+    if model is None or not spec:
+        return {}
+    if not isinstance(spec, dict):
+        raise ConfigError(f"spawn.clients.{client or '?'}.model_env must be an object")
+    return env_from_template(spec, values, where=f"spawn.clients.{client or '?'}.model_env")
 
 
 def resume_command(
@@ -283,7 +289,8 @@ def _clone_missing(
     if not request.clone:
         hint = f"git clone -- {shlex.quote(url)} {shlex.quote(str(dest))}" if url and dest else None
         raise SpawnError(
-            f"no local clone of {request.repo!r} found; pass --clone to clone it",
+            f"no local clone of {request.repo!r} found; pass --clone to clone it, "
+            f"or add the folder that holds an existing clone to repos.roots in config.json",
             EXIT_FAILED, hint,
         ) from missing
     if url is None:

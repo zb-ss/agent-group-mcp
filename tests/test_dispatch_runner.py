@@ -7,14 +7,15 @@ from __future__ import annotations
 import dataclasses
 import fcntl
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from agent_bus import config, repo_identity, spawn, status
 from agent_bus.dispatch import runner, settings
-from agent_bus.dispatch.model import Membership, Task
+from agent_bus.dispatch.messages import Batch, Message
+from agent_bus.dispatch.model import Membership, Task, format_now
 from agent_bus.dispatch.source import SourceError
 from agent_bus.clients.base import ResumableSession
 from agent_bus.dispatch.store import DispatchStore
@@ -1438,3 +1439,193 @@ def test_a_start_decision_beside_a_live_session_is_reopened_not_stuck(h, tmp_pat
                          actor="dispatcher", rows=h.rows)
     _decide(h, "resume")
     assert [d.result for d in h.go().decisions] == ["messaged"]
+
+
+# ------------------------- message sources, schedules -----------------------
+
+NIGHT = datetime(2030, 1, 7, 22, 0, tzinfo=timezone.utc)
+ALWAYS = {"interval_minutes": 5, "hours": "always"}
+
+
+def _message(item_id="m1"):
+    return Message(
+        source="chat", item_id=item_id, container="C0000000001", author="U0000000001",
+        author_kind="user", text="hello", at="2030-01-07T09:00:00.000000Z",
+        url="https://example.slack.com/archives/C0000000001/p1",
+    )
+
+
+class FakeMessageSource:
+    name = "chat"
+    kind = "fake"
+
+    def __init__(self, items=(), schedule=ALWAYS, default="notify"):
+        self.items, self.schedule, self.default, self.calls = list(items), schedule, default, 0
+
+    def fetch(self, cursor, *, now):
+        self.calls += 1
+        return Batch(tuple(self.items), "cursor-1")
+
+    def rules_for(self, message):
+        return [], self.default
+
+
+def _go_messages(h, sources, **kwargs):
+    return h.go(message_sources=sources, **kwargs)
+
+
+def test_no_message_sources_keeps_the_report_shape(h):
+    report = h.go()
+    assert report.messages == [] and "messages" in report.to_dict()
+
+
+def test_always_message_source_runs_outside_working_hours_only_for_messages(h):
+    fake = FakeMessageSource([_message()])
+    report = _go_messages(h, [fake], now=NIGHT)
+    assert report.skipped is None
+    assert fake.calls == 1 and h.source.calls == 0
+    assert [m["result"] for m in report.messages] == ["notified"]
+    assert h.store.source_state("chat").cursor == "cursor-1"
+
+
+def test_nothing_due_reports_outside_working_hours(h):
+    fake = FakeMessageSource(schedule={"interval_minutes": 5, "hours": "working"})
+    report = _go_messages(h, [fake], now=NIGHT)
+    assert report.skipped == "outside working hours"
+    assert fake.calls == 0 and h.source.calls == 0
+
+
+def test_message_source_runs_once_per_interval(h):
+    fake = FakeMessageSource()
+    _go_messages(h, [fake])
+    _go_messages(h, [fake])
+    assert fake.calls == 1
+
+
+def test_duplicate_item_is_acted_on_once(h):
+    fake = FakeMessageSource([_message()])
+    first = _go_messages(h, [fake])
+    later = datetime(2030, 1, 7, 10, 30, tzinfo=timezone.utc)
+    second = _go_messages(h, [fake], now=later)
+    assert fake.calls == 2
+    assert len(first.messages) == 1 and second.messages == []
+    assert h.notifier.states.count("message") == 1
+
+
+def test_task_source_schedule_is_stored_and_respected(h):
+    h.source.schedule = {"interval_minutes": 60, "hours": "working"}
+    h.go()
+    assert h.source.calls == 1
+    assert h.store.source_state("asana").last_run_at
+    h.go(now=datetime(2030, 1, 7, 10, 20, tzinfo=timezone.utc))
+    assert h.source.calls == 1
+    h.go(now=datetime(2030, 1, 7, 11, 5, tzinfo=timezone.utc))
+    assert h.source.calls == 2
+
+
+def test_null_schedule_never_writes_source_state(h):
+    h.go()
+    assert h.store.source_state("asana") is None
+
+
+def test_ignore_hours_and_dry_run_bypass_schedules(h):
+    h.source.schedule = {"interval_minutes": 600, "hours": "working"}
+    h.go()
+    h.go(ignore_hours=True)
+    h.go(dry_run=True)
+    assert h.source.calls == 3
+    fake = FakeMessageSource(schedule={"interval_minutes": 600, "hours": "working"})
+    _go_messages(h, [fake], now=NIGHT, ignore_hours=True)
+    assert fake.calls == 1
+
+
+def test_dry_run_with_message_sources_writes_nothing(tmp_path, storage):
+    h = Harness(tmp_path, storage, [])
+    fake = FakeMessageSource([_message()])
+    report = _go_messages(h, [fake], dry_run=True)
+    assert fake.calls == 1
+    assert not h.store.path.exists()
+    assert not settings.lock_path().exists() and not settings.scan_lock_path().exists()
+    assert h.notifier.sent == [] and h.spawn.requests == [] and h.send.calls == []
+    assert all(m["result"].startswith("would_") for m in report.messages)
+
+
+def test_scan_phase_runs_after_the_run_lock_is_released(h, monkeypatch):
+    seen = {}
+
+    def scan_phase(pctx, queued):
+        with runner.run_lock(settings.lock_path()) as acquired:
+            seen["run_lock_free"] = acquired
+
+    monkeypatch.setattr(runner.scan, "main_phase", lambda pctx, sources: ["queued"])
+    monkeypatch.setattr(runner.scan, "scan_phase", scan_phase)
+    _go_messages(h, [FakeMessageSource()])
+    assert seen == {"run_lock_free": True}
+
+
+def test_scan_phase_is_skipped_while_the_scan_lock_is_held(h, monkeypatch):
+    class Queue:
+        source = FakeMessageSource()
+
+    called = []
+    monkeypatch.setattr(runner.scan, "main_phase", lambda pctx, sources: [Queue()])
+    monkeypatch.setattr(runner.scan, "scan_phase", lambda pctx, queued: called.append(1))
+    path = settings.scan_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        report = _go_messages(h, [Queue.source])
+    assert called == [] and report.errors == []
+    assert [(m["source"], m["result"], m["reason"]) for m in report.messages] == [
+        ("chat", "skipped", "another scan is in progress")]
+    assert report.exit_code == 0
+
+
+def test_failed_message_decision_sets_the_exit_code():
+    report = runner.RunReport(messages=[{"result": "failed"}])
+    assert report.exit_code == 1
+
+
+def test_decision_clone_reaches_the_spawn_request(h):
+    h.store.observe(h.source.tasks[0], project_id=PROJECT, now="2030-01-07T09:00:00.000000Z")
+    h.store.update("asana", GID_A, decision_clone="1")
+    h.go()
+    assert h.spawn.requests[0].clone is True
+
+
+def test_clone_stays_off_without_a_decision(h):
+    h.go()
+    assert h.spawn.requests[0].clone is False
+
+
+# ------------------------- message item retention ---------------------------
+
+
+def _old_and_new_items(h):
+    days = h.cfg["dispatch"]["message_retention_days"]
+    old = format_now(NOW - timedelta(days=days + 1))
+    recent = format_now(NOW - timedelta(days=days - 1))
+    for item_id, seen in (("old", old), ("recent", recent)):
+        h.store.record_item("slack", item_id, container="C0000000001", rule="r", action="ignore",
+                            result="ignored", url=None, now=seen)
+
+
+def test_a_real_run_prunes_message_items_past_retention(h):
+    _old_and_new_items(h)
+    h.go()
+    assert not h.store.has_item("slack", "old")
+    assert h.store.has_item("slack", "recent")
+
+
+def test_a_dry_run_prunes_nothing(h):
+    _old_and_new_items(h)
+    h.go(dry_run=True)
+    assert h.store.has_item("slack", "old") and h.store.has_item("slack", "recent")
+
+
+def test_retention_comes_from_config(tmp_path, storage):
+    h = Harness(tmp_path, storage, [_task()], message_retention_days=400)
+    h.store.record_item("slack", "year", container=None, rule=None, action="ignore",
+                        result="ignored", url=None, now=format_now(NOW - timedelta(days=365)))
+    h.go()
+    assert h.store.has_item("slack", "year")

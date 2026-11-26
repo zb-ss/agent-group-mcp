@@ -335,3 +335,246 @@ def paths_db_dir() -> Path:
 def test_decision_model_endpoint_allowed(bus_paths, endpoint, allow_remote):
     _load_with(bus_paths, {"dispatch": {"decision_model": {
         "endpoint": endpoint, "allow_remote": allow_remote}}})
+
+
+def _slack(**extra) -> dict:
+    return {"sources": {"slack": extra}}
+
+
+def _maildir(**extra) -> dict:
+    return {"sources": {"maildir": extra}}
+
+
+def _slack_rule(**extra) -> dict:
+    return _slack(channels={"C0000000001": {"rules": [{"name": "r1", "action": "notify", **extra}]}})
+
+
+def _respond(**extra) -> dict:
+    return _slack_rule(action="respond", playbook="incident", **extra)
+
+
+def _authored_respond(**extra) -> dict:
+    return _respond(bot_ids=["B0000000001"], **extra)
+
+
+MESSAGE_BAD_VALUES = [
+    ({"schedule_tolerance_seconds": -1}, "dispatch.schedule_tolerance_seconds"),
+    ({"timer": {"always": "yes"}}, "dispatch.timer.always"),
+    ({"sources": {"asana": {"schedule": {"interval_minutes": 0, "hours": "always"}}}},
+     "dispatch.sources.asana.schedule.interval_minutes"),
+    ({"sources": {"asana": {"schedule": {"interval_minutes": 5, "hours": "sometimes"}}}},
+     "dispatch.sources.asana.schedule.hours"),
+    ({"sources": {"asana": {"schedule": {"interval_minutes": 5, "hours": {"days": ["mon"], "start": "9am", "end": "10:00"}}}}},
+     "dispatch.sources.asana.schedule.hours.start"),
+    ({"sources": {"Bad Name": {}}}, "dispatch.sources.Bad Name"),
+    ({"sources": {"other": {"type": "asana"}}}, "dispatch.sources.other.type"),
+    (_slack(base_url="http://slack.example.com"), "dispatch.sources.slack.base_url"),
+    (_slack(token_env=""), "dispatch.sources.slack.token_env"),
+    (_slack(page_size=1001), "dispatch.sources.slack.page_size"),
+    (_slack(max_pages=0), "dispatch.sources.slack.max_pages"),
+    (_slack(max_calls_per_run=0), "dispatch.sources.slack.max_calls_per_run"),
+    (_slack(min_interval_seconds=-1), "dispatch.sources.slack.min_interval_seconds"),
+    (_slack(owner_id=5), "dispatch.sources.slack.owner_id"),
+    (_slack(mentions={"action": "respond"}), "dispatch.sources.slack.mentions.action"),
+    (_slack(mentions={"search_query": "{other}"}), "dispatch.sources.slack.mentions.search_query"),
+    (_slack(mentions={"conversation_types": []}), "dispatch.sources.slack.mentions.conversation_types"),
+    (_slack(channels={"c1": {}}), "dispatch.sources.slack.channels.c1"),
+    (_slack(channels={"C0000000001": {"rules": [{"name": "r", "action": "notify", "nope": 1}]}}),
+     "dispatch.sources.slack.channels.C0000000001.rules[0]"),
+    (_slack_rule(name="Bad Name"), ".rules[0].name"),
+    (_slack_rule(action="explode"), ".rules[0].action"),
+    (_slack_rule(bot_ids=[""]), ".rules[0].bot_ids"),
+    (_slack_rule(user_ids="U0000000001"), ".rules[0].user_ids"),
+    (_slack_rule(text=["("]), ".rules[0].text"),
+    (_slack_rule(mention=["everyone"]), ".rules[0].mention"),
+    (_slack_rule(thread="deep"), ".rules[0].thread"),
+    (_slack_rule(playbook="incident"), ".rules[0].playbook"),
+    (_slack_rule(action="respond"), ".rules[0].playbook"),
+    (_slack_rule(action="draft", lifecycle={"open": ["x"]}), ".rules[0].lifecycle"),
+    (_respond(lifecycle={"open": ["("]}), ".rules[0].lifecycle.open"),
+    (_respond(lifecycle={"key": "("}), ".rules[0].lifecycle.key"),
+    (_respond(lifecycle={"stop": ["x"]}), ".rules[0].lifecycle"),
+    (_respond(auto_post_report="yes"), ".rules[0].auto_post_report"),
+    (_slack_rule(auto_post_report=True), ".rules[0].auto_post_report"),
+    (_slack(channels={"C0000000001": {"rules": [
+        {"name": "r1", "action": "notify"}, {"name": "r1", "action": "notify"}]}}), ".rules[1].name"),
+    (_maildir(folders=[]), "dispatch.sources.maildir.folders"),
+    (_maildir(folders=["../x"]), "dispatch.sources.maildir.folders"),
+    (_maildir(folders=["/abs"]), "dispatch.sources.maildir.folders"),
+    (_maildir(drafts_folder="a/../b"), "dispatch.sources.maildir.drafts_folder"),
+    (_maildir(default_action="respond"), "dispatch.sources.maildir.default_action"),
+    (_maildir(link_template="http://mail.example.com/{message_id}"), "dispatch.sources.maildir.link_template"),
+    (_maildir(link_template="https://mail.example.com/{other}"), "dispatch.sources.maildir.link_template"),
+    (_maildir(address=3), "dispatch.sources.maildir.address"),
+    (_maildir(enabled=True), "dispatch.sources.maildir.root"),
+    (_maildir(rules=[{"name": "r", "action": "respond"}]), "email never starts a session"),
+    (_maildir(rules=[{"name": "r", "action": "draft", "playbook": "x"}]), "dispatch.sources.maildir.rules[0]"),
+    (_maildir(rules=[{"name": "r", "action": "draft", "from": ["("]}]), ".rules[0].from"),
+    (_maildir(rules=[{"name": "r", "action": "draft", "folder": "INBOX"}]), ".rules[0].folder"),
+    ({"scanner": {"enabled": "yes"}}, "dispatch.scanner.enabled"),
+    ({"scanner": {"client": "nope"}}, "dispatch.scanner.client"),
+    ({"scanner": {"model": "-m"}}, "dispatch.scanner.model"),
+    ({"scanner": {"playbook": "a/b"}}, "dispatch.scanner.playbook"),
+    ({"scanner": {"batch_size": 0}}, "dispatch.scanner.batch_size"),
+    ({"scanner": {"timeout_seconds": 0}}, "dispatch.scanner.timeout_seconds"),
+    ({"scanner": {"dir": 4}}, "dispatch.scanner.dir"),
+    ({"scanner": {"clients": {"opencode": {"command": []}}}}, "dispatch.scanner.clients.opencode.command"),
+    ({"scanner": {"clients": {"opencode": {"command": ["x", "{other}", "{prompt_file}"]}}}},
+     "dispatch.scanner.clients.opencode.command"),
+    ({"scanner": {"clients": {"opencode": {"command": ["x"]}}}}, "dispatch.scanner.clients.opencode.command"),
+    ({"scanner": {"clients": {"opencode": {"instruction": 1}}}}, "dispatch.scanner.clients.opencode.instruction"),
+    ({"scanner": {"clients": {"opencode": {"pass_env": ["AGENT_BUS_SESSION"]}}}},
+     "dispatch.scanner.clients.opencode.pass_env"),
+    ({"scanner": {"clients": {"opencode": {"pass_env": ["bad name"]}}}},
+     "dispatch.scanner.clients.opencode.pass_env"),
+    ({"scanner": {"clients": {"opencode": {"env": "x"}}}}, "dispatch.scanner.clients.opencode.env"),
+    ({"incident": {"client": "Bad Client"}}, "dispatch.incident.client"),
+    ({"incident": {"model": "-m"}}, "dispatch.incident.model"),
+    ({"incident": {"group": "Not A Slug"}}, "dispatch.incident.group"),
+    ({"incident": {"label_prefix": "-x"}}, "dispatch.incident.label_prefix"),
+    ({"incident": {"remote": "yes"}}, "dispatch.incident.remote"),
+    ({"incident": {"max_spawns_per_hour": -1}}, "dispatch.incident.max_spawns_per_hour"),
+    ({"incident": {"max_running": -1}}, "dispatch.incident.max_running"),
+    ({"incident": {"max_open_hours": 0}}, "dispatch.incident.max_open_hours"),
+    ({"incident": {"max_alert_chars": 0}}, "dispatch.incident.max_alert_chars"),
+    ({"incident": {"max_report_chars": 0}}, "dispatch.incident.max_report_chars"),
+    ({"incident": {"tools_hint": ""}}, "dispatch.incident.tools_hint"),
+    ({"incident": {"dir": 3}}, "dispatch.incident.dir"),
+    ({"incident": {"max_key_chars": 0}}, "dispatch.incident.max_key_chars"),
+    ({"incident": {"max_name_chars": 0}}, "dispatch.incident.max_name_chars"),
+    ({"incident": {"max_time_chars": "60"}}, "dispatch.incident.max_time_chars"),
+    ({"incident": {"max_url_chars": 1.5}}, "dispatch.incident.max_url_chars"),
+    ({"message_retention_days": 0}, "dispatch.message_retention_days"),
+    ({"message_retention_days": 1.5}, "dispatch.message_retention_days"),
+    ({"drafts": {"sending_stale_minutes": 0}}, "dispatch.drafts.sending_stale_minutes"),
+    ({"drafts": {"sending_stale_minutes": "30"}}, "dispatch.drafts.sending_stale_minutes"),
+    ({"drafts": None}, "dispatch.drafts"),
+    (_slack(mentions={"include_direct_messages": "no"}), "dispatch.sources.slack.mentions.include_direct_messages"),
+    (_respond(), ".rules[0].bot_ids"),
+    (_respond(bot_ids=[]), ".rules[0].bot_ids"),
+    (_respond(bot_ids=[], user_ids=[]), "needs an author condition"),
+    (_slack_rule(lifecycle={"open": ["ALERT"], "close": ["RESOLVED"]}), "close an incident"),
+]
+
+
+@pytest.mark.parametrize("override,key", MESSAGE_BAD_VALUES)
+def test_message_source_bad_values(bus_paths, override, key):
+    with pytest.raises(config.ConfigError) as exc:
+        _load_with(bus_paths, {"dispatch": override})
+    assert key in str(exc.value)
+
+
+def test_message_defaults_are_off_and_valid(bus_paths):
+    cfg = config.load()["dispatch"]
+    settings.validate(cfg)
+    assert cfg["sources"]["slack"]["enabled"] is False
+    assert cfg["sources"]["maildir"]["enabled"] is False
+    assert cfg["scanner"]["enabled"] is False
+    assert cfg["timer"]["always"] is False
+    assert cfg["sources"]["asana"]["schedule"] is None
+
+
+def test_valid_slack_respond_rule_and_other_instance(bus_paths):
+    cfg = _load_with(bus_paths, {"dispatch": {"sources": {"slack-alerts": {
+        "type": "slack", "enabled": True,
+        "channels": {"C0000000001": {"rules": [{
+            "name": "critical", "action": "respond", "bot_ids": ["B0000000001"],
+            "mention": ["channel"], "thread": "top", "playbook": "incident",
+            "lifecycle": {"open": ["^ALERT"], "repeat": ["STILL OPEN"], "close": ["RESOLVED"], "key": "(\\w+)"},
+            "auto_post_report": False,
+        }]}},
+    }}}})["dispatch"]
+    assert cfg["sources"]["slack-alerts"]["type"] == "slack"
+
+
+@pytest.mark.parametrize("author", [{"bot_ids": ["B0000000001"]}, {"user_ids": ["U0000000002"]}])
+def test_respond_and_closing_rules_with_an_author_are_valid(bus_paths, author):
+    _load_with(bus_paths, {"dispatch": _respond(**author)})
+    _load_with(bus_paths, {"dispatch": _slack_rule(lifecycle={"open": ["A"], "close": ["R"]}, **author)})
+
+
+def test_a_notify_rule_without_a_close_pattern_needs_no_author(bus_paths):
+    _load_with(bus_paths, {"dispatch": _slack_rule(lifecycle={"open": ["ALERT"]})})
+
+
+def test_new_message_keys_have_documented_defaults(bus_paths):
+    cfg = config.load()["dispatch"]
+    assert cfg["sources"]["slack"]["mentions"]["include_direct_messages"] is False
+    assert cfg["drafts"]["sending_stale_minutes"] == 30
+    assert cfg["message_retention_days"] == 30
+    assert cfg["incident"]["max_key_chars"] == 200
+    caps = {k: cfg["incident"][k] for k in ("max_name_chars", "max_time_chars", "max_url_chars")}
+    assert caps == {"max_name_chars": 120, "max_time_chars": 60, "max_url_chars": 500}
+
+
+def test_source_settings_inherits_packaged_type_defaults(bus_paths):
+    cfg = _load_with(bus_paths, {"dispatch": {"sources": {
+        "slack": {"base_url": "https://edited.example.com/api"},
+        "slack-alerts": {"type": "slack", "enabled": True, "schedule": {"interval_minutes": 2, "hours": "always"}},
+    }}})["dispatch"]
+    merged = settings.source_settings(cfg, "slack-alerts")
+    packaged = config.defaults()["dispatch"]["sources"]["slack"]
+    assert merged["enabled"] is True
+    assert merged["base_url"] == packaged["base_url"]
+    assert merged["schedule"] == {"interval_minutes": 2, "hours": "always"}
+    assert merged["mentions"] == packaged["mentions"]
+    merged["mentions"]["action"] = "ignore"
+    assert cfg["sources"]["slack-alerts"].get("mentions") is None
+    assert settings.source_settings(cfg, "slack")["base_url"] == "https://edited.example.com/api"
+    assert settings.source_type("x", {}) == "x"
+    assert settings.source_type("x", {"type": "slack"}) == "slack"
+
+
+def test_scan_paths(bus_paths):
+    cfg = config.load()["dispatch"]
+    assert settings.incident_dir(cfg) == paths_db_dir() / "incidents"
+    assert settings.scanner_dir(cfg) == paths_db_dir() / "dispatch-scanner"
+    assert settings.scan_lock_path() == paths_db_dir() / "dispatch-scan.lock"
+
+
+WORKING = {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "19:00"}
+MONDAY_NOON = datetime(2030, 1, 7, 12, 0)
+SUNDAY_NOON = datetime(2030, 1, 6, 12, 0)
+
+
+def _due(schedule, last_run_at=None, *, now=None, local=MONDAY_NOON, tolerance=30):
+    from datetime import timezone
+
+    now = now or local.replace(tzinfo=timezone.utc)
+    return settings.schedule_due(
+        schedule, working_hours=WORKING, last_run_at=last_run_at, now=now, local=local,
+        tolerance_seconds=tolerance,
+    )
+
+
+def test_schedule_due_null_follows_working_hours():
+    assert _due(None) is True
+    assert _due(None, local=SUNDAY_NOON) is False
+
+
+def test_schedule_due_working_always_and_window():
+    working = {"interval_minutes": 15, "hours": "working"}
+    always = {"interval_minutes": 15, "hours": "always"}
+    window = {"interval_minutes": 15, "hours": {"days": ["sun"], "start": "10:00", "end": "14:00"}}
+    assert _due(working) is True
+    assert _due(working, local=SUNDAY_NOON) is False
+    assert _due(always, local=SUNDAY_NOON) is True
+    assert _due(window, local=SUNDAY_NOON) is True
+    assert _due(window) is False
+
+
+def test_schedule_due_interval_and_tolerance():
+    from datetime import timedelta, timezone
+
+    schedule = {"interval_minutes": 15, "hours": "always"}
+    now = MONDAY_NOON.replace(tzinfo=timezone.utc)
+
+    def stamp(seconds_ago: float) -> str:
+        return (now - timedelta(seconds=seconds_ago)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    assert _due(schedule, stamp(600), now=now) is False
+    assert _due(schedule, stamp(900 - 31), now=now) is False
+    assert _due(schedule, stamp(900 - 30), now=now) is True
+    assert _due(schedule, stamp(1000), now=now) is True
+    assert _due(schedule, "garbage", now=now) is True
+    assert _due(schedule, None, now=now) is True

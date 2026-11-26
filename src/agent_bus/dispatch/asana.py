@@ -30,6 +30,7 @@ class AsanaSource:
         http_get: HttpGet | None = None,
     ) -> None:
         self._cfg = cfg
+        self.schedule = cfg.get("schedule")
         self._env = env
         self._http_get = http_get
         self._headers: dict[str, str] = {}

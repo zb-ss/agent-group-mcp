@@ -175,3 +175,23 @@ def test_candidates_clean_a_hostile_title(store, cfg):
     assert len(title) < 150  # bounded: max chars plus the ellipsis
     assert item["state"] == "asked" and item["held"] is True and item["session"] is None
     assert item["type"] == "refinement" and item["untrusted"]["url"]
+
+
+def test_clone_is_stored_and_logged(store, cfg):
+    tid = _candidate(store, repo="example-org/repo-a")
+    record = _decide(store, cfg, tid, clone=True)
+    assert record.decision_clone == "1"
+    assert store.list_events(event="decide")[0]["detail"]["clone"] is True
+
+
+def test_clone_defaults_off(store, cfg):
+    tid = _candidate(store, repo="example-org/repo-a")
+    assert _decide(store, cfg, tid).decision_clone is None
+    assert store.list_events(event="decide")[0]["detail"]["clone"] is False
+
+
+@pytest.mark.parametrize("action", ["skip", "ask"])
+def test_clone_is_refused_for_non_spawning_actions(store, cfg, action):
+    tid = _candidate(store, repo="example-org/repo-a")
+    with pytest.raises(DecisionError, match="--clone only apply to start and resume"):
+        _decide(store, cfg, tid, action=action, clone=True)

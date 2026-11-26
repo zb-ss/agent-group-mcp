@@ -16,7 +16,15 @@ def _never_the_real_bus(
     """Point every test at a throwaway database and audit log, including
     the ones that do not ask for `bus_paths`. A test that reaches the
     default paths opens the user's real bus — and runs any pending schema
-    migration on it."""
+    migration on it.
+
+    A test run inside a spawned agent session must not inherit that
+    session's identity either (AGENT_BUS_SESSION, AGENT_BUS_SPAWN_TOKEN,
+    AGENT_BUS_REPO, AGENT_BUS_NAME, AGENT_BUS_AUTHORITY_TOKEN,
+    AGENT_BUS_INSTANCE): CLI subprocess tests copy `os.environ`. So every
+    AGENT_BUS_* variable is removed first, then the two paths are set."""
+    for name in [key for key in os.environ if key.startswith("AGENT_BUS_")]:
+        monkeypatch.delenv(name, raising=False)
     root = tmp_path_factory.mktemp("bus")
     monkeypatch.setenv("AGENT_BUS_DB", str(root / "bus.db"))
     monkeypatch.setenv("AGENT_BUS_AUDIT_LOG", str(root / "audit.log"))
