@@ -10,6 +10,7 @@ never an argv.
 from __future__ import annotations
 
 import fcntl
+import shutil
 import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -18,13 +19,13 @@ from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
-from .. import commands, identity, repo_identity, spawn, status
+from .. import authority, commands, identity, repo_identity, spawn, status
 from ..config import ConfigError
 from ..spawn import SpawnError, SpawnRequest
 from ..clients import agy as agy_client
 from ..clients.base import ResumableSession
-from ..storage import Storage, UnknownRecipientError
-from . import classify, cleanup, playbook, settings
+from ..storage import TIMESTAMP_FORMAT, Storage, UnknownRecipientError
+from . import classify, cleanup, decision_model, playbook, routing, settings, triage
 from .asana import AsanaSource
 from .model import (
     OUTCOME_DONE,
@@ -40,13 +41,22 @@ from .model import (
 from .notify import Notification, Notifier, deliver
 from .playbook import PlaybookError
 from .source import HttpGet, SourceError, TaskSource
-from .store import DispatchStore, TaskRecord
+from .store import (
+    EVENT_APPROVAL_REQUEST,
+    EVENT_CANDIDATE,
+    EVENT_EXECUTED,
+    EVENT_ROUTING,
+    TRIAGE_FIELDS,
+    DispatchStore,
+    TaskRecord,
+)
 
 SOURCES: dict[str, Callable[..., TaskSource]] = {"asana": AsanaSource}
 
 RESULTS = (
     "spawned", "would_spawn", "held", "would_hold", "notified", "would_notify",
-    "messaged", "would_message", "resumed", "would_resume", "skipped", "failed", "ignored",
+    "messaged", "would_message", "resumed", "would_resume", "delegated", "would_delegate",
+    "skipped", "failed", "ignored",
 )
 UNKNOWN = "unknown"
 HEAD = "HEAD"
@@ -54,6 +64,11 @@ STATE_LABELS = {"waiting": "needs review", "done": "done", "ended": "ended witho
 _OUTCOME_FOR_STATE = {"done": OUTCOME_DONE, "ended": OUTCOME_ENDED}
 _WATCHED_OUTCOMES = (OUTCOME_SPAWNED, OUTCOME_DONE, OUTCOME_ENDED)
 _SPAWN_FAILURES = (SpawnError, ConfigError, PlaybookError, OSError)
+_CLEAR_TRIAGE: dict[str, None] = dict.fromkeys(TRIAGE_FIELDS)
+_REOPEN: dict[str, None] = dict.fromkeys(
+    ("decision", "decision_at", "decision_reason", "decision_repo", "decision_client", "decision_model")
+)
+_DECISIONS_TO_EXECUTE = ("start", "resume")
 
 
 @dataclass(frozen=True)
@@ -104,6 +119,11 @@ class _Ctx:
     send: Callable[..., dict]
     rows: list
     report: RunReport
+    available: Callable[[str], bool]
+    http_post: Callable[..., bytes]
+    quota: Callable[[str], float]
+    dispatcher: Any | None = None
+    repo_ids: dict[str, str | None] = field(default_factory=dict)
     spawns: int = 0
     fetched: set[str] = field(default_factory=set)
 
@@ -247,6 +267,15 @@ def _cleanup_paths(record: TaskRecord, row: Any | None) -> tuple[str, str] | Non
     return work_dir, clone
 
 
+def _cleanup_project(ctx: _Ctx, record: TaskRecord) -> dict | None:
+    """The project settings of a record; the defaults for a repo that was
+    started for an unmapped task."""
+    project = settings.project_settings(ctx.dispatch, record.source, record.project_id)
+    if project is None and record.repo:
+        return settings.default_project(ctx.dispatch, record.repo)
+    return project
+
+
 def _cleanup(ctx: _Ctx) -> None:
     if not ctx.dispatch["worktree_cleanup"]["enabled"]:
         return
@@ -261,7 +290,7 @@ def _cleanup(ctx: _Ctx) -> None:
             continue
         if row is not None and (row.live or row.state in status.ACTIVE_STATES):
             continue
-        project = settings.project_settings(ctx.dispatch, record.source, record.project_id)
+        project = _cleanup_project(ctx, record)
         if project is None or not project.get("worktree"):
             continue
         work_dir, clone = paths
@@ -283,8 +312,8 @@ def _cleanup(ctx: _Ctx) -> None:
 
 
 def _drop_agy_trust(ctx: _Ctx, record: TaskRecord, work_dir: Path) -> dict:
-    project = settings.project_settings(ctx.dispatch, record.source, record.project_id) or {}
-    if project.get("client") != agy_client.CLIENT_ID:
+    project = _cleanup_project(ctx, record) or {}
+    if (record.client or project.get("client")) != agy_client.CLIENT_ID:
         return {}
     options = ctx.cfg["spawn"]["clients"].get(agy_client.CLIENT_ID)
     notes = agy_client.AgyWiring().release_worktree(work_dir, options=options)
@@ -333,6 +362,7 @@ def _with_type(record: TaskRecord, type_: str) -> tuple[str, ...]:
 def _handle_task(ctx: _Ctx, task: Task) -> None:
     mapped = _mapped_project(ctx, task)
     if mapped is None:
+        _handle_unmapped(ctx, task)
         return
     project_id, project = mapped
     record = ctx.store.get(task.source, task.task_id)
@@ -340,14 +370,183 @@ def _handle_task(ctx: _Ctx, task: Task) -> None:
         record = ctx.store.observe(task, project_id=project_id, now=ctx.stamp)
     type_ = classify.classify(task, record, rules=ctx.dispatch["rules"])
     action = settings.type_action(ctx.dispatch, type_)
+    if action == "spawn":
+        patterns = settings.type_repos(ctx.dispatch, type_)
+        if patterns is not None and not settings.repo_allowed(
+            patterns, _repo_id(ctx, project["repo"])
+        ):
+            action = "notify"
     if type_ == classify.TYPE_IGNORE or action == settings.TYPE_IGNORE:
         ctx.report.decisions.append(_decision(ctx, task, type_, "ignore", "ignored"))
     elif action == "notify":
         ctx.report.decisions.append(_notify_only(ctx, task, record, type_, project))
     else:
+        delegated = _triage(ctx, task, record, type_, project_id, project)
         ctx.report.decisions.append(
-            _spawn_task(ctx, task, record, type_, project_id, project)
+            delegated
+            or _spawn_task(ctx, task, record, type_, project_id, project)
         )
+
+
+def _triage_active(ctx: _Ctx) -> bool:
+    return bool(ctx.dispatch["triage"]["enabled"] and ctx.dispatcher is not None)
+
+
+def _minutes_since(ctx: _Ctx, stamp: str) -> float | None:
+    try:
+        then = datetime.strptime(stamp, TIMESTAMP_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return (ctx.now - then).total_seconds() / 60
+
+
+def _fallback_due(ctx: _Ctx, candidate_at: str) -> bool:
+    minutes = ctx.dispatch["triage"]["fallback_after_minutes"]
+    if minutes is None:
+        return False
+    elapsed = _minutes_since(ctx, candidate_at)
+    return elapsed is not None and elapsed >= minutes
+
+
+def _skip_by_decision(
+    ctx: _Ctx, task: Task, record: TaskRecord | None, type_: str,
+) -> TaskDecision:
+    reason = f"dispatcher: {(record.decision_reason if record else None) or 'no reason given'}"
+    if not ctx.dry_run and record is not None:
+        ctx.store.update(
+            task.source, task.task_id, type=type_, handled_types=_with_type(record, type_),
+            handled_at=ctx.stamp, last_comment_handled_at=task.newest_comment_at,
+            **_CLEAR_TRIAGE,
+        )
+        ctx.store.log_event(
+            at=ctx.stamp, event=EVENT_EXECUTED, actor="runner", source=task.source,
+            task_id=task.task_id, detail={"result": "skipped", "by": "dispatcher"},
+        )
+    return _decision(ctx, task, type_, "skip", "skipped", reason=reason)
+
+
+def _existing_session(ctx: _Ctx, label: str, record: TaskRecord | None) -> dict | None:
+    rows = _session_rows(ctx, label, record)
+    if not rows:
+        return None
+    row = _latest(rows)
+    return {"name": row.name, "state": row.state, "live": bool(row.live)}
+
+
+def _triage(
+    ctx: _Ctx, task: Task, record: TaskRecord | None, type_: str, project_id: str | None,
+    project: Mapping, *, unmapped: bool = False,
+) -> TaskDecision | None:
+    """Hand a spawn-action task to the dispatcher. None means the deterministic
+    path goes on (spawn, resume or message as before)."""
+    chosen = record.decision if record else None
+    if chosen in _DECISIONS_TO_EXECUTE:
+        return None
+    if chosen == "skip":
+        return _skip_by_decision(ctx, task, record, type_)
+    if not _triage_active(ctx):
+        return None
+    if chosen == "ask":
+        return _decision(ctx, task, type_, "triage", "delegated",
+                         reason="the dispatcher is asking the owner")
+    if record is not None and record.candidate_at:
+        if _fallback_due(ctx, record.candidate_at):
+            return None
+        return _decision(ctx, task, type_, "triage", "delegated",
+                         reason="waiting for the dispatcher")
+    label, failure = _label_for(ctx, task, type_)
+    if failure is not None:
+        return _decision(ctx, task, type_, "spawn", "failed", reason=failure, label=label)
+    if ctx.dry_run:
+        return _decision(ctx, task, type_, "triage", "would_delegate", label=label)
+    return _send_candidate(ctx, task, record, type_, project, label, unmapped)
+
+
+def _send_candidate(
+    ctx: _Ctx, task: Task, record: TaskRecord | None, type_: str, project: Mapping,
+    label: str, unmapped: bool,
+) -> TaskDecision | None:
+    if unmapped:
+        why = "unmapped_project"
+    else:
+        why = "follow_up" if settings.resume_playbook(ctx.dispatch, type_) else "new_task"
+    repo = None if unmapped else project["repo"]
+    body = triage.candidate_body(
+        task=task, type_=type_, reason=why, repo=repo, label=label,
+        session=_existing_session(ctx, label, record),
+        over_soft_limit=_over_soft_limit(ctx, record),
+        max_chars=ctx.dispatch["title_max_chars"],
+    )
+    try:
+        ctx.send(from_agent=ctx.dispatch["bus_sender"], to=ctx.dispatcher.name, body=body)
+    except (UnknownRecipientError, ValueError):
+        return None
+    fields: dict[str, Any] = {"candidate_type": type_, "candidate_at": ctx.stamp, "label": label}
+    if not unmapped:
+        fields["repo"] = project["repo"]
+    ctx.store.update(task.source, task.task_id, **fields)
+    ctx.store.log_event(
+        at=ctx.stamp, event=EVENT_CANDIDATE, actor="runner", source=task.source,
+        task_id=task.task_id, detail={"type": type_, "reason": why, "to": ctx.dispatcher.name},
+    )
+    return _decision(ctx, task, type_, "triage", "delegated", label=label)
+
+
+def _handle_unmapped(ctx: _Ctx, task: Task) -> None:
+    """A task of a project without a mapping: only an offered candidate, and only
+    for sources that list repo patterns. Otherwise it is dropped, as before."""
+    if not settings.unmapped_repos(ctx.dispatch, task.source):
+        return
+    record = ctx.store.get(task.source, task.task_id)
+    type_ = classify.classify(task, record, rules=ctx.dispatch["rules"])
+    if settings.type_action(ctx.dispatch, type_) != "spawn":
+        return
+    # a follow-up on a task that already has a repo keeps it: decide() stores no
+    # decision_repo for it
+    chosen = record and (record.decision_repo or record.repo)
+    if record is not None and record.decision in _DECISIONS_TO_EXECUTE and chosen:
+        _spawn_unmapped(ctx, task, record, type_, chosen)
+        return
+    if not _triage_active(ctx) and not (record is not None and record.decision == "skip"):
+        return
+    if not ctx.dry_run:
+        first = task.memberships[0].project_id if task.memberships else None
+        record = ctx.store.observe(task, project_id=first, now=ctx.stamp)
+    decision = _triage(ctx, task, record, type_, None, {"repo": None}, unmapped=True)
+    if decision is not None:
+        ctx.report.decisions.append(decision)
+
+
+def _spawn_unmapped(
+    ctx: _Ctx, task: Task, record: TaskRecord, type_: str, repo: str
+) -> None:
+    project = settings.default_project(ctx.dispatch, repo)
+    patterns = settings.type_repos(ctx.dispatch, type_)
+    if patterns is not None and not settings.repo_allowed(
+        patterns, _repo_id(ctx, project["repo"])
+    ):
+        ctx.report.decisions.append(
+            _decision(ctx, task, type_, "spawn", "failed",
+                      reason=f"repo not allowed for {type_}")
+        )
+        return
+    ctx.report.decisions.append(
+        _spawn_task(ctx, task, record, type_, record.project_id or "", project)
+    )
+
+
+def _repo_id(ctx: _Ctx, repo: str) -> str | None:
+    """The repo's id (`<host>/<path>`), cached for the run; None when unknown."""
+    if repo in ctx.repo_ids:
+        return ctx.repo_ids[repo]
+    try:
+        found: str | None = repo_identity.resolve(
+            repo, storage=ctx.storage, cfg=ctx.cfg["repos"], run=ctx.run, persist=False,
+        ).repo_id
+    except LookupError:
+        found = repo_identity.normalize_remote(repo, ctx.cfg["repos"].get("host_aliases"))
+    ctx.repo_ids[repo] = found
+    return found
 
 
 def _notify_only(
@@ -376,7 +575,8 @@ def _notify_only(
 
 def _running(ctx: _Ctx) -> int:
     """Spawned sessions in an active state plus the ones started in this run."""
-    active = sum(1 for r in ctx.rows if r.spawned and r.state in status.ACTIVE_STATES)
+    active = sum(1 for r in ctx.rows if r.spawned and getattr(r, "role", None) is None
+        and r.state in status.ACTIVE_STATES)
     return active + ctx.spawns
 
 
@@ -387,25 +587,54 @@ def _over_soft_limit(ctx: _Ctx, record: TaskRecord | None) -> bool:
     return _running(ctx) >= soft
 
 
+def _ask_dispatcher(
+    ctx: _Ctx, task: Task, record: TaskRecord | None, type_: str, label: str,
+) -> bool:
+    """Send the approval request to the dispatcher; True when it took it."""
+    body = triage.approval_body(
+        task=task, type_=type_, label=label, running=_running(ctx),
+        soft_limit=ctx.dispatch["soft_limit"], max_chars=ctx.dispatch["title_max_chars"],
+    )
+    try:
+        ctx.send(from_agent=ctx.dispatch["bus_sender"], to=ctx.dispatcher.name, body=body)
+    except (UnknownRecipientError, ValueError):
+        return False
+    ctx.store.update(task.source, task.task_id, held_at=ctx.stamp)
+    ctx.store.log_event(
+        at=ctx.stamp, event=EVENT_APPROVAL_REQUEST, actor="runner", source=task.source,
+        task_id=task.task_id, detail={"type": type_, "to": ctx.dispatcher.name},
+    )
+    return True
+
+
 def _hold(
     ctx: _Ctx, task: Task, record: TaskRecord | None, type_: str, label: str,
 ) -> TaskDecision:
     """Hold a spawn past the soft limit until the owner approves it. Nothing but
-    `held_at` is recorded, so the task is classified the same way next run."""
+    `held_at` is recorded, so the task is classified the same way next run. With
+    a live dispatcher the approval request goes to it; else the owner is alerted."""
+    via_dispatcher = ctx.dispatcher is not None
+    if not ctx.dry_run and (record is None or record.held_at is None):
+        if via_dispatcher and _ask_dispatcher(ctx, task, record, type_, label):
+            pass
+        else:
+            via_dispatcher = False
+            wanted = "needs_approval" in ctx.dispatch["notify_on"]
+            # An undelivered alert is retried next run, like the other notifications.
+            if not wanted or _notify(
+                ctx, Notification(label, "needs approval", task.title, task.url)
+            ):
+                ctx.store.update(task.source, task.task_id, held_at=ctx.stamp)
+    hint = (
+        "the dispatcher was asked" if via_dispatcher
+        else f"run `agent-bus dispatch approve {task.task_id}`"
+    )
     reason = (
         f"needs approval: {_running(ctx)} sessions running, soft limit "
-        f"{ctx.dispatch['soft_limit']}; run `agent-bus dispatch approve {task.task_id}`"
+        f"{ctx.dispatch['soft_limit']}; {hint}"
     )
-    if ctx.dry_run:
-        return _decision(ctx, task, type_, "spawn", "would_hold", reason=reason, label=label)
-    if record is None or record.held_at is None:
-        wanted = "needs_approval" in ctx.dispatch["notify_on"]
-        # An undelivered alert is retried next run, like the other notifications.
-        if not wanted or _notify(
-            ctx, Notification(label, "needs approval", task.title, task.url)
-        ):
-            ctx.store.update(task.source, task.task_id, held_at=ctx.stamp)
-    return _decision(ctx, task, type_, "spawn", "held", reason=reason, label=label)
+    result = "would_hold" if ctx.dry_run else "held"
+    return _decision(ctx, task, type_, "spawn", result, reason=reason, label=label)
 
 
 def _session_rows(ctx: _Ctx, label: str, record: TaskRecord | None) -> list:
@@ -540,6 +769,8 @@ def _spawn_task(
         return _decision(ctx, task, type_, "spawn", "failed", reason=failure, label=label)
     resume_playbook = settings.resume_playbook(ctx.dispatch, type_)
     rows = _session_rows(ctx, label, record)
+    if record is not None and record.decision == "start":
+        resume_playbook = None  # the dispatcher chose a new session
     if resume_playbook:
         live = [row for row in rows if row.live]
         if live:
@@ -547,6 +778,12 @@ def _spawn_task(
                                  _latest(live), resume_playbook)
     reason = _skip_reason(ctx, label, record)
     if reason is not None:
+        if (reason == "session active" and not ctx.dry_run and record is not None
+                and record.decision == "start"):
+            # A new session cannot start beside a live one: make the candidate
+            # pending again so the dispatcher can pick resume.
+            ctx.store.update(task.source, task.task_id, **_REOPEN)
+            reason = "session active; start decision reopened, decide again (resume messages it)"
         return _decision(ctx, task, type_, "spawn", "skipped", reason=reason, label=label)
     if _over_soft_limit(ctx, record):
         return _hold(ctx, task, record, type_, label)
@@ -558,6 +795,8 @@ def _spawn_task(
             return _resume_task(ctx, task, record, type_, project_id, project, label,
                                 prior, found, resume_playbook)
         new_reason = f"new session: {why}"
+    route, answer = _route(ctx, task, record, type_, project_id, project)
+    project = {**project, "client": route.client, "model": route.model}
     try:
         values = _values(ctx, task, type_, label, project_id, project)
         text = playbook.render(
@@ -583,7 +822,77 @@ def _spawn_task(
     except _SPAWN_FAILURES as exc:
         return _spawn_failed(ctx, task, record, type_, project, label, exc)
     return _spawned(ctx, task, record, type_, project, label, result, reason=new_reason,
-                    start_commit=values["head_sha"])
+                    start_commit=values["head_sha"], routed=(type_, route, answer))
+
+
+def _route(
+    ctx: _Ctx, task: Task, record: TaskRecord | None, type_: str, project_id: str,
+    project: Mapping,
+) -> tuple[routing.Route, decision_model.ShadowAnswer | None]:
+    """The client and model for a new session, and the decision model's answer
+    when it was consulted (never in a dry run)."""
+    if record is not None and record.decision_client:
+        route = routing.Route(record.decision_client, record.decision_model,
+                              routing.BY_DISPATCHER)
+        return route, None
+    routing_cfg = ctx.dispatch["routing"]
+    dm_cfg = ctx.dispatch["decision_model"]
+    needs_id = bool(routing_cfg["enabled"] or dm_cfg["enabled"])
+    signals = routing.Signals(
+        type=type_, repo=project["repo"],
+        repo_id=_repo_id(ctx, project["repo"]) if needs_id else None,
+        title=clean_text(task.title, ctx.dispatch["title_max_chars"]),
+        sections=tuple(
+            m.section_name for m in task.memberships
+            if m.project_id == project_id and m.section_name
+        ),
+    )
+    route = routing.choose(
+        routing_cfg, signals, static_client=project["client"], static_model=project["model"],
+        available=ctx.available, quota=ctx.quota,
+    )
+    if not dm_cfg["enabled"] or ctx.dry_run:
+        return route, None
+    clients = [c for c in routing_cfg["clients"] if ctx.available(c)]
+    answer = decision_model.consult(
+        dm_cfg, signals, clients, complexity_max=routing_cfg["complexity"]["max"],
+        http_post=ctx.http_post,
+    )
+    route = decision_model.apply(
+        dm_cfg, route, answer, routing_cfg=routing_cfg, available=ctx.available,
+    )
+    return route, answer
+
+
+def _log_routing(
+    ctx: _Ctx, task: Task, type_: str, route: routing.Route,
+    answer: decision_model.ShadowAnswer | None,
+) -> None:
+    dm_cfg = ctx.dispatch["decision_model"]
+    if not (ctx.dispatch["routing"]["enabled"] or dm_cfg["enabled"]):
+        return
+    agree = answer.client == route.client if answer is not None and answer.client else None
+    ctx.store.log_event(
+        at=ctx.stamp, event=EVENT_ROUTING, actor="runner", source=task.source,
+        task_id=task.task_id,
+        detail={
+            "type": type_, "actual": route.to_dict(),
+            "shadow": answer.to_dict() if answer is not None else None,
+            "mode": dm_cfg["mode"] if dm_cfg["enabled"] else None,
+            "agree": agree,
+        },
+    )
+
+
+def _executed(
+    ctx: _Ctx, task: Task, record: TaskRecord | None, result: str, session: str,
+) -> None:
+    ctx.store.log_event(
+        at=ctx.stamp, event=EVENT_EXECUTED, actor="runner", source=task.source,
+        task_id=task.task_id,
+        detail={"result": result, "session": session,
+                "by": "dispatcher" if record is not None and record.decision else "runner"},
+    )
 
 
 def _latest(rows: Sequence[Any]) -> Any:
@@ -620,8 +929,9 @@ def _message_live(
         task.source, task.task_id, type=type_, handled_types=_with_type(record, type_),
         repo=project["repo"], label=label, session_name=row.name,
         handled_at=ctx.stamp, last_comment_handled_at=task.newest_comment_at,
-        outcome=OUTCOME_SPAWNED, last_notified_state="messaged",
+        outcome=OUTCOME_SPAWNED, last_notified_state="messaged", **_CLEAR_TRIAGE,
     )
+    _executed(ctx, task, record, "messaged", row.name)
     return _decision(ctx, task, type_, "message", "messaged", label=label, session=row.name)
 
 
@@ -629,7 +939,7 @@ def _resumable(
     ctx: _Ctx, record: TaskRecord, row: Any | None, project: Mapping, label: str,
 ) -> tuple[ResumableSession | None, str]:
     """(the session to resume, or None and why it cannot be)."""
-    client = project["client"]
+    client = record.client or project["client"]
     if not (ctx.cfg["spawn"]["clients"].get(client) or {}).get("resume_prompt"):
         return None, f"no resume template for {client}"
     work_dir = record.work_dir or (row.work_dir if row else None)
@@ -669,9 +979,10 @@ def _resume_task(
             text, label=label, prompts_dir=settings.prompts_dir(ctx.dispatch))
         result = ctx.resume_fn(
             spawn.ResumeRequest(
-                address=address, client=project["client"], label=label,
+                address=address, client=record.client or project["client"], label=label,
                 work_dir=Path(work_dir), repo_path=Path(clone), prompt_file=prompt,
-                session_id=found.session_id, model=project["model"],
+                session_id=found.session_id,
+                model=record.model if record.client else project["model"],
                 remote=project["remote"],
             ),
             storage=ctx.storage, cfg=ctx.cfg, run=ctx.run, now=ctx.now,
@@ -691,11 +1002,13 @@ def _spawned(
     ctx: _Ctx, task: Task, record: TaskRecord, type_: str, project: Mapping,
     label: str, result: Any, *, reason: str | None = None, action: str = "spawn",
     decision_result: str = "spawned", start_commit: str | None = None,
+    routed: tuple[str, routing.Route, decision_model.ShadowAnswer | None] | None = None,
 ) -> TaskDecision:
     session = result.name
     extra: dict[str, Any] = {}
     if action == "spawn":  # a resume keeps the folder, so keeps its start commit
         extra["start_commit"] = start_commit if start_commit != UNKNOWN else None
+        extra["client"], extra["model"] = project["client"], project["model"]
     ctx.store.update(
         task.source, task.task_id, type=type_, handled_types=_with_type(record, type_),
         repo=project["repo"], label=label, session_name=session,
@@ -703,8 +1016,11 @@ def _spawned(
         last_comment_handled_at=task.newest_comment_at,
         outcome=OUTCOME_SPAWNED, last_notified_state="starting",
         work_dir=result.work_dir, clone_path=result.repo_path,
-        worktree_removed_at=None, held_at=None, approved_at=None, **extra,
+        worktree_removed_at=None, held_at=None, approved_at=None, **_CLEAR_TRIAGE, **extra,
     )
+    _executed(ctx, task, record, decision_result, session)
+    if action == "spawn" and routed is not None:
+        _log_routing(ctx, task, routed[0], routed[1], routed[2])
     ctx.spawns += 1
     return _decision(ctx, task, type_, action, decision_result, reason=reason,
                      label=label, session=session)
@@ -740,6 +1056,15 @@ def _fetch_all(ctx: _Ctx, sources: Sequence[TaskSource], today) -> None:
             _handle_task(ctx, task)
 
 
+def _client_available(cfg: Mapping) -> Callable[[str], bool]:
+    """A configured client whose launch command is on PATH."""
+    def available(client: str) -> bool:
+        command = (cfg["spawn"]["clients"].get(client) or {}).get("command")
+        return bool(command) and shutil.which(command[0]) is not None
+
+    return available
+
+
 def run(
     *,
     cfg: Mapping,
@@ -757,17 +1082,23 @@ def run(
     find_session: Callable[..., Any] = spawn.find_resumable,
     send: Callable[..., dict] | None = None,
     collect: Callable[..., list] = status.collect,
+    available: Callable[[str], bool] | None = None,
+    http_post: Callable[..., bytes] = decision_model.default_http_post,
+    quota: Callable[[str], float] = routing.no_quota,
 ) -> RunReport:
     now = now or datetime.now(timezone.utc)
     local = now.astimezone(tz)
     d = cfg["dispatch"]
     if not (dry_run or ignore_hours or settings.within_working_hours(d["working_hours"], local)):
         return RunReport(skipped="outside working hours")
+    if available is None:
+        available = _client_available(cfg)
     ctx = _Ctx(
         cfg=cfg, dispatch=d, storage=storage, store=store, notifiers=notifiers, now=now,
         dry_run=dry_run, run=run, spawn_fn=spawn_fn, resume_fn=resume_fn,
         find_session=find_session, send=send or storage.send_message, rows=[],
-        report=RunReport(dry_run=dry_run),
+        report=RunReport(dry_run=dry_run), available=available, http_post=http_post,
+        quota=quota,
     )
     if dry_run:
         return _execute(ctx, sources, local.date(), collect)
@@ -777,11 +1108,22 @@ def run(
         return _execute(ctx, sources, local.date(), collect)
 
 
+def _live_dispatcher(ctx: _Ctx) -> Any | None:
+    """The dispatcher's status row when it is live and holds a valid authority."""
+    if not ctx.storage.has_authority(authority.ROLE_DISPATCHER):
+        return None
+    for row in ctx.rows:
+        if getattr(row, "role", None) == authority.ROLE_DISPATCHER and row.live:
+            return row
+    return None
+
+
 def _execute(ctx: _Ctx, sources: Sequence[TaskSource], today, collect) -> RunReport:
     ctx.rows = collect(
         ctx.storage, grace_seconds=ctx.cfg["spawn"]["startup_grace_seconds"],
         now=ctx.now, include_ended=True,
     )
+    ctx.dispatcher = _live_dispatcher(ctx)
     _transitions(ctx)
     _cleanup(ctx)
     _fetch_all(ctx, sources, today)

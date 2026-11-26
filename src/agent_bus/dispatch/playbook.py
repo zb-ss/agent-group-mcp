@@ -56,14 +56,17 @@ def load_template(name: str, *, templates_dir: str | None) -> str:
     )
 
 
-def render(name: str, values: Mapping[str, str], *, templates_dir: str | None) -> str:
+def render(
+    name: str, values: Mapping[str, str], *, templates_dir: str | None,
+    placeholders: Sequence[str] = PLACEHOLDERS,
+) -> str:
     text = load_template(name, templates_dir=templates_dir)
     try:
         result = string.Template(text).substitute(values)
     except (KeyError, ValueError) as exc:
         raise PlaybookError(
             f"playbook {name!r} cannot be rendered ({exc!r}); "
-            f"placeholders: {', '.join(PLACEHOLDERS)}"
+            f"placeholders: {', '.join(placeholders)}"
         ) from exc
     if not result.strip():
         raise PlaybookError(f"playbook {name!r} rendered empty")

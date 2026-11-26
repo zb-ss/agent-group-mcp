@@ -149,7 +149,7 @@ def test_to_dict_has_exactly_the_documented_keys(storage, fake_procs):
         "name", "group", "client", "label", "state", "reported_state",
         "state_at", "live", "spawned", "last_seen", "topic", "pending_count",
         "repo_path", "repo_id", "work_dir", "tmux_session", "tmux_window",
-        "model", "remote", "links",
+        "model", "remote", "links", "role",
     ])
 
 
@@ -237,3 +237,12 @@ def test_the_row_carries_the_session_links(storage, fake_procs):
     (row,) = _collect(storage)
     assert row.links == tuple(links)
     assert row.to_dict()["links"] == tuple(links)
+
+
+def test_spawn_role_shows_on_its_row_and_ordinary_rows_have_none(storage):
+    storage.record_spawn(_record(name="shared/claude-boss", role="dispatcher"))
+    storage.record_spawn(_record(name="shared/claude-plain"))
+    by_name = {r.name: r for r in _collect(storage)}
+    assert by_name["shared/claude-boss"].role == "dispatcher"
+    assert by_name["shared/claude-boss"].to_dict()["role"] == "dispatcher"
+    assert by_name["shared/claude-plain"].role is None

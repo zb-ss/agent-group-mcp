@@ -17,11 +17,12 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from . import clients, commands, identity, paths, repo_identity, resolution, status, tmux
 from . import storage as storage_mod
@@ -33,6 +34,7 @@ EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_CAP_REACHED = 4
 
+SECRET_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
 PROMPT_TOKEN = "{prompt}"
 SESSION_ENV = resolution.SESSION_ENV
 SPAWN_TOKEN_ENV = resolution.SPAWN_TOKEN_ENV
@@ -62,6 +64,9 @@ class SpawnRequest:
     clone: bool = False
     remote: bool = True
     dry_run: bool = False
+    role: str | None = None
+    # (variable name, 0600 file holding its value) pairs, see render_command
+    secret_env: tuple[tuple[str, Path], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,22 @@ def _fragment(template: Mapping, key: str, client: str | None) -> list[str] | No
     return value
 
 
+PROMPT_DELIVERIES = ("argv", "paste")
+DEFAULT_PROMPT_READY_SECONDS_KEY = "prompt_ready_seconds"
+
+
+def uses_paste(template: Mapping, client: str | None = None) -> bool:
+    """True when the client's first prompt is pasted into its window after
+    launch (`prompt_delivery: "paste"`) instead of passed on its command line."""
+    mode = template.get("prompt_delivery", "argv")
+    if mode not in PROMPT_DELIVERIES:
+        raise ConfigError(
+            f"spawn.clients.{client or '?'}.prompt_delivery must be one of "
+            f"{', '.join(PROMPT_DELIVERIES)}"
+        )
+    return mode == "paste"
+
+
 def render_command(
     template: Mapping,
     *,
@@ -110,12 +131,22 @@ def render_command(
     client: str | None = None,
     user_wired: bool = False,
     command_key: str = "command",
+    secret_env: Sequence[tuple[str, Path]] = (),
 ) -> str:
     """The shell line a tmux window runs. Every token is quoted except
     `{prompt}`, which reads the prompt file at run time so the prompt never
     travels inside the tmux command string. `user_wired` adds the client's
     `user_wired` fragment (session variables for a client wired per user)
     right after the command."""
+    prefix, suffix = "", ""
+    for name, secret_file in secret_env:
+        if not SECRET_NAME_RE.fullmatch(name):
+            raise ConfigError(f"secret environment name {name!r} must match [A-Z_][A-Z0-9_]*")
+        quoted = shlex.quote(str(secret_file))
+        # the value is read at run time and the file removed at once, so the
+        # secret never enters the command string
+        prefix += f'export {name}="$(cat {quoted})"; rm -f {quoted}; '
+        suffix += f"unset {name}; "
     model_env = _model_env(template, values, model, client)
     fragments: list[list[str]] = []
     for key in (command_key, "user_wired", "model", "remote", "prompt"):
@@ -125,6 +156,8 @@ def render_command(
             continue
         if key == "remote" and not remote:
             continue
+        if key == "prompt" and command_key == "command" and uses_paste(template, client):
+            continue  # pasted into the window after launch instead
         fragment = _fragment(template, key, client)
         if fragment is None:
             if key in ("remote", "user_wired"):
@@ -151,7 +184,7 @@ def render_command(
                 f"({type(exc).__name__}: {exc}); placeholders are "
                 f"{', '.join('{' + k + '}' for k in values)}"
             ) from exc
-    return " ".join(parts) + f"; {after_exit}"
+    return prefix + " ".join(parts) + f"; {suffix}{after_exit}"
 
 
 def _fill_leaves(node: Any, values: Mapping[str, str]) -> Any:
@@ -349,6 +382,11 @@ def _clone_into(url: str, dest: Path, *, cfg: Mapping, run: commands.Runner) -> 
         raise SpawnError(f"cannot clone into {dest}: {exc}") from exc
     finally:
         shutil.rmtree(temp, ignore_errors=True)
+
+
+def wire_repo(client: str, path: Path, *, storage: Storage, notes: list[str]) -> None:
+    """Wire a folder for `client` so a session started there can join the bus."""
+    _wire_fresh_clone(client, path, storage=storage, notes=notes)
 
 
 def _wire_fresh_clone(
@@ -859,11 +897,15 @@ def _render(
     request: SpawnRequest, checked: _Checked, spawn_cfg: Mapping, *,
     values: Mapping[str, str], set_env: Mapping[str, str], user_wired: bool = False,
 ) -> str:
+    secret_names = {name for name, _ in request.secret_env}
+    strip_env = list(spawn_cfg["strip_env"])
+    if resolution.AUTHORITY_TOKEN_ENV not in secret_names:
+        strip_env.append(resolution.AUTHORITY_TOKEN_ENV)
     return render_command(
         checked.template, values=values, prompt_file=checked.prompt_file,
-        model=request.model, remote=request.remote, strip_env=spawn_cfg["strip_env"],
+        model=request.model, remote=request.remote, strip_env=strip_env,
         set_env=set_env, after_exit=spawn_cfg["after_exit"], client=request.client,
-        user_wired=user_wired,
+        user_wired=user_wired, secret_env=request.secret_env,
     )
 
 
@@ -887,12 +929,15 @@ def _check_templates(
 
 
 def _check_capacity(
-    storage: Storage, spawn_cfg: Mapping, now: datetime | None
+    storage: Storage, spawn_cfg: Mapping, now: datetime | None, *, exempt: bool = False
 ) -> list[status.StatusRow]:
-    """The status rows, after refusing when the spawn cap is reached."""
+    """The status rows, after refusing when the spawn cap is reached. Role
+    sessions (the dispatcher) never count, and `exempt` skips the check."""
     rows = status.collect(storage, grace_seconds=spawn_cfg["startup_grace_seconds"], now=now)
-    active = [r for r in rows if r.spawned and r.state in status.ACTIVE_STATES]
-    if len(active) >= spawn_cfg["max_sessions"]:
+    active = [
+        r for r in rows if r.spawned and r.role is None and r.state in status.ACTIVE_STATES
+    ]
+    if not exempt and len(active) >= spawn_cfg["max_sessions"]:
         raise SpawnError(
             f"{len(active)} spawned sessions are active, the cap is "
             f"{spawn_cfg['max_sessions']} (spawn.max_sessions in config.json): "
@@ -930,16 +975,22 @@ def _prepare_work_dir(
 
 
 _CALLER_SESSION_ENV = frozenset(
-    {resolution.SESSION_ENV, resolution.INSTANCE_ENV, resolution.SPAWN_TOKEN_ENV}
+    {
+        resolution.SESSION_ENV, resolution.INSTANCE_ENV, resolution.SPAWN_TOKEN_ENV,
+        resolution.AUTHORITY_TOKEN_ENV,
+    }
 )
 
 
 def _register_and_launch(
     request: SpawnRequest, result: SpawnResult, *, storage: Storage, spawn_cfg: Mapping,
     run: commands.Runner, env: Mapping[str, str], checked: _Checked, stamp: str,
+    sleep: Callable[[float], None] = time.sleep, paste: bool = False,
 ) -> SpawnResult:
     """Put the session on the roster, then open its window. When tmux refuses,
-    exactly what this call wrote is undone, restoring any earlier row."""
+    exactly what this call wrote is undone, restoring any earlier row. With
+    `paste`, the prompt file is pasted into the window once the client had
+    `prompt_ready_seconds` to start."""
     address = result.name
     # registering a session also registers its client address
     client_address = identity.parse(address).client_address
@@ -953,14 +1004,16 @@ def _register_and_launch(
         prompt_file=str(checked.prompt_file),
         tmux_session=result.tmux_session, tmux_window=result.tmux_window,
         remote=request.remote and checked.template.get("remote") is not None, spawned_at=stamp,
+        role=request.role,
     ))
     # The caller's own bus identity must not reach a tmux server this call may
     # create: its login shells would inherit it. The command sets these itself.
     strip = set(spawn_cfg["strip_env"]) | _CALLER_SESSION_ENV
+    window_env = {k: v for k, v in env.items() if k not in strip}
     try:
-        tmux.launch(
+        window_id = tmux.launch(
             result.tmux_session, result.tmux_window, Path(result.work_dir), result.command,
-            env={k: v for k, v in env.items() if k not in strip},
+            env=window_env,
             tmux_bin=spawn_cfg["tmux_bin"], timeout=spawn_cfg["tmux_timeout_seconds"], run=run,
         )
     except tmux.TmuxError as exc:
@@ -968,7 +1021,33 @@ def _register_and_launch(
         if not client_existed:
             storage.forget_agent(client_address)
         raise SpawnError(str(exc), EXIT_FAILED) from exc
+    if paste:
+        _paste_prompt(
+            result, checked, spawn_cfg, window_id, sleep=sleep, run=run, env=window_env)
     return SpawnResult(**{**asdict(result), "launched": True})
+
+
+def _paste_prompt(
+    result: SpawnResult, checked: _Checked, spawn_cfg: Mapping, window_id: str, *,
+    sleep: Callable[[float], None], run: commands.Runner, env: Mapping[str, str],
+) -> None:
+    """Deliver the first prompt after launch. The session is already running,
+    so a failure is a note on the result, not a refusal."""
+    wait = checked.template.get(DEFAULT_PROMPT_READY_SECONDS_KEY)
+    sleep(wait if isinstance(wait, (int, float)) and wait >= 0 else 0)
+    command = checked.template.get("command")
+    try:
+        tmux.paste_file(
+            window_id, checked.prompt_file,
+            client=command[0] if isinstance(command, list) and command else "",
+            tmux_bin=spawn_cfg["tmux_bin"], timeout=spawn_cfg["tmux_timeout_seconds"],
+            run=run, env=env,
+        )
+    except tmux.TmuxError as exc:
+        result.notes.append(
+            f"the window is open but its first prompt was not delivered ({exc}); "
+            f"paste {checked.prompt_file} into it by hand"
+        )
 
 
 def _roll_back(storage: Storage, address: str, agent, record: SpawnRecord | None) -> None:
@@ -992,6 +1071,7 @@ def spawn(
     run: commands.Runner = commands.run_command,
     env: Mapping[str, str] | None = None,
     now: datetime | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> SpawnResult:
     """Start the session, or raise SpawnError / ConfigError (never anything
     else for an expected failure). The error carries the notes gathered so far."""
@@ -999,7 +1079,7 @@ def spawn(
     try:
         return _spawn(
             request, storage=storage, cfg=cfg, run=run,
-            env=os.environ if env is None else env, now=now, notes=notes,
+            env=os.environ if env is None else env, now=now, notes=notes, sleep=sleep,
         )
     except (SpawnError, ConfigError) as exc:
         exc.notes = notes  # type: ignore[attr-defined]
@@ -1009,13 +1089,14 @@ def spawn(
 def _spawn(
     request: SpawnRequest, *, storage: Storage, cfg: Mapping, run: commands.Runner,
     env: Mapping[str, str], now: datetime | None, notes: list[str],
+    sleep: Callable[[float], None] = time.sleep,
 ) -> SpawnResult:
     spawn_cfg = cfg["spawn"]
     checked = _validate_request(request, spawn_cfg)
     _check_templates(request, checked, spawn_cfg, env)
     # Refusals that need no clone come first, so a refused spawn never leaves
     # a fresh clone behind.
-    rows = _check_capacity(storage, spawn_cfg, now)
+    rows = _check_capacity(storage, spawn_cfg, now, exempt=request.role is not None)
 
     found = _resolve_clone(request, storage=storage, cfg=cfg, run=run, notes=notes)
     clone = found.path
@@ -1062,7 +1143,8 @@ def _spawn(
         )
     return _register_and_launch(
         request, result, storage=storage, spawn_cfg=spawn_cfg, run=run, env=env,
-        checked=checked, stamp=stamp,
+        checked=checked, stamp=stamp, sleep=sleep,
+        paste=uses_paste(checked.template, request.client),
     )
 
 
@@ -1117,7 +1199,8 @@ def resume(
         values["model"] = request.model
     command = render_command(
         checked.template, values=values, prompt_file=checked.prompt_file,
-        model=request.model, remote=request.remote, strip_env=spawn_cfg["strip_env"],
+        model=request.model, remote=request.remote,
+        strip_env=[*spawn_cfg["strip_env"], resolution.AUTHORITY_TOKEN_ENV],
         set_env=_session_env(handle, repo_path, work_dir, env, stamp),
         after_exit=spawn_cfg["after_exit"], client=request.client, command_key="resume_prompt",
     )

@@ -151,7 +151,8 @@ class AsanaSource:
                     project_gid, project.get("name") or "", section.get("name") or None
                 )
             )
-        if not any(m.project_id in mapped for m in memberships):
+        keep_unmapped = bool(self._cfg.get("unmapped_repos"))
+        if not keep_unmapped and not any(m.project_id in mapped for m in memberships):
             return None
         url = raw.get("permalink_url") or ""
         return Task(

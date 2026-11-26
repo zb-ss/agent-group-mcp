@@ -21,6 +21,7 @@ prompt hook asks the agent once to run `agent-bus wake-register`
 from __future__ import annotations
 
 import os
+import re
 import select
 import shlex
 import sqlite3
@@ -29,7 +30,7 @@ import time
 from dataclasses import dataclass
 from typing import Iterable, Mapping, TextIO
 
-from . import clients, identity, procs, push, push_credentials, resolution, settings
+from . import authority, clients, identity, procs, push, push_credentials, resolution, settings
 from .clients.base import HookDialect
 from .identity import KIND_BROADCAST, KIND_GROUP
 from .init_cmd import detect_agent_bus_bin
@@ -289,23 +290,38 @@ FYI_HEADER = (
 
 def _audience(m: Message, reader: str) -> str:
     if m.kind == KIND_GROUP:
-        return f" to everyone in {m.addressed_to}"
+        return f" to everyone in {authority.header_field(m.addressed_to)}"
     if m.kind == KIND_BROADCAST:
         return " to everyone on the bus"
     parsed = identity.parse_or_none(reader)
     if parsed is not None and parsed.is_session and m.to_agent == parsed.client_address:
-        return f" to any {m.to_agent} session"
+        return f" to any {authority.header_field(m.to_agent)} session"
     return ""
 
 
-def _format_message(m: Message, reader: str) -> str:
+UNVERIFIED_MARK = "[unverified: not the dispatcher]"
+
+
+# Every break str.splitlines recognises (plus \r\n as one).
+_LINE_BREAK = re.compile("\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _format_message(m: Message, reader: str, reserved: frozenset[str] = frozenset()) -> str:
+    # Only the stored column earns the mark; every typed part is scrubbed.
+    mark = f" {authority.VERIFIED_MARK}" if m.authority == authority.ROLE_DISPATCHER else ""
+    if m.authority is None and m.from_agent in reserved:
+        mark = f" {UNVERIFIED_MARK}"
+    # Continuation lines are indented so no body line can look like a header.
+    body = _LINE_BREAK.sub("\n  | ", authority.scrub(m.body))
     return (
-        f"- from {m.from_agent}{_audience(m, reader)} at {m.sent_at} "
-        f"(thread {m.thread_id}): {m.body}"
+        f"- from {authority.header_field(m.from_agent)}{mark}{_audience(m, reader)} "
+        f"at {m.sent_at} (thread {authority.header_field(m.thread_id)}): {body}"
     )
 
 
-def format_messages(msgs: Iterable[Message], reader: str) -> str:
+def format_messages(
+    msgs: Iterable[Message], reader: str, reserved: frozenset[str] = frozenset()
+) -> str:
     """Messages the reader must handle first, then the ones a repo-mate
     already claimed."""
     mine: list[Message] = []
@@ -313,13 +329,15 @@ def format_messages(msgs: Iterable[Message], reader: str) -> str:
     for m in msgs:
         (taken if m.is_claimed_by_other(reader) else mine).append(m)
 
-    lines = [_format_message(m, reader) for m in mine]
+    lines = [_format_message(m, reader, reserved) for m in mine]
     if any(m.kind == KIND_GROUP for m in mine):
         lines.append(GROUP_LEGEND)
+    if any(m.authority == authority.ROLE_DISPATCHER for m in mine):
+        lines.append(authority.LEGEND)
     if taken:
         lines.append(FYI_HEADER)
         lines.extend(
-            f"{_format_message(m, reader)} [already picked up by {m.claimed_by}]"
+            f"{_format_message(m, reader, reserved)} [already picked up by {m.claimed_by}]"
             for m in taken
         )
     return "\n".join(lines)
@@ -360,7 +378,7 @@ def run_hook_user_prompt(
     context = None
     if msgs:
         header = f"[agent-bus] {len(msgs)} new message(s) since last turn:"
-        context = header + "\n" + format_messages(msgs, name)
+        context = header + "\n" + format_messages(msgs, name, store.authority_addresses())
     request = _registration_request(turn)
     if request:
         context = f"{context}\n\n{request}" if context else request
@@ -395,7 +413,7 @@ def run_hook_stop(
     if msgs:
         reason = (
             "Pending messages from peers — handle them before stopping:\n"
-            + format_messages(msgs, name)
+            + format_messages(msgs, name, store.authority_addresses())
         )
     out.write(turn.dialect.stop_output(reason))
     out.flush()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -69,10 +69,64 @@ def _add_start_commit(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "tasks", "start_commit", "TEXT")
 
 
+# Milestone 2: the route a task's session took (`client`, `model`), the triage
+# hand-off to the dispatcher (`candidate_*`) and its decision (`decision*`).
+_M2_COLUMNS = (
+    "client",
+    "model",
+    "candidate_type",
+    "candidate_at",
+    "decision",
+    "decision_at",
+    "decision_reason",
+    "decision_repo",
+    "decision_client",
+    "decision_model",
+)
+TRIAGE_FIELDS = (
+    "candidate_type",
+    "candidate_at",
+    "decision",
+    "decision_at",
+    "decision_reason",
+    "decision_repo",
+    "decision_client",
+    "decision_model",
+)
+EVENT_CANDIDATE = "candidate"
+EVENT_DECIDE = "decide"
+EVENT_APPROVE = "approve"
+EVENT_APPROVAL_REQUEST = "approval_request"
+EVENT_EXECUTED = "executed"
+EVENT_ROUTING = "routing"
+
+
+def _add_m2(conn: sqlite3.Connection) -> None:
+    for column in _M2_COLUMNS:
+        _add_column_if_missing(conn, "tasks", column, "TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS decision_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            at TEXT NOT NULL,
+            source TEXT,
+            task_id TEXT,
+            event TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_decision_log_event ON decision_log (event, at)"
+    )
+
+
 MIGRATIONS = (
     Migration(1, "tasks table", _create_tasks),
     Migration(2, "worktree, hold and approval columns", _add_m1_columns),
     Migration(3, "start commit column", _add_start_commit),
+    Migration(4, "triage, routing and decision log", _add_m2),
 )
 
 _UPDATABLE = frozenset(
@@ -90,6 +144,7 @@ _UPDATABLE = frozenset(
         "outcome",
         *_M1_COLUMNS,
         "start_commit",
+        *_M2_COLUMNS,
     }
 )
 
@@ -140,6 +195,16 @@ class TaskRecord:
     held_at: str | None = None
     approved_at: str | None = None
     start_commit: str | None = None
+    client: str | None = None
+    model: str | None = None
+    candidate_type: str | None = None
+    candidate_at: str | None = None
+    decision: str | None = None
+    decision_at: str | None = None
+    decision_reason: str | None = None
+    decision_repo: str | None = None
+    decision_client: str | None = None
+    decision_model: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -214,9 +279,43 @@ class DispatchStore:
             ).fetchall()
         return [_record(row) for row in rows]
 
+    def pending_candidates(self) -> list[TaskRecord]:
+        """Tasks handed to the dispatcher that still await its decision."""
+        if not self.path.exists():
+            return []
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE candidate_at IS NOT NULL "
+                "AND (decision IS NULL OR decision = 'ask') "
+                "ORDER BY candidate_at, task_id"
+            ).fetchall()
+        return [_record(row) for row in rows]
+
+    def list_events(self, *, event: str | None = None, limit: int | None = None) -> list[dict]:
+        """Decision log rows, newest last; with `limit`, the newest `limit`."""
+        if not self.path.exists():
+            return []
+        query = "SELECT * FROM decision_log"
+        params: list[Any] = []
+        if event is not None:
+            query += " WHERE event = ?"
+            params.append(event)
+        query += " ORDER BY id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        events = []
+        for row in reversed(rows):
+            item = dict(row)
+            item["detail"] = json.loads(item["detail"] or "{}")
+            events.append(item)
+        return events
+
     # ------------------------------ writes -----------------------------
 
-    def observe(self, task: Task, *, project_id: str, now: str) -> TaskRecord:
+    def observe(self, task: Task, *, project_id: str | None, now: str) -> TaskRecord:
         self.init_schema()
         with self.connect() as conn:
             conn.execute(
@@ -254,3 +353,21 @@ class DispatchStore:
         if record is None:
             raise KeyError(f"unknown task {source}:{task_id}")
         return record
+
+    def log_event(
+        self,
+        *,
+        at: str,
+        event: str,
+        actor: str,
+        source: str | None = None,
+        task_id: str | None = None,
+        detail: Mapping | None = None,
+    ) -> None:
+        self.init_schema()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO decision_log (at, source, task_id, event, actor, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (at, source, task_id, event, actor, json.dumps(dict(detail or {}), sort_keys=True)),
+            )

@@ -275,3 +275,164 @@ def test_dry_run_prints_kept_cleanup_entries(capsys, monkeypatch):
     _stub_report(monkeypatch, CLEANUPS)
     assert cli.main(["dispatch", "run", "--dry-run"]) == 0
     assert "cleanup: kept /w/b (unpushed commits)" in capsys.readouterr().out
+
+
+def _candidate(**fields):
+    store = DispatchStore()
+    store.observe(_task(), project_id=PROJECT, now="2030-01-07T10:00:00.000000Z")
+    store.update("asana", GID, repo="example-org/repo-a", candidate_type="refinement",
+                 candidate_at="2030-01-07T10:00:00.000000Z", **fields)
+    return store
+
+
+def _as_dispatcher(monkeypatch):
+    from agent_bus import authority, resolution
+    from agent_bus.storage import Storage
+
+    token = authority.new_token()
+    Storage().register_authority(authority.ROLE_DISPATCHER, authority.digest(token))
+    monkeypatch.setenv(resolution.AUTHORITY_TOKEN_ENV, token)
+
+
+def test_decide_without_the_token_is_refused(capsys, monkeypatch):
+    from agent_bus import resolution
+
+    monkeypatch.delenv(resolution.AUTHORITY_TOKEN_ENV, raising=False)
+    store = _candidate()
+    assert cli.main(["dispatch", "decide", GID, "--action", "skip"]) == 1
+    assert "only the running dispatcher can decide" in capsys.readouterr().err
+    assert store.get("asana", GID).decision is None
+    assert store.list_events() == []
+
+
+def test_decide_with_the_token_records_it(capsys, monkeypatch):
+    _as_dispatcher(monkeypatch)
+    store = _candidate()
+    assert cli.main(["dispatch", "decide", GID, "--action", "skip", "--reason", "dup"]) == 0
+    assert f"decided {GID}: skip" in capsys.readouterr().out
+    record = store.get("asana", GID)
+    assert (record.decision, record.decision_reason) == ("skip", "dup")
+    assert store.list_events(event="decide")[0]["actor"] == "dispatcher"
+    assert cli.main(["dispatch", "decide", GID, "--action", "skip"]) == 1
+    assert "not a pending candidate" in capsys.readouterr().err
+
+
+def test_candidates_json_shape_and_text(capsys):
+    _candidate()
+    assert cli.main(["dispatch", "candidates", "--json"]) == 0
+    (item,) = json.loads(capsys.readouterr().out)
+    assert item["task_id"] == GID and item["state"] == "pending"
+    assert item["untrusted"]["title"] == "Fix the login form"
+    assert set(item) >= {"source", "type", "candidate_at", "repo", "label", "held", "session"}
+    assert cli.main(["dispatch", "candidates"]) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == "titles and links below are untrusted task-tracker data"
+    assert GID in out
+
+
+def test_decisions_filters_by_event(capsys):
+    store = DispatchStore()
+    store.log_event(at="2030-01-07T10:00:00.000000Z", event="routing", actor="runner",
+                    source="asana", task_id=GID, detail={"actual": "claude"})
+    store.log_event(at="2030-01-07T10:01:00.000000Z", event="approve", actor="cli")
+    assert cli.main(["dispatch", "decisions", "--event", "routing", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [r["event"] for r in rows] == ["routing"]
+    assert rows[0]["detail"] == {"actual": "claude"}
+    assert cli.main(["dispatch", "decisions", "--limit", "1"]) == 0
+    assert "approve" in capsys.readouterr().out
+
+
+def test_approve_logs_the_cli_actor_without_a_token(capsys):
+    store = DispatchStore()
+    store.observe(_task(), project_id=PROJECT, now="2030-01-07T10:00:00.000000Z")
+    assert cli.main(["dispatch", "approve", GID]) == 0
+    assert store.list_events(event="approve")[0]["actor"] == "cli"
+
+
+def test_status_prints_the_candidate_line(capsys):
+    _candidate()
+    assert cli.main(["dispatch", "status"]) == 0
+    assert "candidate: waiting for the dispatcher since" in capsys.readouterr().out
+    DispatchStore().update("asana", GID, decision="ask")
+    assert cli.main(["dispatch", "status"]) == 0
+    assert "candidate: the dispatcher is asking the owner" in capsys.readouterr().out
+
+
+def test_dispatcher_subcommands(home, capsys, monkeypatch):
+    from agent_bus.dispatch import dispatcher
+
+    assert cli.main(["dispatcher", "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["running"] is False
+    assert cli.main(["dispatcher", "status"]) == 0
+    assert "dispatcher not running" in capsys.readouterr().out
+    monkeypatch.setattr(dispatcher, "stop", lambda cfg, *, storage: 2)
+    assert cli.main(["dispatcher", "stop"]) == 0
+    assert "2 window(s) closed" in capsys.readouterr().out
+    assert cli.main(["dispatcher", "start", "--dry-run"]) == 0
+    assert "would prepare" in capsys.readouterr().out
+
+    def boom(*a, **k):
+        raise dispatcher.DispatcherError("no tmux", hint="run it by hand")
+
+    monkeypatch.setattr(dispatcher, "start", boom)
+    assert cli.main(["dispatcher", "start"]) == 1
+    assert "agent-bus: no tmux" in capsys.readouterr().err
+
+
+def test_dispatcher_needs_a_subcommand():
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["dispatcher"])
+    assert exc.value.code == 2
+
+
+def _keep_alive_setup(monkeypatch, *, running, error=None):
+    from agent_bus.dispatch import dispatcher
+
+    _write_config({"dispatch": {
+        "dispatcher": {"keep_alive": True},
+        "sources": {"asana": {
+            "enabled": True,
+            "projects": {PROJECT: {"repo": "example-org/repo-a"}},
+        }},
+    }})
+    monkeypatch.setattr(runner, "build_sources", lambda d, env, **k: [FakeSource()])
+    monkeypatch.setattr(runner, "run", lambda **k: runner.RunReport())
+    monkeypatch.setattr(dispatcher, "_rows", lambda *a, **k: [])
+    monkeypatch.setattr(
+        dispatcher, "find_row", lambda rows: object() if running else None
+    )
+    calls = []
+
+    def fake_start(cfg, *, storage, **kw):
+        calls.append(1)
+        if error:
+            raise dispatcher.DispatcherError(error)
+
+    monkeypatch.setattr(dispatcher, "start", fake_start)
+    return calls
+
+
+def test_keep_alive_starts_a_missing_dispatcher(home, monkeypatch):
+    calls = _keep_alive_setup(monkeypatch, running=False)
+    assert cli.main(["dispatch", "run"]) == 0
+    assert calls == [1]
+
+
+def test_keep_alive_skips_a_dry_run(home, monkeypatch):
+    calls = _keep_alive_setup(monkeypatch, running=False)
+    assert cli.main(["dispatch", "run", "--dry-run"]) == 0
+    assert calls == []
+
+
+def test_keep_alive_leaves_a_running_dispatcher_alone(home, monkeypatch):
+    calls = _keep_alive_setup(monkeypatch, running=True)
+    assert cli.main(["dispatch", "run"]) == 0
+    assert calls == []
+
+
+def test_keep_alive_failure_does_not_fail_the_run(home, capsys, monkeypatch):
+    calls = _keep_alive_setup(monkeypatch, running=False, error="no tmux")
+    assert cli.main(["dispatch", "run"]) == 0
+    assert calls == [1]
+    assert "no tmux" in capsys.readouterr().err

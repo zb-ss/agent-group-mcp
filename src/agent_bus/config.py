@@ -114,6 +114,8 @@ _TEMPLATE_SCHEMA = {
     "resume_prompt": (_is_str_list, "a list of strings or null", True),
     "user_wired": (_is_str_list, "a list of strings or null", True),
     "transcripts": (_is_str, "a string or null", True),
+    "prompt_delivery": (lambda v: v in ("argv", "paste"), '"argv" or "paste"', False),
+    "prompt_ready_seconds": (_is_non_negative_number, "a non-negative number", False),
 }
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 

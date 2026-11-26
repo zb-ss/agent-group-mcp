@@ -31,6 +31,7 @@ from . import formatting as fmt
 from . import identity
 from . import init_cmd
 from . import repo_identity
+from . import resolution
 from . import settings
 from . import spawn
 from . import status
@@ -86,6 +87,7 @@ def cmd_send(args: argparse.Namespace) -> int:
             body=body,
             thread_id=args.thread,
             actor=speaker,
+            authority_token=os.environ.get(resolution.AUTHORITY_TOKEN_ENV) or None,
         )
     except UnknownRecipientError as e:
         sys.stderr.write(f"agent-bus: {e}\n")
@@ -619,6 +621,57 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_resume(args: argparse.Namespace) -> int:
+    try:
+        cfg = config.load()
+        store = Storage()
+        record = store.get_spawn(args.address)
+        if record is None:
+            sys.stderr.write(f"agent-bus: {args.address} is not a spawned session\n")
+            return 1
+        found = spawn.find_resumable(
+            record.client,
+            cfg=cfg,
+            clone=Path(record.repo_path),
+            work_dir=Path(record.work_dir),
+            label=record.tmux_window,
+        )
+        if found is None:
+            sys.stderr.write(
+                f"agent-bus: no resumable {record.client} session found for {args.address}\n"
+            )
+            return 1
+        request = spawn.ResumeRequest(
+            address=args.address,
+            client=record.client,
+            label=record.tmux_window,
+            work_dir=Path(record.work_dir),
+            repo_path=Path(record.repo_path),
+            prompt_file=Path(args.prompt_file),
+            session_id=found.session_id,
+            model=args.model or record.model,
+            remote=not args.no_remote,
+            dry_run=args.dry_run,
+        )
+        result = spawn.resume(request, storage=store, cfg=cfg)
+    except config.ConfigError as e:
+        return _spawn_failure(str(e), None, 1, getattr(e, "notes", None))
+    except spawn.SpawnError as e:
+        return _spawn_failure(str(e), e.hint, e.exit_code, e.notes)
+    for note in result.notes:
+        sys.stderr.write(f"agent-bus: note: {note}\n")
+    if args.json:
+        sys.stdout.write(json.dumps(result.to_dict(), indent=2) + "\n")
+        return 0
+    where = f"tmux {result.tmux_session}:{result.tmux_window} ({result.work_dir})"
+    if result.launched:
+        sys.stdout.write(f"launched {result.name} in {where}\n")
+        sys.stdout.write(f"attach: tmux attach -t {result.tmux_session}\n")
+    else:
+        sys.stdout.write(f"would launch {result.name} in {where}\n{result.command}\n")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     try:
         cfg = config.load()
@@ -931,6 +984,25 @@ def build_parser() -> argparse.ArgumentParser:
         "Print what would run; change nothing."))
     s.add_argument("--json", action="store_true", help="Emit JSON result.")
     s.set_defaults(func=cmd_spawn)
+
+    # resume
+    s = sub.add_parser(
+        "resume",
+        help="Reopen an ended spawned session in its own tmux window.",
+        description=(
+            "Finds the client's session for a spawned address and resumes it "
+            "from its own folder with the prompt file as the next message."
+        ),
+    )
+    s.add_argument("address", help="Bus address of the spawned session.")
+    s.add_argument("--prompt-file", required=True, help="File holding the next message.")
+    s.add_argument("--model", help="Model override; defaults to the recorded one.")
+    s.add_argument("--no-remote", action="store_true", help=(
+        "Do not turn on the client's Remote Control."))
+    s.add_argument("--dry-run", action="store_true", help=(
+        "Print what would run; change nothing."))
+    s.add_argument("--json", action="store_true", help="Emit JSON result.")
+    s.set_defaults(func=cmd_resume)
 
     # status
     s = sub.add_parser("status", help="Show which sessions run where and what they are doing.")

@@ -32,11 +32,11 @@
         "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
       "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "resume": ["codex", "resume"], "worktree_links": [],
         "resume_prompt": null, "transcripts": null,
-        "user_wired": ["-c", "mcp_servers.agent-bus.env_vars=[\"AGENT_BUS_SESSION\", \"AGENT_BUS_SPAWN_TOKEN\", \"AGENT_BUS_REPO\", \"AGENT_BUS_DB\", \"AGENT_BUS_AUDIT_LOG\"]"]},
-      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": [],
+        "user_wired": ["-c", "mcp_servers.agent-bus.env_vars=[\"AGENT_BUS_SESSION\", \"AGENT_BUS_SPAWN_TOKEN\", \"AGENT_BUS_AUTHORITY_TOKEN\", \"AGENT_BUS_REPO\", \"AGENT_BUS_DB\", \"AGENT_BUS_AUDIT_LOG\"]"]},
+      "agy": {"command": ["agy", "--mode", "auto", "--add-dir", "{dir}"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": [],
         "resume_prompt": null, "transcripts": null,
         "worktree_trust": {"enabled": false, "file": "~/.gemini/antigravity-cli/settings.json", "key": "trustedWorkspaces"}},
-      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "resume": null, "worktree_links": [],
+      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "prompt_delivery": "paste", "prompt_ready_seconds": 6, "resume": null, "worktree_links": [],
         "resume_prompt": null, "transcripts": null,
         "model_env": {"OPENCODE_CONFIG_CONTENT": {"model": "{model}"}}}
     }
@@ -57,11 +57,15 @@
     "overlap_max_items": 10,
     "fetch_timeout_seconds": 120,
     "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify", "needs_approval", "worktree_removed"],
+    "dispatcher": {"client": "claude", "model": null, "label": "dispatcher", "group": "dispatcher", "dir": null, "playbook": "dispatcher", "remote": true, "keep_alive": false},
+    "triage": {"enabled": true, "fallback_after_minutes": 60},
+    "routing": {"enabled": false, "clients": {"claude": {"weight": 3, "types": {}, "per_complexity": 1, "models": []}, "codex": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}, "agy": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}}, "complexity": {"max": 5, "signals": []}, "overrides": []},
+    "decision_model": {"enabled": false, "mode": "shadow", "endpoint": "http://localhost:11434/v1/systemone", "allow_remote": false, "model": null, "timeout_seconds": 20, "max_state_chars": 2000},
     "defaults": {"client": "claude", "model": null, "worktree": null, "fetch": false, "clone": false, "remote": true},
     "types": {
       "refinement": {"action": "spawn", "playbook": "refinement"},
       "follow-up": {"action": "spawn", "playbook": "follow-up", "resume_playbook": "follow-up-resume"},
-      "implementation": {"action": "notify", "playbook": "implementation"}
+      "implementation": {"action": "spawn", "playbook": "implementation", "repos": []}
     },
     "rules": [
       {"type": "refinement", "section": ["(?i)refine"]},
@@ -69,7 +73,7 @@
       {"type": "implementation", "section": ["(?i)^(to ?do|ready|in progress)"]}
     ],
     "sources": {
-      "asana": {"enabled": false, "base_url": "https://app.asana.com/api/1.0", "token_env": "ASANA_TOKEN", "workspace": null, "lookahead_days": 0, "page_size": 100, "max_pages": 10, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "ignore_own_comments": true, "comment_authors": [], "projects": {}}
+      "asana": {"enabled": false, "base_url": "https://app.asana.com/api/1.0", "token_env": "ASANA_TOKEN", "workspace": null, "lookahead_days": 0, "page_size": 100, "max_pages": 10, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "ignore_own_comments": true, "comment_authors": [], "unmapped_repos": [], "projects": {}}
     },
     "notifiers": {
       "log": {"file": null},

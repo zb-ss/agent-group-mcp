@@ -225,12 +225,12 @@ def _tables(db: Path) -> set[str]:
         }
 
 
-def test_target_version_is_step_six():
-    assert migrations.target_version() == 1006
+def test_target_version_is_step_seven():
+    assert migrations.target_version() == 1008
 
 
 def test_fresh_db_has_step_five_objects(bus_paths, storage):
-    assert _user_version(bus_paths["db"]) == 1006
+    assert _user_version(bus_paths["db"]) == migrations.target_version()
     assert STEP_5_AGENT_COLUMNS <= _columns(bus_paths["db"], "agents")
     assert STEP_5_TABLES <= _tables(bus_paths["db"])
 
@@ -240,7 +240,7 @@ def test_legacy_db_gets_step_five_objects(legacy_db):
 
     Storage().init_schema()
 
-    assert _user_version(legacy_db) == 1006
+    assert _user_version(legacy_db) == migrations.target_version()
     assert STEP_5_AGENT_COLUMNS <= _columns(legacy_db, "agents")
     assert STEP_5_TABLES <= _tables(legacy_db)
 
@@ -274,7 +274,7 @@ def test_step_four_db_migrates_without_renaming_anything(bus_paths):
 
     Storage().init_schema()
 
-    assert _user_version(db) == 1006
+    assert _user_version(db) == migrations.target_version()
     assert STEP_5_AGENT_COLUMNS <= _columns(db, "agents")
     assert STEP_5_TABLES <= _tables(db)
     with sqlite3.connect(db) as conn:
@@ -329,7 +329,7 @@ def test_step_five_db_gains_the_links_column(bus_paths):
 
     Storage().init_schema()
 
-    assert _user_version(db) == 1006
+    assert _user_version(db) == migrations.target_version()
     assert "links" in _columns(db, "agents")
     assert Storage().get_agent("solo").link_list == []
 
@@ -337,7 +337,77 @@ def test_step_five_db_gains_the_links_column(bus_paths):
 def test_the_links_step_is_idempotent(bus_paths, storage):
     conn = sqlite3.connect(bus_paths["db"], isolation_level=None)
     try:
-        migrations.MIGRATIONS[-1].apply(conn)
+        migrations.MIGRATIONS[5].apply(conn)
     finally:
         conn.close()
     assert "links" in _columns(bus_paths["db"], "agents")
+
+
+def _step_six_db(db: Path) -> None:
+    conn = sqlite3.connect(db, isolation_level=None)
+    try:
+        for migration in migrations.MIGRATIONS[:6]:
+            migration.apply(conn)
+        conn.execute(
+            "INSERT INTO agents (name, repo_path, registered_at, last_seen) "
+            "VALUES ('example-org/claude-a', '/code/a', 't', 't')"
+        )
+        conn.execute(
+            "INSERT INTO messages (message_id, from_agent, to_agent, body, "
+            "thread_id, sent_at) VALUES ('m1', 'x', 'example-org/claude-a', "
+            "'hi', 't1', '2030-01-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO spawns (name, client, repo_id, repo_path, work_dir, "
+            "model, prompt_file, tmux_session, tmux_window, remote, spawned_at) "
+            "VALUES ('example-org/claude-a', 'claude', 'example-org/repo-a', "
+            "'/code/a', '/code/a', NULL, '/p', 's', 'w', 0, '2030-01-01T00:00:00Z')"
+        )
+        conn.execute("PRAGMA user_version = 1006")
+    finally:
+        conn.close()
+
+
+def test_step_six_db_upgrades_to_authority_columns(bus_paths):
+    from agent_bus.storage import Storage
+
+    db = bus_paths["db"]
+    _step_six_db(db)
+    assert "authority" not in _columns(db, "messages")
+
+    storage = Storage()
+    storage.init_schema()
+
+    assert _user_version(db) == 1008
+    assert "authority" in _columns(db, "messages")
+    assert "role" in _columns(db, "spawns")
+    assert "authorities" in _tables(db)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT body, authority FROM messages WHERE message_id = 'm1'"
+        ).fetchone() == ("hi", None)
+    record = storage.get_spawn("example-org/claude-a")
+    assert record is not None and record.role is None
+
+
+def test_pre_step_seven_statements_still_work(bus_paths, storage):
+    with sqlite3.connect(bus_paths["db"]) as conn:
+        conn.execute(
+            "INSERT INTO agents (name, repo_path, registered_at, last_seen) "
+            "VALUES ('example-org/claude-b', '/code/b', 't', 't')"
+        )
+        conn.execute(
+            "INSERT INTO messages (message_id, from_agent, to_agent, body, "
+            "thread_id, sent_at, addressed_to, fanout_id, to_group) "
+            "VALUES ('m2', 'x', 'example-org/claude-b', 'yo', 't2', "
+            "'2030-01-01T00:00:00Z', NULL, NULL, NULL)"
+        )
+        conn.execute(
+            "INSERT INTO spawns (name, client, repo_id, repo_path, work_dir, "
+            "model, prompt_file, tmux_session, tmux_window, remote, spawned_at) "
+            "VALUES ('example-org/claude-b', 'claude', NULL, '/code/b', "
+            "'/code/b', NULL, '/p', 's', 'w', 1, '2030-01-01T00:00:00Z')"
+        )
+    msgs = storage.read_inbox(agent="example-org/claude-b", mark_read=False)
+    assert [(m.body, m.authority) for m in msgs] == [("yo", None)]
+    assert storage.get_spawn("example-org/claude-b").role is None

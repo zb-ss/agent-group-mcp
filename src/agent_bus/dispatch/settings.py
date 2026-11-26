@@ -8,7 +8,9 @@ holds the helpers that read it, so other modules never poke at raw keys.
 from __future__ import annotations
 
 import copy
+import fnmatch
 import re
+import urllib.parse
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +28,8 @@ from ..config import (
     _is_str_map,
 )
 
+DECISIONS = ("start", "resume", "skip", "ask")
+DECISION_MODES = ("shadow", "active")
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 ACTIONS = ("spawn", "notify", "ignore")
 TYPE_IGNORE = "ignore"
@@ -82,6 +86,11 @@ _ASANA_SCHEMA = {
     "max_pages": (lambda v: _is_int(v) and v >= 1, "an integer >= 1", False),
     "timeout_seconds": (_is_number, "a number", False),
     "max_retry_wait_seconds": (lambda v: _is_number(v) and v >= 0, "a number >= 0", False),
+    "unmapped_repos": (
+        lambda v: _is_str_list(v) and all(p.strip() for p in v),
+        "a list of non-empty repo id patterns",
+        False,
+    ),
 }
 _PROJECT_SCHEMA = {
     "client": (_is_str, "a string", False),
@@ -221,6 +230,12 @@ def _check_types(section: Any) -> None:
             resume is None or (_is_str(resume) and PLAYBOOK_NAME.fullmatch(resume) is not None),
             f"{key}.resume_playbook",
             "null or a playbook name (lowercase letters, digits and dashes)",
+        )
+        repos = entry.get("repos")
+        _require(
+            repos is None or (_is_str_list(repos) and all(p.strip() for p in repos)),
+            f"{key}.repos",
+            "null or a list of non-empty repo id patterns",
         )
 
 
@@ -376,6 +391,192 @@ def _check_timer(section: Any) -> None:
             ) from exc
 
 
+def _is_model_name(value: Any) -> bool:
+    return value is None or (_is_str(value) and not value.startswith("-"))
+
+
+def _check_dispatcher(section: Any) -> None:
+    _require(_is_obj(section), "dispatcher", "an object")
+    client = section.get("client")
+    _require(
+        _is_str(client) and identity.is_valid_client(client),
+        "dispatcher.client",
+        "a valid client name",
+    )
+    label = section.get("label")
+    valid_label = False
+    if _is_str(label) and not label.startswith("-"):
+        try:
+            identity.normalize_label(label)
+            valid_label = True
+        except ValueError:
+            pass
+    _require(valid_label, "dispatcher.label", "a valid session label not starting with '-'")
+    group = section.get("group")
+    _require(
+        _is_str(group) and bool(group) and identity.slugify(group) == group,
+        "dispatcher.group",
+        "a non-empty slug (lowercase letters, digits and dashes)",
+    )
+    _require(
+        section.get("dir") is None or _is_str(section.get("dir")),
+        "dispatcher.dir",
+        "a string or null",
+    )
+    playbook = section.get("playbook")
+    _require(
+        _is_str(playbook) and PLAYBOOK_NAME.fullmatch(playbook) is not None,
+        "dispatcher.playbook",
+        "a playbook name (lowercase letters, digits and dashes)",
+    )
+    _require(
+        _is_model_name(section.get("model")),
+        "dispatcher.model",
+        "a string not starting with '-' or null",
+    )
+    _require(_is_bool(section.get("remote")), "dispatcher.remote", "a boolean")
+    _require(_is_bool(section.get("keep_alive")), "dispatcher.keep_alive", "a boolean")
+
+
+def _check_triage(section: Any) -> None:
+    _require(_is_obj(section), "triage", "an object")
+    _require(_is_bool(section.get("enabled")), "triage.enabled", "a boolean")
+    minutes = section.get("fallback_after_minutes")
+    _require(
+        minutes is None or (_is_number(minutes) and minutes > 0),
+        "triage.fallback_after_minutes",
+        "a number > 0 or null",
+    )
+
+
+def _check_routing_client(name: Any, entry: Any) -> None:
+    key = f"routing.clients.{name}"
+    _require(_is_str(name) and identity.is_valid_client(name), "routing.clients", "keyed by valid client names")
+    _require(_is_obj(entry), key, "an object")
+    _require(_is_number(entry.get("weight")), f"{key}.weight", "a number")
+    types = entry.get("types")
+    _require(
+        _is_obj(types) and all(_is_number(v) for v in types.values()),
+        f"{key}.types",
+        "an object of numbers",
+    )
+    _require(_is_number(entry.get("per_complexity")), f"{key}.per_complexity", "a number")
+    models = entry.get("models")
+    _require(isinstance(models, list), f"{key}.models", "a list of {min_complexity, model} objects")
+    for index, item in enumerate(models):
+        item_key = f"{key}.models[{index}]"
+        _require(_is_obj(item), item_key, "an object")
+        minimum = item.get("min_complexity")
+        _require(_is_int(minimum) and minimum >= 0, f"{item_key}.min_complexity", "an integer >= 0")
+        _require(
+            "model" in item and _is_model_name(item["model"]),
+            f"{item_key}.model",
+            "a string not starting with '-' or null",
+        )
+
+
+def _check_complexity(section: Any) -> None:
+    _require(_is_obj(section), "routing.complexity", "an object")
+    maximum = section.get("max")
+    _require(
+        _is_int(maximum) and 1 <= maximum <= 25, "routing.complexity.max", "an integer from 1 to 25"
+    )
+    signals = section.get("signals")
+    _require(isinstance(signals, list), "routing.complexity.signals", "a list")
+    for index, signal in enumerate(signals):
+        key = f"routing.complexity.signals[{index}]"
+        _require(_is_obj(signal), key, "an object")
+        unknown = sorted(set(signal) - {"score", "type", "title", "section"})
+        _require(not unknown, key, f"free of unknown keys ({', '.join(unknown)})")
+        _require(_is_int(signal.get("score")), f"{key}.score", "an integer")
+        if "type" in signal:
+            _require(_is_str_list(signal["type"]), f"{key}.type", "a list of strings")
+        for pattern_key in ("title", "section"):
+            if pattern_key in signal:
+                _check_patterns(signal[pattern_key], f"{key}.{pattern_key}")
+
+
+def _check_overrides(overrides: Any) -> None:
+    _require(isinstance(overrides, list), "routing.overrides", "a list")
+    for index, item in enumerate(overrides):
+        key = f"routing.overrides[{index}]"
+        _require(_is_obj(item), key, "an object")
+        unknown = sorted(set(item) - {"client", "repo", "type", "model"})
+        _require(not unknown, key, f"free of unknown keys ({', '.join(unknown)})")
+        client = item.get("client")
+        _require(
+            _is_str(client) and identity.is_valid_client(client),
+            f"{key}.client",
+            "a valid client name",
+        )
+        if "repo" in item:
+            _require(_is_str(item["repo"]) and bool(item["repo"]), f"{key}.repo", "a non-empty string")
+        if "type" in item:
+            _require(_is_str(item["type"]), f"{key}.type", "a string")
+        if "model" in item:
+            _require(
+                _is_model_name(item["model"]), f"{key}.model", "a string not starting with '-' or null"
+            )
+
+
+def _check_routing(section: Any) -> None:
+    _require(_is_obj(section), "routing", "an object")
+    _require(_is_bool(section.get("enabled")), "routing.enabled", "a boolean")
+    clients = section.get("clients")
+    _require(_is_obj(clients), "routing.clients", "an object")
+    for name, entry in clients.items():
+        _check_routing_client(name, entry)
+    _check_complexity(section.get("complexity"))
+    _check_overrides(section.get("overrides"))
+
+
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def endpoint_problem(endpoint: str, allow_remote: bool) -> str | None:
+    """Why a decision-model endpoint may not be used, or None when it may."""
+    parts = urllib.parse.urlsplit(endpoint)
+    host = (parts.hostname or "").lower()
+    if host in LOCAL_HOSTS:
+        return None
+    if not allow_remote:
+        return "a local host (localhost, 127.0.0.1 or ::1) unless allow_remote is true"
+    if parts.scheme != "https":
+        return "https:// for a host other than the local machine"
+    return None
+
+
+def _check_decision_model(section: Any) -> None:
+    _require(_is_obj(section), "decision_model", "an object")
+    _require(_is_bool(section.get("enabled")), "decision_model.enabled", "a boolean")
+    _require(
+        section.get("mode") in DECISION_MODES,
+        "decision_model.mode",
+        f"one of {', '.join(DECISION_MODES)}",
+    )
+    endpoint = section.get("endpoint")
+    _require(
+        _is_str(endpoint) and endpoint.startswith(("http://", "https://")),
+        "decision_model.endpoint",
+        "a string starting with http:// or https://",
+    )
+    allow_remote = section.get("allow_remote")
+    _require(_is_bool(allow_remote), "decision_model.allow_remote", "a boolean")
+    problem = endpoint_problem(endpoint, allow_remote)
+    _require(problem is None, "decision_model.endpoint", problem or "")
+    model = section.get("model")
+    _require(model is None or _is_str(model), "decision_model.model", "a string or null")
+    _require(
+        not section["enabled"] or bool(model),
+        "decision_model.model",
+        "set when decision_model is enabled",
+    )
+    timeout = section.get("timeout_seconds")
+    _require(_is_number(timeout) and timeout > 0, "decision_model.timeout_seconds", "a number > 0")
+    chars = section.get("max_state_chars")
+    _require(_is_int(chars) and chars >= 1, "decision_model.max_state_chars", "an integer >= 1")
+
+
 def validate(section: Any) -> None:
     """Raise ConfigError naming the dotted key of the first bad value."""
     _check_section(section, _TOP_SCHEMA, "dispatch")
@@ -390,6 +591,10 @@ def validate(section: Any) -> None:
     _check_sources(section.get("sources"))
     _check_notifiers(section.get("notifiers"))
     _check_timer(section.get("timer"))
+    _check_dispatcher(section.get("dispatcher"))
+    _check_triage(section.get("triage"))
+    _check_routing(section.get("routing"))
+    _check_decision_model(section.get("decision_model"))
 
 
 def within_working_hours(working_hours: Mapping, local_now: datetime) -> bool:
@@ -412,6 +617,32 @@ def project_settings(dispatch_cfg: Mapping, source: str, project_id: str) -> dic
     merged = {**copy.deepcopy(dict(dispatch_cfg["defaults"])), **copy.deepcopy(entry)}
     merged.setdefault("playbooks", {})
     return merged
+
+
+def default_project(dispatch_cfg: Mapping, repo: str) -> dict:
+    """Settings for a repo that is not mapped to a project: the defaults."""
+    merged = copy.deepcopy(dict(dispatch_cfg["defaults"]))
+    merged["repo"] = repo
+    merged["playbooks"] = {}
+    return merged
+
+
+def type_repos(dispatch_cfg: Mapping, task_type: str) -> list[str] | None:
+    """The repo id patterns a type may spawn for; None when unrestricted."""
+    repos = dispatch_cfg["types"].get(task_type, {}).get("repos")
+    return None if repos is None else list(repos)
+
+
+def repo_allowed(patterns: list[str] | None, repo_id: str | None) -> bool:
+    if patterns is None:
+        return True
+    if repo_id is None:
+        return False
+    return any(fnmatch.fnmatchcase(repo_id, pattern) for pattern in patterns)
+
+
+def unmapped_repos(dispatch_cfg: Mapping, source: str) -> list[str]:
+    return list(dispatch_cfg["sources"].get(source, {}).get("unmapped_repos", []))
 
 
 def playbook_name(dispatch_cfg: Mapping, project: Mapping, task_type: str) -> str:
@@ -452,3 +683,11 @@ def prompts_dir(dispatch_cfg: Mapping) -> Path:
 
 def timer_output_path(dispatch_cfg: Mapping) -> Path:
     return _configured_or(dispatch_cfg["timer"].get("output_file"), "dispatch-timer.log")
+
+
+def dispatcher_dir(dispatch_cfg: Mapping) -> Path:
+    return _configured_or(dispatch_cfg["dispatcher"].get("dir"), "dispatcher")
+
+
+def dispatcher_token_path() -> Path:
+    return paths.db_path().with_name("dispatcher.token")

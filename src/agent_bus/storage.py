@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import audit, identity, links as links_mod, migrations, push, settings, wake
+from . import audit, authority as authority_mod, identity, links as links_mod, migrations, push, settings, wake
 from .push import STATUS_RATE_LIMITED, STATUS_UNREGISTERED
 from .identity import BROADCAST, KIND_BROADCAST, KIND_DIRECT, KIND_GROUP
 from .paths import db_path, ensure_parents
@@ -72,7 +72,7 @@ class UnknownRecipientError(ValueError):
 
 MESSAGE_COLUMNS = (
     "message_id, from_agent, to_agent, body, thread_id, sent_at, read_at, "
-    "delivered_at, addressed_to, fanout_id, to_group, claimed_by"
+    "delivered_at, addressed_to, fanout_id, to_group, claimed_by, authority"
 )
 
 
@@ -168,6 +168,8 @@ class Message:
     fanout_id: str | None = None
     to_group: str | None = None
     claimed_by: str | None = None
+    # Role of a verified sender (e.g. "dispatcher"); NULL when unverified.
+    authority: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Message":
@@ -193,6 +195,7 @@ class Message:
             "addressed_to": self.addressed_to,
             "kind": self.kind,
             "claimed_by": self.claimed_by,
+            "authority": self.authority,
             "body": self.body,
             "thread_id": self.thread_id,
             "sent_at": self.sent_at,
@@ -304,11 +307,12 @@ class SpawnRecord:
     tmux_window: str
     remote: bool
     spawned_at: str
+    role: str | None = None
 
 
 _SPAWN_COLUMNS = (
     "name, client, repo_id, repo_path, work_dir, model, prompt_file, "
-    "tmux_session, tmux_window, remote, spawned_at"
+    "tmux_session, tmux_window, remote, spawned_at, role"
 )
 
 
@@ -574,6 +578,83 @@ class Storage:
         said `done` (a follow-up is new work)."""
         self.set_state(name, STATE_WORKING)
 
+    # --------------------------- authorities --------------------------------
+
+    def register_authority(self, role: str, token_sha256: str) -> None:
+        """Make `token_sha256` the only live token of `role`."""
+        self.init_schema()
+        now = _utc_now_iso()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "UPDATE authorities SET revoked_at = ? "
+                    "WHERE role = ? AND revoked_at IS NULL",
+                    (now, role),
+                )
+                conn.execute(
+                    "INSERT INTO authorities "
+                    "(token_sha256, role, created_at, revoked_at) "
+                    "VALUES (?, ?, ?, NULL)",
+                    (token_sha256, role, now),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def revoke_authority(self, role: str) -> int:
+        """Revoke every live token of `role`; returns the rows revoked."""
+        self.init_schema()
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE authorities SET revoked_at = ? "
+                "WHERE role = ? AND revoked_at IS NULL",
+                (_utc_now_iso(), role),
+            )
+            return cur.rowcount
+
+    def authority_role(self, token: str | None) -> str | None:
+        """Role of a live token, None for a missing, unknown or revoked one."""
+        if not token:
+            return None
+        self.init_schema()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT role FROM authorities "
+                "WHERE token_sha256 = ? AND revoked_at IS NULL",
+                (authority_mod.digest(token),),
+            ).fetchone()
+        return row["role"] if row else None
+
+    def set_authority_name(self, role: str, name: str) -> None:
+        """Record the bus address of the live session of `role`."""
+        self.init_schema()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE authorities SET name = ? WHERE role = ? AND revoked_at IS NULL",
+                (name, role),
+            )
+
+    def authority_addresses(self, *, live_only: bool = False) -> frozenset[str]:
+        """Addresses recorded for authority roles; only unrevoked ones when
+        `live_only`."""
+        self.init_schema()
+        sql = "SELECT name FROM authorities WHERE name IS NOT NULL"
+        if live_only:
+            sql += " AND revoked_at IS NULL"
+        with self.connect() as conn:
+            return frozenset(r["name"] for r in conn.execute(sql).fetchall())
+
+    def has_authority(self, role: str) -> bool:
+        self.init_schema()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM authorities WHERE role = ? AND revoked_at IS NULL",
+                (role,),
+            ).fetchone()
+        return row is not None
+
     # ----------------------------- spawns -----------------------------------
 
     def record_spawn(self, record: SpawnRecord) -> None:
@@ -581,12 +662,13 @@ class Storage:
         with self.connect() as conn:
             conn.execute(
                 f"INSERT OR REPLACE INTO spawns ({_SPAWN_COLUMNS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.name, record.client, record.repo_id,
                     record.repo_path, record.work_dir, record.model,
                     record.prompt_file, record.tmux_session,
                     record.tmux_window, int(record.remote), record.spawned_at,
+                    record.role,
                 ),
             )
 
@@ -834,6 +916,7 @@ class Storage:
         thread_id: str | None = None,
         actor: str | None = None,
         skip: frozenset[str] = frozenset(),
+        authority_token: str | None = None,
     ) -> dict:
         """Insert one row per recipient. Writes audit rows BEFORE returning.
 
@@ -848,6 +931,10 @@ class Storage:
         "group" or "broadcast". A group or broadcast with nobody to receive
         it is not an error — the lists are simply empty.
 
+        `authority_token` is the secret of a role (see `register_authority`);
+        a valid one stamps every row with that role, anything else leaves
+        the sender unverified.
+
         Raises UnknownRecipientError when `to` names nobody on the bus.
         """
         if not body:
@@ -858,6 +945,7 @@ class Storage:
         self.init_schema()
         sent_at = _utc_now_iso()
         actor_name = actor or from_agent
+        role = self.authority_role(authority_token)
 
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -865,6 +953,7 @@ class Storage:
                 delivery = self._deliver(
                     conn, from_agent=from_agent, to=to, body=body,
                     thread_id=thread_id, sent_at=sent_at, skip=skip,
+                    authority=role,
                 )
                 conn.execute("COMMIT")
             except Exception:
@@ -896,6 +985,7 @@ class Storage:
                 "thread_id": delivery.thread_id,
                 "body_preview": audit.body_preview(body),
                 "body_sha256": audit.body_sha256(body),
+                **({"authority": role} if role is not None else {}),
             }
             for mid, name in zip(delivery.message_ids, delivery.names)
         )
@@ -915,6 +1005,7 @@ class Storage:
         thread_id: str | None,
         sent_at: str,
         skip: frozenset[str] = frozenset(),
+        authority: str | None = None,
     ) -> "_Delivery":
         """Resolve `to` and insert one row per recipient, inside the
         caller's transaction."""
@@ -929,13 +1020,13 @@ class Storage:
             """
             INSERT INTO messages
                 (message_id, from_agent, to_agent, body, thread_id,
-                 sent_at, addressed_to, fanout_id, to_group)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 sent_at, addressed_to, fanout_id, to_group, authority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     mid, from_agent, recipient.name, body, thread, sent_at,
-                    to, fanout_id, recipient.group if is_fan_out else None,
+                    to, fanout_id, recipient.group if is_fan_out else None, authority,
                 )
                 for mid, recipient in zip(message_ids, recipients)
             ],
@@ -1268,11 +1359,13 @@ class Storage:
         from_agent: str, thread_id: str | None, body: str,
     ) -> tuple[bool, str]:
         if not plan.pushes:
+            # The wake command is user-configured and may relay these to a
+            # session: no typed text may carry the verified mark.
             return wake.fire_wake(
                 plan.agent.name,
-                from_agent=from_agent,
+                from_agent=authority_mod.header_field(from_agent),
                 to_agent=plan.agent.name,
-                body=body,
+                body=authority_mod.scrub(body),
                 thread_id=thread_id,
                 message_id=plan.message_id,
                 config=cfg,
