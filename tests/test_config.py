@@ -220,3 +220,24 @@ def test_client_resume_must_be_a_list_of_strings_or_null(bus_paths):
     path.write_text(json.dumps({"spawn": {"clients": {"claude": {"resume": None}}}}),
                     encoding="utf-8")
     assert config.load()["spawn"]["clients"]["claude"]["resume"] is None
+
+
+@pytest.mark.parametrize(
+    "key, value, wanted",
+    [
+        ("prompt_delivery", "typed", '"argv" or "paste"'),
+        ("prompt_ready_seconds", "soon", "a non-negative number"),
+        ("prompt_ready_seconds", -1, "a non-negative number"),
+    ],
+)
+def test_prompt_delivery_keys_are_validated(bus_paths, key, value, wanted):
+    path = config.config_path()
+    path.write_text(json.dumps({"spawn": {"clients": {"opencode": {key: value}}}}), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match=f"spawn.clients.opencode.{key} must be {wanted}"):
+        config.load()
+
+
+def test_opencode_pastes_its_prompt_by_default():
+    opencode = config.defaults()["spawn"]["clients"]["opencode"]
+    assert opencode["prompt_delivery"] == "paste"
+    assert opencode["prompt_ready_seconds"] > 0

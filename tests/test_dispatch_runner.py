@@ -251,9 +251,9 @@ def test_implementation_notifies_once_by_default(tmp_path, storage):
     assert _record(h).outcome == "notified"
 
 
-def test_implementation_spawns_when_configured(tmp_path, storage):
+def test_implementation_spawns_when_configured(tmp_path, storage, known_repo):
     h = Harness(tmp_path, storage, [_task(section="Ready")])
-    h.cfg["dispatch"]["types"]["implementation"]["action"] = "spawn"
+    h.cfg["dispatch"]["types"]["implementation"].update(action="spawn", repos=["*"])
     assert [d.result for d in h.go().decisions] == ["spawned"]
 
 
@@ -826,6 +826,15 @@ def test_resume_counts_against_the_per_run_limit_and_the_soft_limit(tmp_path, st
     assert h.resume.requests == []
 
 
+def test_dry_run_of_an_unseen_task_whose_label_has_an_active_session_is_skipped(h):
+    label = h.go(dry_run=True).decisions[0].label
+    h.rows = [_row(f"repo-a/claude-{label}", "working", live=True)]
+    assert h.store.get("asana", GID_A) is None
+    decisions = h.go(dry_run=True).decisions
+    assert [(d.result, d.reason) for d in decisions] == [("skipped", "session active")]
+    assert h.store.get("asana", GID_A) is None
+
+
 def test_type_without_resume_playbook_behaves_as_before(h, tmp_path):
     h.cfg["dispatch"]["types"]["follow-up"].pop("resume_playbook")
     h.go()
@@ -953,3 +962,479 @@ def test_spawn_records_the_start_commit(h, monkeypatch):
 def test_spawn_with_an_unknown_head_records_no_start_commit(h):
     h.go()
     assert _record(h).start_commit is None
+
+
+# --------------------- allowlist, routing, decision model --------------------
+
+REPO_ID = "git.example.test/example-org/repo-a"
+
+
+@pytest.fixture
+def known_repo(monkeypatch):
+    def resolve(name, **kwargs):
+        return repo_identity.LocalRepo(Path("/x"), REPO_ID, name)
+
+    monkeypatch.setattr(repo_identity, "resolve", resolve)
+
+
+def _impl(tmp_path, storage, repos):
+    h = Harness(tmp_path, storage, [_task(section="Ready")])
+    h.cfg["dispatch"]["types"]["implementation"].update(action="spawn", repos=repos)
+    return h
+
+
+@pytest.mark.parametrize(
+    ("repos", "result"),
+    [([], "notified"), (["git.example.test/example-org/*"], "spawned"),
+     (["git.example.test/other-org/*"], "notified")],
+)
+def test_type_repo_allowlist(tmp_path, storage, known_repo, repos, result):
+    h = _impl(tmp_path, storage, repos)
+    assert [d.result for d in h.go().decisions] == [result]
+    assert len(h.spawn.requests) == (result == "spawned")
+
+
+def test_unknown_repo_id_is_not_allowed(tmp_path, storage):
+    h = _impl(tmp_path, storage, ["*"])
+    h.cfg["repos"]["host_aliases"] = {}
+    # not resolvable and not a remote: no id, so notify-only
+    assert [d.result for d in h.go().decisions] == ["notified"]
+
+
+def _routing(h, **extra):
+    h.cfg["dispatch"]["routing"].update(enabled=True, **extra)
+    h.cfg["dispatch"]["routing"]["clients"]["codex"]["weight"] = 9
+    return h
+
+
+ALL = lambda client: True  # noqa: E731
+
+
+def test_routing_picks_the_scored_client(h):
+    _routing(h)
+    h.go(available=ALL)
+    assert h.spawn.requests[0].client == "codex"
+    record = _record(h)
+    assert (record.client, record.model) == ("codex", None)
+    assert len(_routing_events(h)) == 1
+
+
+def test_routing_skips_unavailable_clients(h):
+    _routing(h)
+    h.go(available=lambda c: c != "codex")
+    assert h.spawn.requests[0].client == "claude"
+
+
+def test_override_wins_over_scores(h):
+    _routing(h, overrides=[{"type": "refinement", "client": "agy", "model": "m-1"}])
+    h.go(available=ALL)
+    request = h.spawn.requests[0]
+    assert (request.client, request.model) == ("agy", "m-1")
+
+
+def test_dispatcher_decision_wins_over_routing(h):
+    _routing(h)
+    h.store.observe(h.source.tasks[0], project_id=PROJECT, now="2030-01-07T09:00:00.000000Z")
+    h.store.update("asana", GID_A, decision_client="agy", decision_model="m-2")
+    h.go(available=ALL)
+    request = h.spawn.requests[0]
+    assert (request.client, request.model) == ("agy", "m-2")
+
+
+def test_routing_off_keeps_static_client(h):
+    h.go(available=ALL)
+    assert h.spawn.requests[0].client == "claude"
+    assert _record(h).client == "claude"
+
+
+def test_follow_up_resume_keeps_the_recorded_client(h, tmp_path):
+    h.cfg["spawn"]["clients"]["codex"]["resume_prompt"] = ["{prompt}"]
+    _routing(h)
+    h.go(available=ALL)
+    h.store.update("asana", GID_A, work_dir=str(tmp_path), clone_path=str(tmp_path),
+                   client="claude", model="m-old")
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    h.go(available=ALL)
+    request, = h.resume.requests
+    assert (request.client, request.model) == ("claude", "m-old")
+    assert h.find.calls[0][0] == "claude"
+
+
+class FakeHttp:
+    def __init__(self, answer=None, error=None):
+        self.calls, self.answer, self.error = [], answer, error
+
+    def __call__(self, url, body, headers, timeout):
+        self.calls.append((url, body))
+        if self.error:
+            raise self.error
+        return self.answer
+
+
+ANSWER = b'{"answers": {"client": {"choice": "agy"}, "complexity": {"score": 2}}}'
+
+
+def _dm(h, mode="shadow"):
+    h.cfg["dispatch"]["decision_model"].update(enabled=True, mode=mode, model="m")
+    return h
+
+
+def _routing_events(h):
+    with h.store.connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM decision_log WHERE event = 'routing'")]
+
+
+def test_shadow_mode_records_and_does_not_decide(h):
+    import json
+    _dm(h)
+    http = FakeHttp(ANSWER)
+    h.go(available=ALL, http_post=http)
+    assert len(http.calls) == 1
+    assert h.spawn.requests[0].client == "claude"
+    event, = _routing_events(h)
+    detail = json.loads(event["detail"])
+    assert detail["actual"]["client"] == "claude"
+    assert detail["shadow"]["client"] == "agy"
+    assert (detail["mode"], detail["agree"]) == ("shadow", False)
+
+
+def test_http_failure_still_spawns_and_logs_the_error(h):
+    import json
+    from agent_bus.dispatch.decision_model import DecisionModelError
+    _dm(h)
+    h.go(available=ALL, http_post=FakeHttp(error=DecisionModelError("down")))
+    assert len(h.spawn.requests) == 1
+    detail = json.loads(_routing_events(h)[0]["detail"])
+    assert detail["shadow"]["error"] == "down" and detail["agree"] is None
+
+
+def test_active_mode_switches_the_client(h):
+    _dm(h, "active")
+    h.go(available=ALL, http_post=FakeHttp(ANSWER))
+    assert h.spawn.requests[0].client == "agy"
+    assert _record(h).client == "agy"
+
+
+def test_dry_run_never_consults_or_logs(h):
+    _dm(h)
+    http = FakeHttp(ANSWER)
+    report = h.go(available=ALL, http_post=http, dry_run=True)
+    assert [d.result for d in report.decisions] == ["would_spawn"]
+    assert http.calls == [] and h.store.list_tasks() == []
+
+
+def test_dispatcher_rows_do_not_count_toward_limits(tmp_path, storage):
+    h = Harness(tmp_path, storage, [_task()], soft_limit=1)
+    h.cfg["spawn"]["max_sessions"] = 1
+    row = dataclasses.replace(_row("repo-a/claude-disp", "working"), role="dispatcher")
+    h.rows = [row]
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+
+
+# ------------------------- triage through the dispatcher ----------------------
+
+DISPATCHER = "dispatcher/claude-dispatcher"
+OTHER_REPO = "example-org/repo-b"
+STAMP = "2030-01-07T10:00:00.000000Z"
+
+
+def _with_dispatcher(h, live=True, register=True):
+    if register:
+        h.storage.register_authority("dispatcher", "a" * 64)
+    row = dataclasses.replace(
+        _row(DISPATCHER, "working", live=live), role="dispatcher", group="dispatcher")
+    h.rows = [row] + [r for r in h.rows if r.name != DISPATCHER]
+    return h
+
+
+def _decide(h, decision, gid=GID_A, **fields):
+    h.store.update("asana", gid, decision=decision, decision_at=STAMP, **fields)
+
+
+def _events(h, event):
+    return h.store.list_events(event=event)
+
+
+def test_candidate_is_sent_once_and_nothing_spawns(h):
+    _with_dispatcher(h)
+    report = h.go()
+    assert [(d.result, d.action) for d in report.decisions] == [("delegated", "triage")]
+    assert h.spawn.requests == []
+    assert len(h.send.calls) == 1
+    sender, to, body = h.send.calls[0]
+    assert (sender, to) == (h.cfg["dispatch"]["bus_sender"], DISPATCHER)
+    first, second = body.splitlines()[:2]
+    assert first.startswith("agent-bus dispatch candidate.")
+    import json
+    payload = json.loads(second)
+    assert (payload["kind"], payload["reason"], payload["task_id"]) == (
+        "candidate", "new_task", GID_A)
+    record = _record(h)
+    assert record.candidate_at == STAMP and record.candidate_type == "refinement"
+    assert len(_events(h, "candidate")) == 1
+    assert [d.result for d in h.go().decisions] == ["delegated"]
+    assert len(h.send.calls) == 1
+
+
+def test_no_dispatcher_keeps_the_deterministic_path(h):
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    assert h.send.calls == []
+
+
+def test_dead_dispatcher_row_keeps_the_deterministic_path(h):
+    _with_dispatcher(h, live=False)
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+
+
+def test_unregistered_authority_keeps_the_deterministic_path(h):
+    _with_dispatcher(h, register=False)
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+
+
+def test_triage_disabled_keeps_the_deterministic_path(h):
+    _with_dispatcher(h)
+    h.cfg["dispatch"]["triage"]["enabled"] = False
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    assert h.send.calls == []
+
+
+def test_send_failure_falls_back_for_this_run(h):
+    _with_dispatcher(h)
+    h.send.error = ValueError("gone")
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    assert _record(h).candidate_at is None
+
+
+def test_fallback_timeout_runs_the_deterministic_path(h):
+    _with_dispatcher(h)
+    h.go()
+    h.store.update("asana", GID_A, candidate_at="2030-01-07T08:00:00.000000Z")
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    record = _record(h)
+    assert record.candidate_at is None
+    assert _events(h, "executed")[-1]["detail"]["by"] == "runner"
+
+
+def test_fallback_never_when_the_timeout_is_null(h):
+    _with_dispatcher(h)
+    h.cfg["dispatch"]["triage"]["fallback_after_minutes"] = None
+    h.go()
+    h.store.update("asana", GID_A, candidate_at="2000-01-07T08:00:00.000000Z")
+    assert [d.result for d in h.go().decisions] == ["delegated"]
+
+
+def test_decision_start_spawns_new_even_when_resumable(h, tmp_path):
+    _with_dispatcher(h)
+    h.go()
+    h.store.update("asana", GID_A, work_dir=str(tmp_path), clone_path=str(tmp_path),
+                   handled_types=("refinement",), session_name="repo-a/claude-old",
+                   handled_at=STAMP, last_comment_handled_at=COMMENT_1)
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    _decide(h, "start")
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    assert h.resume.requests == [] and len(h.spawn.requests) == 1
+    record = _record(h)
+    assert record.decision is None and record.candidate_at is None
+
+
+def test_decision_resume_messages_a_live_session(h):
+    _with_dispatcher(h)
+    h.go()
+    h.store.update("asana", GID_A, session_name="repo-a/claude-old",
+                   handled_types=("refinement",), handled_at=STAMP,
+                   last_comment_handled_at=COMMENT_1)
+    h.rows.append(_row("repo-a/claude-old", "working", live=True))
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    _decide(h, "resume")
+    assert [d.result for d in h.go().decisions] == ["messaged"]
+    assert h.send.calls[-1][1] == "repo-a/claude-old"
+    assert h.spawn.requests == []
+    assert _record(h).decision is None
+
+
+def test_decision_skip_marks_the_task_handled(h):
+    _with_dispatcher(h)
+    h.go()
+    _decide(h, "skip", decision_reason="duplicate of another task")
+    decision = h.go().decisions[0]
+    assert (decision.result, decision.action) == ("skipped", "skip")
+    assert decision.reason == "dispatcher: duplicate of another task"
+    record = _record(h)
+    assert record.decision is None and record.candidate_at is None
+    assert record.handled_types == ("refinement",) and record.handled_at == STAMP
+    assert _events(h, "executed")[-1]["detail"]["result"] == "skipped"
+    assert [d.result for d in h.go().decisions] == ["ignored"]
+    assert h.spawn.requests == []
+
+
+def test_decision_ask_stays_delegated_without_resending(h):
+    _with_dispatcher(h)
+    h.go()
+    _decide(h, "ask")
+    decision = h.go().decisions[0]
+    assert decision.result == "delegated" and "owner" in decision.reason
+    assert len(h.send.calls) == 1 and h.spawn.requests == []
+    assert _record(h).decision == "ask"
+
+
+def test_executed_spawn_clears_triage_and_logs(h):
+    _with_dispatcher(h)
+    h.go()
+    _decide(h, "start", decision_client="codex", decision_model="m-1")
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    record = _record(h)
+    assert all(getattr(record, name) is None for name in (
+        "candidate_type", "candidate_at", "decision", "decision_at", "decision_reason",
+        "decision_repo", "decision_client", "decision_model"))
+    assert h.spawn.requests[0].client == "codex"
+    detail = _events(h, "executed")[-1]["detail"]
+    assert (detail["result"], detail["by"]) == ("spawned", "dispatcher")
+
+
+def test_dry_run_with_a_dispatcher_sends_nothing(h):
+    _with_dispatcher(h)
+    report = h.go(dry_run=True)
+    assert [d.result for d in report.decisions] == ["would_delegate"]
+    assert h.send.calls == [] and h.store.list_tasks() == []
+    assert h.spawn.requests == []
+
+
+# ------------------------------ unmapped projects -----------------------------
+
+
+def _unmapped(tmp_path, storage, patterns=("*",)):
+    h = Harness(tmp_path, storage, [_task(project="1000000000009999")])
+    h.cfg["dispatch"]["sources"]["asana"]["unmapped_repos"] = list(patterns)
+    return h
+
+
+def test_unmapped_task_is_dropped_without_patterns(tmp_path, storage):
+    h = _unmapped(tmp_path, storage, patterns=())
+    _with_dispatcher(h)
+    assert h.go().decisions == [] and h.store.list_tasks() == []
+
+
+def test_unmapped_task_is_dropped_without_a_dispatcher(tmp_path, storage):
+    h = _unmapped(tmp_path, storage)
+    assert h.go().decisions == [] and h.store.list_tasks() == []
+
+
+def test_unmapped_task_becomes_a_candidate_then_spawns_in_the_decided_repo(tmp_path, storage):
+    import json
+    h = _unmapped(tmp_path, storage)
+    _with_dispatcher(h)
+    assert [d.result for d in h.go().decisions] == ["delegated"]
+    payload = json.loads(h.send.calls[0][2].splitlines()[1])
+    assert payload["reason"] == "unmapped_project" and payload["repo"] is None
+    _decide(h, "start", decision_repo=OTHER_REPO)
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    request = h.spawn.requests[0]
+    assert (request.repo, request.client) == (OTHER_REPO, "claude")
+    assert _record(h).repo == OTHER_REPO
+
+
+def test_unmapped_decision_for_a_repo_the_type_does_not_allow_fails(tmp_path, storage):
+    h = _unmapped(tmp_path, storage)
+    h.cfg["dispatch"]["types"]["refinement"]["repos"] = ["git.example.test/other/*"]
+    _with_dispatcher(h)
+    h.go()
+    _decide(h, "start", decision_repo=OTHER_REPO)
+    decision = h.go().decisions[0]
+    assert (decision.result, decision.reason) == ("failed", "repo not allowed for refinement")
+    assert h.spawn.requests == []
+
+
+def test_unmapped_skip_marks_it_handled(tmp_path, storage):
+    h = _unmapped(tmp_path, storage)
+    _with_dispatcher(h)
+    h.go()
+    _decide(h, "skip", decision_reason="not ours")
+    assert [d.result for d in h.go().decisions] == ["skipped"]
+    assert [d.result for d in h.go().decisions] == []
+
+
+def test_unmapped_dry_run_writes_nothing(tmp_path, storage):
+    h = _unmapped(tmp_path, storage)
+    _with_dispatcher(h)
+    assert [d.result for d in h.go(dry_run=True).decisions] == ["would_delegate"]
+    assert h.send.calls == [] and h.store.list_tasks() == []
+
+
+# ---------------------- approvals through the dispatcher ----------------------
+
+
+def test_hold_with_a_dispatcher_asks_it_and_sends_no_alert(tmp_path, storage):
+    import json
+    h = Harness(tmp_path, storage, [_task()], soft_limit=1)
+    _busy(h)
+    _with_dispatcher(h)
+    h.go()
+    _decide(h, "start")
+    h.send.calls.clear()
+    decision = h.go().decisions[0]
+    assert decision.result == "held" and decision.reason.endswith("the dispatcher was asked")
+    assert h.notifier.sent == [] and len(h.send.calls) == 1
+    assert json.loads(h.send.calls[0][2].splitlines()[1])["kind"] == "approval_request"
+    assert _record(h).held_at is not None
+    assert len(_events(h, "approval_request")) == 1
+    h.go()
+    assert len(h.send.calls) == 1  # not asked twice
+
+
+def test_hold_falls_back_to_the_alert_when_the_dispatcher_cannot_be_asked(tmp_path, storage):
+    h = Harness(tmp_path, storage, [_task()], soft_limit=1)
+    _busy(h)
+    _with_dispatcher(h)
+    h.go()
+    _decide(h, "start")
+    h.send.error = ValueError("bad")
+    decision = h.go().decisions[0]
+    assert decision.result == "held" and "agent-bus dispatch approve" in decision.reason
+    assert h.notifier.states == ["needs approval"]
+
+
+def test_hold_without_a_dispatcher_alerts_as_before(tmp_path, storage):
+    h = Harness(tmp_path, storage, [_task()], soft_limit=1)
+    _busy(h)
+    decision = h.go().decisions[0]
+    assert "agent-bus dispatch approve" in decision.reason
+    assert h.notifier.states == ["needs approval"] and h.send.calls == []
+
+
+def test_a_resume_decision_for_a_follow_up_on_a_spawned_unmapped_task_runs(tmp_path, storage):
+    from agent_bus.dispatch import decisions
+    h = _unmapped(tmp_path, storage)
+    _with_dispatcher(h)
+    h.go()
+    _decide(h, "start", decision_repo=OTHER_REPO)
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    h.source.tasks = [_task(project="1000000000009999", comment=COMMENT_2)]
+    assert [d.result for d in h.go().decisions] == ["delegated"]
+    decisions.decide(h.store, h.cfg, GID_A, action="resume", now=STAMP, actor="dispatcher")
+    assert _record(h).decision == "resume" and _record(h).decision_repo is None
+    results = [d.result for d in h.go().decisions]
+    assert results and results[0] != "delegated"
+    assert _record(h).decision is None
+
+
+def test_a_start_decision_beside_a_live_session_is_reopened_not_stuck(h, tmp_path):
+    _with_dispatcher(h)
+    h.go()
+    h.store.update("asana", GID_A, session_name="repo-a/claude-old",
+                   handled_types=("refinement",), handled_at=STAMP,
+                   last_comment_handled_at=COMMENT_1)
+    h.rows.append(_row("repo-a/claude-old", "working", live=True))
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    _decide(h, "start")
+    [decision] = h.go().decisions
+    assert decision.result == "skipped" and "reopened" in decision.reason
+    record = _record(h)
+    assert record.decision is None and record.candidate_at
+    # decide() itself refuses start while the session is live
+    from agent_bus.dispatch import decisions
+    with pytest.raises(decisions.DecisionError, match="live session"):
+        decisions.decide(h.store, h.cfg, GID_A, action="start", now=STAMP,
+                         actor="dispatcher", rows=h.rows)
+    _decide(h, "resume")
+    assert [d.result for d in h.go().decisions] == ["messaged"]

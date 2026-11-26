@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+from pathlib import Path
 from datetime import datetime
 
 import pytest
@@ -76,6 +77,45 @@ BAD_VALUES = [
     ({"worktree_cleanup": {"enabled": "yes"}}, "dispatch.worktree_cleanup.enabled"),
     ({"notify_on": ["waiting", "bogus"]}, "dispatch.notify_on"),
     ({"types": {"follow-up": {"resume_playbook": "a/b"}}}, "dispatch.types.follow-up.resume_playbook"),
+    ({"types": {"implementation": {"repos": "a/*"}}}, "dispatch.types.implementation.repos"),
+    ({"types": {"implementation": {"repos": [""]}}}, "dispatch.types.implementation.repos"),
+    ({"sources": {"asana": {"unmapped_repos": [""]}}}, "dispatch.sources.asana.unmapped_repos"),
+    ({"dispatcher": {"client": "Bad Client"}}, "dispatch.dispatcher.client"),
+    ({"dispatcher": {"label": "-x"}}, "dispatch.dispatcher.label"),
+    ({"dispatcher": {"group": "Not A Slug"}}, "dispatch.dispatcher.group"),
+    ({"dispatcher": {"dir": 5}}, "dispatch.dispatcher.dir"),
+    ({"dispatcher": {"playbook": "a/b"}}, "dispatch.dispatcher.playbook"),
+    ({"dispatcher": {"model": "-m"}}, "dispatch.dispatcher.model"),
+    ({"dispatcher": {"remote": "yes"}}, "dispatch.dispatcher.remote"),
+    ({"dispatcher": {"keep_alive": "yes"}}, "dispatch.dispatcher.keep_alive"),
+    ({"triage": {"enabled": 1}}, "dispatch.triage.enabled"),
+    ({"triage": {"fallback_after_minutes": 0}}, "dispatch.triage.fallback_after_minutes"),
+    ({"routing": {"enabled": "on"}}, "dispatch.routing.enabled"),
+    ({"routing": {"clients": {"claude": {"weight": "x"}}}}, "dispatch.routing.clients.claude.weight"),
+    ({"routing": {"clients": {"claude": {"types": {"a": "x"}}}}}, "dispatch.routing.clients.claude.types"),
+    ({"routing": {"clients": {"claude": {"per_complexity": None}}}}, "dispatch.routing.clients.claude.per_complexity"),
+    ({"routing": {"clients": {"claude": {"models": [{"min_complexity": -1, "model": "m"}]}}}},
+     "dispatch.routing.clients.claude.models[0].min_complexity"),
+    ({"routing": {"clients": {"claude": {"models": [{"min_complexity": 1, "model": "-m"}]}}}},
+     "dispatch.routing.clients.claude.models[0].model"),
+    ({"routing": {"complexity": {"max": 26}}}, "dispatch.routing.complexity.max"),
+    ({"routing": {"complexity": {"signals": [{"score": 1, "extra": 1}]}}}, "dispatch.routing.complexity.signals[0]"),
+    ({"routing": {"complexity": {"signals": [{"score": "a"}]}}}, "dispatch.routing.complexity.signals[0].score"),
+    ({"routing": {"complexity": {"signals": [{"score": 1, "title": ["("]}]}}},
+     "dispatch.routing.complexity.signals[0].title"),
+    ({"routing": {"overrides": [{"client": "Bad Client"}]}}, "dispatch.routing.overrides[0].client"),
+    ({"routing": {"overrides": [{"client": "codex", "repo": ""}]}}, "dispatch.routing.overrides[0].repo"),
+    ({"routing": {"overrides": [{"client": "codex", "model": "-m"}]}}, "dispatch.routing.overrides[0].model"),
+    ({"routing": {"overrides": [{"client": "codex", "extra": 1}]}}, "dispatch.routing.overrides[0]"),
+    ({"decision_model": {"mode": "loud"}}, "dispatch.decision_model.mode"),
+    ({"decision_model": {"endpoint": "ftp://x"}}, "dispatch.decision_model.endpoint"),
+    ({"decision_model": {"enabled": True}}, "dispatch.decision_model.model"),
+    ({"decision_model": {"allow_remote": "yes"}}, "dispatch.decision_model.allow_remote"),
+    ({"decision_model": {"endpoint": "https://models.example.test/x"}}, "dispatch.decision_model.endpoint"),
+    ({"decision_model": {"allow_remote": True, "endpoint": "http://models.example.test/x"}},
+     "dispatch.decision_model.endpoint"),
+    ({"decision_model": {"timeout_seconds": 0}}, "dispatch.decision_model.timeout_seconds"),
+    ({"decision_model": {"max_state_chars": 0}}, "dispatch.decision_model.max_state_chars"),
 ]
 
 
@@ -141,7 +181,7 @@ def test_resume_playbook_reader(bus_paths):
 def test_type_action(bus_paths):
     cfg = config.load()["dispatch"]
     assert settings.type_action(cfg, "refinement") == "spawn"
-    assert settings.type_action(cfg, "implementation") == "notify"
+    assert settings.type_action(cfg, "implementation") == "spawn"
     assert settings.type_action(cfg, "unknown") == "ignore"
 
 
@@ -246,3 +286,52 @@ def test_comment_authors_default_is_empty_and_list_is_valid(bus_paths):
     cfg = _load_with(bus_paths, {"dispatch": {"sources": {"asana": {
         "comment_authors": ["1000000000000050"]}}}})
     assert cfg["dispatch"]["sources"]["asana"]["comment_authors"] == ["1000000000000050"]
+
+
+def test_repo_allowed_and_type_repos(bus_paths):
+    assert settings.repo_allowed(None, "g/r")
+    assert settings.repo_allowed(None, None)
+    assert not settings.repo_allowed([], "g/r")
+    assert not settings.repo_allowed(["g/*"], None)
+    assert settings.repo_allowed(["g/*"], "g/r")
+    assert not settings.repo_allowed(["g/*"], "h/r")
+    cfg = config.load()["dispatch"]
+    assert settings.type_repos(cfg, "implementation") == []
+    assert settings.type_repos(cfg, "refinement") is None
+    assert settings.type_repos(cfg, "unknown") is None
+
+
+def test_default_project_and_unmapped(bus_paths):
+    cfg = config.load()["dispatch"]
+    project = settings.default_project(cfg, "g/r")
+    assert project["repo"] == "g/r" and project["playbooks"] == {}
+    assert project["client"] == cfg["defaults"]["client"]
+    project["client"] = "changed"
+    assert cfg["defaults"]["client"] != "changed"
+    assert settings.unmapped_repos(cfg, "asana") == []
+    assert settings.unmapped_repos(cfg, "other") == []
+
+
+def test_dispatcher_paths(bus_paths):
+    cfg = config.load()["dispatch"]
+    assert settings.dispatcher_dir(cfg) == paths_db_dir() / "dispatcher"
+    assert settings.dispatcher_token_path() == paths_db_dir() / "dispatcher.token"
+    cfg = _load_with(bus_paths, {"dispatch": {"dispatcher": {"dir": "~/somewhere"}}})["dispatch"]
+    assert settings.dispatcher_dir(cfg) == Path("~/somewhere").expanduser()
+
+
+def paths_db_dir() -> Path:
+    from agent_bus import paths
+
+    return paths.db_path().parent
+
+
+@pytest.mark.parametrize("endpoint,allow_remote", [
+    ("http://localhost:11434/v1/x", False),
+    ("http://127.0.0.1:11434/v1/x", False),
+    ("http://[::1]:11434/v1/x", False),
+    ("https://models.example.test/x", True),
+])
+def test_decision_model_endpoint_allowed(bus_paths, endpoint, allow_remote):
+    _load_with(bus_paths, {"dispatch": {"decision_model": {
+        "endpoint": endpoint, "allow_remote": allow_remote}}})

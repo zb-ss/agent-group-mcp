@@ -251,12 +251,16 @@ agents(name PK, repo_path, registered_at, last_seen,
        state NULL, state_at NULL)
 messages(message_id PK, from_agent, to_agent, body, thread_id,
          sent_at, read_at NULL, delivered_at NULL,
-         addressed_to NULL, fanout_id NULL, to_group NULL, claimed_by NULL)
+         addressed_to NULL, fanout_id NULL, to_group NULL, claimed_by NULL,
+         authority NULL)
 sessions(server_pid, server_started, client_address,   -- PK
          name, repo_path, lineage, session_key NULL, started_at, last_seen)
 repos(repo_path PK, repo_id NULL, checked_at)       -- cached remote ids
 spawns(name PK, client, repo_id NULL, repo_path, work_dir, model NULL,
-       prompt_file, tmux_session, tmux_window, remote, spawned_at)
+       prompt_file, tmux_session, tmux_window, remote, spawned_at,
+       role NULL)
+authorities(token_sha256 PK, role, created_at, revoked_at NULL,
+            name NULL)                              -- hashes only, never tokens
 -- Indices on (to_agent, read_at), (thread_id, sent_at),
 -- agents(group_name), messages(fanout_id) and sessions(client_address).
 -- Startup: PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
@@ -279,6 +283,13 @@ older `agent-bus` still works against a newer database — which matters
 because MCP servers started before an upgrade keep running. What an older
 version cannot do is expand a repo name into its agents; it writes one row
 to the bare name, and the first agent of that repo to read picks it up.
+Bus schema step 7 adds `messages.authority`, `spawns.role` and the
+`authorities` table, and step 8 adds `authorities.name`; a database of an
+earlier step upgrades with all rows intact. The dispatch database
+(`dispatch.db`) has its own steps; step 4 adds the task columns for the
+client of a session, the triage hand-off and the decision, and the
+`decision_log` table.
+
 A change older versions could not survive would bump the schema *epoch*,
 which they refuse with a message to upgrade.
 
@@ -413,8 +424,11 @@ agent-bus tail --json | jq '.[] | select(.op=="send")'
 
 Task dispatch has its own commands, described in
 [Dispatching tasks](#dispatching-tasks-agent-bus-dispatch):
-`dispatch run`, `dispatch status`, `dispatch install-timer` and
-`dispatch uninstall-timer`.
+`dispatch run`, `dispatch status`, `dispatch approve`, `dispatch candidates`,
+`dispatch decide`, `dispatch decisions`, `dispatch install-timer` and
+`dispatch uninstall-timer`. The always-on dispatcher session has
+`dispatcher start|stop|status`, and `agent-bus resume` reopens an ended
+spawned session.
 
 By default `tail -f` renders one-line summaries instead of raw JSON, so
 it stays readable while still being scriptable via `--json`.
@@ -859,6 +873,8 @@ The suite covers:
 - repo identity: URL normalisation (ssh, https, ports, host aliases), resolving a repo from the roster and from scanned roots
 - spawn: command rendering per client, the tmux calls (with a stand-in `tmux`), the cap, cloning, worktrees and their carried-over files, dry runs, registration on the bus
 - dispatch: the Asana source, rules, playbooks, state file, notifiers and timer files, driven with fake HTTP, SMTP, tmux and timers (no network)
+- authority: token hashing and revocation, verified and forged marks in hook output and `read_inbox`, the audit role, token secrecy in spawn commands and the database, and the dispatcher's start, stop and status
+- dispatch triage: candidates, decisions, fallbacks and dry runs, approvals through the dispatcher, unmapped repos, implementation repo patterns, routing policy and the decision model in shadow and active mode (fake HTTP, no Ollama), and `agent-bus resume`
 - state reporting: `set_session(state=...)`, the hooks' `working` / `waiting`, and renames carrying the state
 - status: states, liveness, `--all`, the `--json` keys
 - native wake: `hook-watch` waking, giving up, handing over to a newer watcher, following a session's address, standing down for `wake.json`, the rate limit, a stop signal; the Claude Code hook command's exit codes run for real; Codex routes kept by the hooks and `codex queue` run by senders (with a stand-in `codex`); agy's registration request, private credential store and `agy agentapi send-message` run by senders (with a stand-in `agy`); the opencode plugin's watcher under Node
@@ -1061,11 +1077,11 @@ stops `spawn` with an error naming it; `status` warns and carries on.
         "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
       "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "resume": ["codex", "resume"], "worktree_links": [],
         "resume_prompt": null, "transcripts": null,
-        "user_wired": ["-c", "mcp_servers.agent-bus.env_vars=[\"AGENT_BUS_SESSION\", \"AGENT_BUS_SPAWN_TOKEN\", \"AGENT_BUS_REPO\", \"AGENT_BUS_DB\", \"AGENT_BUS_AUDIT_LOG\"]"]},
-      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": [],
+        "user_wired": ["-c", "mcp_servers.agent-bus.env_vars=[\"AGENT_BUS_SESSION\", \"AGENT_BUS_SPAWN_TOKEN\", \"AGENT_BUS_AUTHORITY_TOKEN\", \"AGENT_BUS_REPO\", \"AGENT_BUS_DB\", \"AGENT_BUS_AUDIT_LOG\"]"]},
+      "agy": {"command": ["agy", "--mode", "auto", "--add-dir", "{dir}"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": [],
         "resume_prompt": null, "transcripts": null,
         "worktree_trust": {"enabled": false, "file": "~/.gemini/antigravity-cli/settings.json", "key": "trustedWorkspaces"}},
-      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "resume": null, "worktree_links": [],
+      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "prompt_delivery": "paste", "prompt_ready_seconds": 6, "resume": null, "worktree_links": [],
         "resume_prompt": null, "transcripts": null,
         "model_env": {"OPENCODE_CONFIG_CONTENT": {"model": "{model}"}}}
     }
@@ -1086,11 +1102,24 @@ stops `spawn` with an error naming it; `status` warns and carries on.
     "overlap_max_items": 10,
     "fetch_timeout_seconds": 120,
     "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify", "needs_approval", "worktree_removed"],
+    "dispatcher": {"client": "claude", "model": null, "label": "dispatcher", "group": "dispatcher", "dir": null, "playbook": "dispatcher", "remote": true, "keep_alive": false},
+    "triage": {"enabled": true, "fallback_after_minutes": 60},
+    "routing": {
+      "enabled": false,
+      "clients": {
+        "claude": {"weight": 3, "types": {}, "per_complexity": 1, "models": []},
+        "codex": {"weight": 2, "types": {}, "per_complexity": 0, "models": []},
+        "agy": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}
+      },
+      "complexity": {"max": 5, "signals": []},
+      "overrides": []
+    },
+    "decision_model": {"enabled": false, "mode": "shadow", "endpoint": "http://localhost:11434/v1/systemone", "allow_remote": false, "model": null, "timeout_seconds": 20, "max_state_chars": 2000},
     "defaults": {"client": "claude", "model": null, "worktree": null, "fetch": false, "clone": false, "remote": true},
     "types": {
       "refinement": {"action": "spawn", "playbook": "refinement"},
       "follow-up": {"action": "spawn", "playbook": "follow-up", "resume_playbook": "follow-up-resume"},
-      "implementation": {"action": "notify", "playbook": "implementation"}
+      "implementation": {"action": "spawn", "playbook": "implementation", "repos": []}
     },
     "rules": [
       {"type": "refinement", "section": ["(?i)refine"]},
@@ -1098,7 +1127,7 @@ stops `spawn` with an error naming it; `status` warns and carries on.
       {"type": "implementation", "section": ["(?i)^(to ?do|ready|in progress)"]}
     ],
     "sources": {
-      "asana": {"enabled": false, "base_url": "https://app.asana.com/api/1.0", "token_env": "ASANA_TOKEN", "workspace": null, "lookahead_days": 0, "page_size": 100, "max_pages": 10, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "ignore_own_comments": true, "comment_authors": [], "projects": {}}
+      "asana": {"enabled": false, "base_url": "https://app.asana.com/api/1.0", "token_env": "ASANA_TOKEN", "workspace": null, "lookahead_days": 0, "page_size": 100, "max_pages": 10, "timeout_seconds": 30, "max_retry_wait_seconds": 30, "ignore_own_comments": true, "comment_authors": [], "unmapped_repos": [], "projects": {}}
     },
     "notifiers": {
       "log": {"file": null},
@@ -1172,11 +1201,24 @@ stops `spawn` with an error naming it; `status` warns and carries on.
   `agent-bus spawn --client opencode --model <model>` puts
   `OPENCODE_CONFIG_CONTENT='{"model":"<model>"}'` in the launched command.
   A client with neither `model` nor `model_env` still refuses `--model`.
-  Known limit: opencode 2.4.1 ignores every configured model, including
-  this one and your own default, when it starts with `--prompt`, which is
-  how spawn starts it; the session then runs on an OpenCode-provided
-  default. The override does apply when opencode starts without a prompt
-  and to `opencode run`.
+  Known limit: opencode 2.4.1 ignores the models of some providers (a local
+  Ollama provider was seen; a Google model was honoured) when it starts
+  with `--prompt`. The template therefore sets `"prompt_delivery": "paste"`:
+  opencode starts without a prompt, spawn waits `prompt_ready_seconds`
+  (6 by default) and pastes the prompt file into the window (`tmux
+  load-buffer`, `paste-buffer`, Enter), so the prompt still never travels in
+  an argument and the model applies. If the paste fails the session stays
+  open and the result carries a note. `"prompt_delivery": "argv"` (the
+  default for every other client) passes the `prompt` fragment on the
+  command line.
+- agy sessions are started with `--add-dir {dir}`, which opens the working
+  folder as a workspace; without it agy loaded no workspace plugin, so the
+  agent-bus tools were missing and the session stayed `starting`
+  (agy 1.5.17).
+  Checked with agy 1.5.17: a session started in the clone itself joins the
+  bus; agy asks once per conversation before it calls an agent-bus tool
+  unless you allow those tools in its settings. A session started in a
+  worktree still does not load the agent-bus server, so it stays `starting`.
 - `spawn.clients.agy.worktree_trust` (`enabled` false by default, `file`,
   `key`) carries folder trust over to worktrees for Antigravity CLI. It acts
   only when the clone is already listed under `key` in that JSON file; the
@@ -1272,10 +1314,25 @@ process or session id) keeps the state it reported, `done` included; the
 ## Dispatching tasks (`agent-bus dispatch`)
 
 `agent-bus dispatch run` reads your tasks from a task source (first source:
-Asana), decides per task what to do with fixed rules from `config.json`, and
+Asana), classifies each task with fixed rules from `config.json`, and
 either starts a session for it with `agent-bus spawn` or only notifies you.
-There is no model in the decision loop. It is meant to run from a timer, and
-it is off until you enable a source.
+It is meant to run from a timer, and it is off until you enable a source.
+
+It works in one of two modes:
+
+- **With a running dispatcher** (see [The dispatcher](#the-dispatcher)) and
+  `dispatch.triage.enabled`, the timer only collects candidates: every task
+  whose type has the action `spawn` is handed to the dispatcher as one
+  structured bus message. The dispatcher decides per candidate: start a new
+  session, resume or message an existing one, skip, or ask you. The next
+  run carries the decision out.
+- **Without a dispatcher**, with triage off, when the dispatcher cannot be
+  messaged, or when a candidate has waited longer than
+  `dispatch.triage.fallback_after_minutes`, the timer decides by the fixed
+  rules alone, as it always did.
+
+A dry run changes nothing in either mode: no bus message, no state written,
+no session started.
 
 One run does, in order:
 
@@ -1285,12 +1342,15 @@ One run does, in order:
 4. Fetches the incomplete tasks assigned to the token's user that are due on or before today plus `lookahead_days`.
 5. Maps each task to a repo through `projects`: the repo comes from the first of the task's memberships whose project id is a key of `projects`. A task can sit in several projects at once, so map only the projects that belong to one repo and leave shared process projects (a board every repo uses, for example) unmapped; a rule's `project` scope is separate from this mapping and can name such a shared project. A task in no configured project is ignored and not stored.
 6. Classifies the task: rules are tried in order and the first match wins.
-7. Spawns a session with a prompt rendered from a playbook, or notifies only, according to the action of the task's type.
+7. Spawns a session with a prompt rendered from a playbook, or notifies only, according to the action of the task's type. With a running dispatcher a spawn-action task is handed to the dispatcher instead (result `delegated`; `would_delegate` in a dry run) and starts once the dispatcher has decided.
 
 ```bash
 agent-bus dispatch run [--dry-run] [--json] [--ignore-hours]
 agent-bus dispatch status [--json]
 agent-bus dispatch approve <task-id>
+agent-bus dispatch candidates [--json]
+agent-bus dispatch decide <task-id> --action start|resume|skip|ask [--source S] [--reason TEXT] [--repo REPO] [--client C] [--model M]
+agent-bus dispatch decisions [--json] [--event EVENT] [--limit N]
 agent-bus dispatch install-timer [--load] [--bin-path PATH]
 agent-bus dispatch uninstall-timer [--unload] [--bin-path PATH]
 ```
@@ -1360,8 +1420,29 @@ An invalid value makes the config fail to load, naming the dotted key.
 | `overlap_max_items` | Cap on the list of other in-flight or handled tasks of the same project (`10`) |
 | `fetch_timeout_seconds` | Timeout for `git fetch` before a spawn (`120`) |
 | `notify_on` | Which events notify: `waiting`, `done`, `ended`, `spawn_failed`, `notify`, `needs_approval`, `worktree_removed` (all seven). A config that sets `notify_on` itself must list `needs_approval` and `worktree_removed` to get those alerts |
+| `dispatcher.client` | Client the dispatcher runs on, any configured `spawn.clients` entry (`claude`) |
+| `dispatcher.model` | Model for the dispatcher (`null`: the client's default) |
+| `dispatcher.label` / `group` | Label and group of its bus address `<group>/<client>-<label>` (`dispatcher`, `dispatcher`) |
+| `dispatcher.dir` | Its working folder (`null`: `dispatcher` beside the database) |
+| `dispatcher.playbook` | Playbook name for its prompt (`dispatcher`) |
+| `dispatcher.remote` | Turn the client's Remote Control on (`true`) |
+| `dispatcher.keep_alive` | A real `dispatch run` starts the dispatcher when none runs; a start failure is a warning and the run continues with the fixed rules (`false`) |
+| `triage.enabled` | Hand spawn-action tasks to a running dispatcher (`true`; inert while none runs) |
+| `triage.fallback_after_minutes` | A candidate the dispatcher has not decided after this many minutes is handled by the fixed rules (`60`) |
+| `routing.enabled` | Choose client and model by the scoring policy (`false`) |
+| `routing.clients.<client>.weight` / `types` / `per_complexity` / `models` | Score parts of a client (`claude` 3/`{}`/1/`[]`, `codex` 2/`{}`/0/`[]`, `agy` 2/`{}`/0/`[]`); see *Routing* |
+| `routing.complexity.max` / `signals` | Highest complexity level and the signals that add to it (`5`, `[]`) |
+| `routing.overrides` | Ordered owner overrides by repo and type (`[]`) |
+| `decision_model.enabled` | Ask a local decision model (`false`) |
+| `decision_model.mode` | `shadow` records only, `active` may decide (`shadow`) |
+| `decision_model.endpoint` | Decision model URL (`http://localhost:11434/v1/systemone`) |
+| `decision_model.allow_remote` | Allow an endpoint host other than `localhost`, `127.0.0.1` or `::1`; a remote endpoint must still use `https://` (`false`) |
+| `decision_model.model` | Model name sent to the endpoint, required when enabled (`null`) |
+| `decision_model.timeout_seconds` | Request timeout (`20`) |
+| `decision_model.max_state_chars` | Cap on the task description sent (`2000`) |
 | `defaults` | Per-project defaults: `client` (`claude`), `model`, `worktree`, `fetch`, `clone`, `remote` |
-| `types.<type>.action` | `spawn`, `notify` or `ignore` per type |
+| `types.<type>.action` | `spawn`, `notify` or `ignore` per type (`implementation` spawns, but only for repos in its `repos` list) |
+| `types.<type>.repos` | Repo patterns the type may spawn for, matched against the repo id such as `github.com/example-org/*`; absent or `null`: every mapped repo, `[]`: none (`implementation`: `[]`, the others: absent) |
 | `types.<type>.playbook` | Playbook name for the type (same as the type) |
 | `types.<type>.resume_playbook` | Playbook sent to a live or resumed session instead of spawning (`follow-up-resume` for `follow-up`; none for the others) |
 | `rules` | Ordered classification rules, see below |
@@ -1375,6 +1456,7 @@ An invalid value makes the config fail to load, naming the dotted key.
 | `sources.asana.max_retry_wait_seconds` | Longest wait before the single retry after HTTP 429, whatever `Retry-After` asks (`30`). Redirects are never followed, so the token is never sent to another host. |
 | `sources.asana.ignore_own_comments` | Comments by the token's user do not count as new comments (`true`) |
 | `sources.asana.comment_authors` | Allowlist of user gids (digit strings). When non-empty, only comments by these users count as new comments; empty (`[]`) means any author. Recommended for unattended setups: otherwise anyone who can comment on a task can start a follow-up session |
+| `sources.asana.unmapped_repos` | Repo patterns for tasks of projects not in `projects`; non-empty and a running dispatcher make such tasks candidates (`[]`: they are dropped) |
 | `sources.asana.projects` | Project id to repo: a string, or an object with `repo` and optional `client`, `model`, `worktree`, `fetch`, `clone`, `remote`, `playbooks` |
 | `notifiers.log.file` | Log file (`dispatch.log` beside the database) |
 | `notifiers.macos.*` | `enabled`, `osascript_bin`, `title`, `timeout_seconds` |
@@ -1406,9 +1488,9 @@ to `follow-up`, and `to do` / `ready` / `in progress` sections to
 Each type has an action: `spawn` starts a session (a type with a
 `resume_playbook` first tries to reach the task's existing session, see
 *Follow-ups*), `notify` only notifies
-(once per task), `ignore` does nothing. `refinement` and `follow-up` spawn;
-`implementation` is notify-only by default, and
-`dispatch.types.implementation.action` set to `spawn` makes it spawn.
+(once per task), `ignore` does nothing. `refinement` and `follow-up` spawn. `implementation` has the action
+`spawn` but its `repos` list is empty by default, so it only notifies until
+you list repos (see *Implementation tasks*).
 A task whose session is live or in an active state is skipped.
 
 The label is built from `label.template` with `{gid}`, `{gid_suffix}`,
@@ -1542,6 +1624,180 @@ for each worktree it keeps.
   (`git cherry`). That covers merge commits, rebase merges and squashes of a
   single commit. A squash of several commits is not detected: the worktree is
   kept and you remove it by hand.
+
+### The dispatcher
+
+The dispatcher is an always-on agent session you talk to, for example from
+your phone. It runs in tmux in its own folder (`dispatch.dispatcher.dir`,
+by default `dispatcher` beside the database), outside every repository,
+under its own bus address `<group>/<client>-<label>` (by default
+`dispatcher/claude-dispatcher`). It can list sessions, message any session,
+spawn or resume sessions in any repo and approve held spawns; a repo that is
+not cloned is cloned only with `--clone`.
+
+```bash
+agent-bus dispatcher start [--dry-run] [--json]
+agent-bus dispatcher stop
+agent-bus dispatcher status [--json]
+```
+
+- `start --dry-run` shows what would happen and writes nothing. `start`
+  prepares the folder, wires it for the client, creates the authority token
+  (see *Authority*) and launches the client in tmux. A second `start`
+  reports that it already runs and exits 0.
+- The first launch in the new folder shows the client's folder-trust prompt.
+  Attach to the tmux window and answer it once.
+- With `dispatch.dispatcher.remote` (default on) and a client that has a
+  `remote` fragment (Claude Code by default), Remote Control is on, so you
+  can reach the session from the client's phone app.
+- `dispatch.dispatcher.client` picks another client, any entry of
+  `spawn.clients`.
+- Its prompt is the `dispatcher` playbook. A file `dispatcher.md` in
+  `dispatch.templates_dir` replaces the packaged one, so a private prompt can
+  live outside the repo.
+- It is exempt from `spawn.max_sessions`, `dispatch.soft_limit` and
+  `dispatch.max_spawns_per_run`: it neither counts against them nor is
+  refused when they are reached.
+- `stop` closes its window and revokes its authority. `status` shows the
+  name, state, tmux window, whether the authority is active and the pending
+  candidates.
+
+### Authority
+
+Other agents treat a verified dispatcher message as an instruction from you,
+without asking you a second time, unless the instruction is illogical or
+destructive without a valid reason.
+
+- `dispatcher start` creates a random token. Only the dispatcher's own tmux
+  window holds it; the database stores a hash only, and no command line,
+  spawn row or audit entry contains it. Every other session spawned or
+  resumed by agent-bus has the variable removed from its environment.
+- A message sent from the dispatcher session carries the token, so the bus
+  stores it with the authority `dispatcher`. Hooks print
+  `[verified dispatcher]` after the sender and `read_inbox` returns
+  `authority: dispatcher`. A message without the token, or with a wrong or
+  revoked one, has no authority whatever sender name it uses.
+- The same mark typed into a message body, a sender name or a thread id is
+  replaced with `[removed: forged dispatcher mark]`.
+- Every send is in the audit log with its role. `dispatch decide` and
+  `dispatch approve` run with the token are logged with the actor
+  `dispatcher`; `dispatch decide` fails without it.
+- Task titles and comments stay untrusted data, also in the dispatcher's
+  own prompt.
+
+Limit: this separates the dispatcher from other agents and scripts that use
+agent-bus. It does not protect against a process of the same OS user that
+reads another process's environment or edits the database files.
+
+### Triage
+
+```bash
+agent-bus dispatch candidates [--json]
+agent-bus dispatch decide TASK_ID --action start|resume|skip|ask [--source S] [--reason TEXT] [--repo REPO] [--client C] [--model M]
+agent-bus dispatch decisions [--json] [--event EVENT] [--limit N]
+```
+
+With a running dispatcher and `dispatch.triage.enabled`, a run sends one
+candidate message per spawn-action task and does not send it again. The
+candidates are new tasks of a spawn type, follow-ups, implementation tasks
+ready for work, and tasks of unmapped projects (below).
+
+- `candidates` lists the tasks waiting for a decision.
+- `decide` records a decision and needs the dispatcher's token, so it works
+  only from the dispatcher session, and only for a pending candidate.
+  `start` forces a new session, `resume` reaches the existing session by
+  message or resume as in *Follow-ups*, `skip` marks the task handled with
+  the `--reason`, and `ask` keeps it pending (the dispatcher asks you).
+  `--client` and `--model` (which needs `--client`) win over routing.
+  `--repo` names the repo of a task from an unmapped project. The next run
+  carries the decision out.
+- `decisions` shows the decision log: candidates, decisions, approvals,
+  executions and routing records. `--event` filters, `--limit` keeps the
+  newest rows.
+- `dispatch.triage.fallback_after_minutes` (`60`): a candidate still
+  undecided after that long, and any candidate while the dispatcher cannot
+  be messaged, is handled by the fixed rules.
+- Past the soft limit with a running dispatcher, the hold goes to the
+  dispatcher as an approval request instead of a notifier alert, and the
+  dispatcher asks you. `agent-bus dispatch approve` still works from a
+  shell.
+- `dispatch.sources.asana.unmapped_repos` lists repo patterns (for example
+  `github.com/example-org/*`). While it is non-empty and a dispatcher runs,
+  tasks of projects not in `projects` become candidates, and the
+  dispatcher's `decide --repo` must name a repo matching a pattern.
+  Otherwise such tasks are dropped as before.
+
+### Implementation tasks
+
+`dispatch.types.<type>.repos` limits where a type may spawn. Absent or
+`null` means every mapped repo, `[]` means none, and a list holds patterns
+matched against the repo id (`github.com/example-org/*`, `example-org/repo-a`).
+A type spawns only for matching repos and notifies otherwise. The packaged
+`implementation` type has `repos: []`, so by default it only notifies. To
+let it work in one organisation's repos:
+
+```json
+{"dispatch": {"types": {"implementation": {"repos": ["github.com/example-org/*"]}}}}
+```
+
+The packaged `implementation` playbook tells the session to work on a
+branch, commit, push, open a draft pull request, record a proof video when
+the repo supports it, and write a draft reply for the task tracker. It never
+merges, deploys or posts anything. The session reports the pull request and
+other links through `set_session` links, which the notifications carry. The
+playbook keeps the untrusted-data block.
+
+### Routing
+
+`dispatch.routing` chooses the client and model per task. It is off by
+default; the project's static `client` and `model` apply then. With
+`routing.enabled`, the order is:
+
+1. A dispatcher decision with `--client` / `--model`.
+2. The first matching entry of `routing.overrides` (`repo` pattern, `type`,
+   `client`, optional `model`).
+3. The scoring policy: each available client in `routing.clients` scores
+   `weight` plus its `types.<type>` bonus plus `per_complexity` times the
+   task's complexity; the highest score wins and the first wins a tie.
+   `routing.complexity.signals` entries (`type`, `title` and `section`
+   pattern lists, plus a `score`) add up to the complexity, capped at
+   `routing.complexity.max`. A client's `models` list (`min_complexity`,
+   `model`) picks the model by complexity.
+4. The static client and model when no client is available.
+
+A resumed or messaged session keeps the client it was started with, even
+when routing would now choose another. `opencode` is not routed to. Quota-
+aware routing is not built yet; the policy has a place for it.
+
+### Decision model
+
+`dispatch.decision_model` adds an optional local decision model. It needs a
+local Ollama (v0.35.0 or later) with a System One decision model; the
+endpoint default is `http://localhost:11434/v1/systemone` and `model` names
+the model (for example `example-decision-model`).
+
+- `mode: "shadow"` (default): each real spawn posts one request to the
+  endpoint and logs a `routing` row holding the actual choice and the
+  model's answer, or its error. It never changes the choice, and an
+  unreachable endpoint never fails a spawn.
+- `mode: "active"`: the model's client is used only when it is a configured
+  routing client and available, and never over an override or a dispatcher
+  decision.
+- The request carries the task type, the repo, the title and the section
+  names (at most `max_state_chars` characters) to the configured endpoint.
+  The endpoint must be on the local machine unless `allow_remote` is true,
+  and a remote endpoint must use `https://`.
+- Review with `agent-bus dispatch decisions --event routing`.
+
+### Resuming a spawned session
+
+```bash
+agent-bus resume ADDRESS --prompt-file FILE [--model M] [--no-remote] [--dry-run] [--json]
+```
+
+Reopens an ended spawned session in its own folder, in any repo, with the
+file as its next message. The client must have `resume_prompt` and
+`transcripts` templates.
 
 ---
 
@@ -1762,9 +2018,15 @@ holding turns open.
   handled task can start a follow-up session; set
   `sources.asana.comment_authors` to your own gid (and trusted colleagues)
   for unattended setups.
-- The one secret agent-bus keeps itself — the token an agy session
-  registers so that it can be woken — is never written to the database or
-  the audit log; see [Native wake](#native-wake-the-default).
+- The secrets agent-bus keeps itself — the token an agy session registers
+  so that it can be woken, and the dispatcher's authority token — are never
+  written to the database (the authority is stored as a hash) or the audit
+  log; see [Native wake](#native-wake-the-default) and
+  [Authority](#authority). The dispatcher is trusted like you: run it only
+  where you would run an unattended session of your own, and note that the
+  authority model does not defend against another process of your OS user.
+- With the decision model enabled, task titles and repo ids are sent to its
+  configured endpoint; keep that endpoint local.
 
 ## Out of scope (future work)
 

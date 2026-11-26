@@ -18,6 +18,7 @@ from agent_bus import clients, config, server, spawn, status, tmux
 from agent_bus.spawn import (
     EXIT_CAP_REACHED, EXIT_FAILED, EXIT_USAGE, SpawnError, SpawnRequest,
 )
+from agent_bus.config import ConfigError
 from agent_bus.storage import STATE_DONE, STATE_STARTING, TIMESTAMP_FORMAT, SpawnRecord
 
 NOW = datetime(2030, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -150,13 +151,127 @@ def test_claude_model_and_no_remote():
     [
         ("codex", None, 'codex "$(cat /tmp/p.txt)"; exec'),
         ("codex", "m1", 'codex -m m1 "$(cat /tmp/p.txt)"; exec'),
-        ("agy", None, 'agy --mode auto --remote-control -i "$(cat /tmp/p.txt)"; exec'),
-        ("agy", "m1", 'agy --mode auto --model m1 --remote-control -i "$(cat /tmp/p.txt)"; exec'),
-        ("opencode", None, 'opencode --standalone --auto --prompt "$(cat /tmp/p.txt)"; exec'),
+        ("agy", None, 'agy --mode auto --add-dir /d --remote-control -i "$(cat /tmp/p.txt)"; exec'),
+        ("agy", "m1", 'agy --mode auto --add-dir /d --model m1 --remote-control -i "$(cat /tmp/p.txt)"; exec'),
+        ("opencode", None, 'opencode --standalone --auto; exec'),
     ],
 )
 def test_other_clients(client, model, tail):
     assert f" AGENT_BUS_SESSION=fix-login {tail}" in _render(client, model=model)
+
+
+def test_paste_client_command_leaves_out_the_prompt_and_argv_clients_keep_it():
+    line = _render("opencode", model="m1")
+    assert "--prompt" not in line and "/tmp/p.txt" not in line
+    for client in ("claude", "codex", "agy"):
+        assert '"$(cat /tmp/p.txt)"' in _render(client)
+    cfg = config.defaults()
+    cfg["spawn"]["clients"]["opencode"]["prompt_delivery"] = "argv"
+    assert '--prompt "$(cat /tmp/p.txt)"' in _render("opencode", cfg=cfg)
+
+
+def test_agy_command_opens_the_working_folder_as_a_workspace():
+    line = _render("agy")
+    assert " agy --mode auto --add-dir /d " in line
+
+
+def test_unknown_prompt_delivery_is_a_config_error():
+    cfg = config.defaults()
+    cfg["spawn"]["clients"]["opencode"]["prompt_delivery"] = "typed"
+    with pytest.raises(config.ConfigError, match="prompt_delivery"):
+        _render("opencode", cfg=cfg)
+
+
+class PasteRun(FakeRun):
+    """FakeRun whose new window has id @9, which paste_file must target."""
+
+    def __call__(self, argv, *, timeout, env=None, cwd=None):
+        if argv[:2] in (["tmux", "new-session"], ["tmux", "new-window"]):
+            self.calls.append((list(argv), {"env": env, "timeout": timeout}))
+            return subprocess.CompletedProcess(argv, 0, "@9\n", "")
+        if argv[:2] == ["tmux", "display-message"]:
+            self.calls.append((list(argv), {"env": env, "timeout": timeout}))
+            return subprocess.CompletedProcess(argv, 0, "4242\n", "")
+        if argv[:1] == ["pgrep"]:
+            self.calls.append((list(argv), {"env": env, "timeout": timeout}))
+            return subprocess.CompletedProcess(argv, 0, "4243\n", "")
+        return super().__call__(argv, timeout=timeout, env=env, cwd=cwd)
+
+
+def _go_paste(storage, cfg, prompt, fake, sleeps, env=None):
+    return spawn.spawn(
+        SpawnRequest(repo="repo-a", client="opencode", name="fix-login", prompt_file=prompt),
+        storage=storage, cfg=cfg, run=fake, env=env or _env(), now=NOW, sleep=sleeps.append,
+    )
+
+
+def test_paste_client_gets_its_prompt_after_launch_without_the_text_in_any_argv(
+    storage, cfg, prompt
+):
+    fake, sleeps = PasteRun(), []
+    result = _go_paste(storage, cfg, prompt, fake, sleeps)
+    assert result.launched
+    assert not any("not delivered" in n for n in result.notes)
+    assert sleeps == [cfg["spawn"]["clients"]["opencode"]["prompt_ready_seconds"]]
+    verbs = [a[1] for a, _ in fake.tmux_calls()]
+    assert verbs.index("new-session") < verbs.index("load-buffer")
+    assert "list-windows" not in verbs[verbs.index("new-session"):]
+    assert verbs[verbs.index("load-buffer"):] == [
+        "load-buffer", "paste-buffer", "display-message", "send-keys"]
+    assert fake.argvs("pgrep")[0][-2:] == ["-x", "opencode"]
+    argvs = [a for a, _ in fake.calls]
+    load = fake.argvs("tmux", "load-buffer")[0]
+    assert str(prompt) in load
+    assert fake.argvs("tmux", "paste-buffer")[0][-2:] == ["-t", "@9"]
+    assert fake.argvs("tmux", "send-keys")[0][-3:] == ["-t", "@9", "Enter"]
+    assert not any("do the thing" in part for argv in argvs for part in argv)
+    assert str(prompt) not in fake.argvs("tmux", "new-session")[0][-1]
+
+
+def test_paste_follow_up_calls_do_not_get_the_authority_token(storage, cfg, prompt):
+    fake = PasteRun()
+    _go_paste(storage, cfg, prompt, fake, [],
+              env=_env(AGENT_BUS_AUTHORITY_TOKEN="secret-token", KEEP_ME="1"))
+    followups = [
+        meta["env"] for argv, meta in fake.calls
+        if argv[0] == "pgrep" or argv[:2] in (["tmux", "display-message"], ["tmux", "send-keys"])
+    ]
+    assert followups
+    for seen in followups:
+        assert "AGENT_BUS_AUTHORITY_TOKEN" not in seen and seen["KEEP_ME"] == "1"
+
+
+def test_argv_clients_are_never_pasted(storage, cfg, prompt):
+    sleeps = []
+    fake = PasteRun()
+    spawn.spawn(
+        SpawnRequest(repo="repo-a", client="claude", name="fix-login", prompt_file=prompt),
+        storage=storage, cfg=cfg, run=fake, env=_env(), now=NOW, sleep=sleeps.append,
+    )
+    assert sleeps == [] and fake.argvs("tmux", "load-buffer") == []
+
+
+def test_failed_paste_keeps_the_session_and_says_so(storage, cfg, prompt):
+    class Refuses(PasteRun):
+        def __call__(self, argv, *, timeout, env=None, cwd=None):
+            if argv[:2] == ["tmux", "load-buffer"]:
+                return subprocess.CompletedProcess(argv, 1, "", "no buffer")
+            return super().__call__(argv, timeout=timeout, env=env, cwd=cwd)
+
+    result = _go_paste(storage, cfg, prompt, Refuses(), [])
+    assert result.launched
+    assert any("first prompt was not delivered" in n for n in result.notes)
+    assert storage.get_spawn(result.name) is not None
+
+
+def test_dry_run_does_not_paste_or_sleep(storage, cfg, prompt):
+    fake, sleeps = PasteRun(), []
+    spawn.spawn(
+        SpawnRequest(repo="repo-a", client="opencode", name="fix-login",
+                     prompt_file=prompt, dry_run=True),
+        storage=storage, cfg=cfg, run=fake, env=_env(), now=NOW, sleep=sleeps.append,
+    )
+    assert sleeps == [] and fake.argvs("tmux", "load-buffer") == []
 
 
 def test_name_and_prompt_path_with_spaces_and_quotes_are_quoted():
@@ -186,7 +301,7 @@ def test_new_session_when_missing(storage, cfg, prompt, repo):
     result, fake = _go(storage, cfg, prompt)
     assert fake.tmux_calls()[1][0] == [
         "tmux", "new-session", "-d", "-s", "agents", "-n", "fix-login",
-        "-c", str(repo), result.command,
+        "-P", "-F", "#{window_id}", "-c", str(repo), result.command,
     ]
     assert result.launched and result.command.startswith("env -u CLAUDECODE")
 
@@ -195,7 +310,7 @@ def test_new_window_when_session_exists(storage, cfg, prompt, repo):
     result, fake = _go(storage, cfg, prompt, FakeRun(sessions={"agents"}))
     assert fake.tmux_calls()[1][0] == [
         "tmux", "new-window", "-d", "-t", "=agents:", "-n", "fix-login",
-        "-c", str(repo), result.command,
+        "-P", "-F", "#{window_id}", "-c", str(repo), result.command,
     ]
 
 
@@ -409,7 +524,7 @@ def test_live_done_session_still_holds_its_address(storage, cfg, prompt, monkeyp
     _go(storage, cfg, prompt)
     storage.set_state("repo-a/claude-fix-login", STATE_DONE)
     row = type("Row", (), {"name": "repo-a/claude-fix-login", "live": True,
-                           "state": STATE_DONE, "spawned": True})()
+                           "state": STATE_DONE, "spawned": True, "role": None})()
     monkeypatch.setattr(status, "collect", lambda *a, **k: [row])
     err = _fail(storage, cfg, prompt)
     assert err.exit_code == EXIT_FAILED and "already running" in str(err)
@@ -1424,3 +1539,72 @@ def test_resume_dry_run_writes_nothing(storage, cfg, prompt, repo, tmp_path):
     assert not result.launched and "--resume abc-123" in result.command
     assert not fake.tmux_calls()
     assert storage.get_agent(ADDRESS) is None and storage.get_spawn(ADDRESS) is None
+
+
+# ------------------------- role, secret environment --------------------------
+
+
+def _render_secret(secret_env, strip_env=None, name="fix-login"):
+    sc = config.defaults()["spawn"]
+    values = {"name": name, "label": name, "address": "x", "repo": "r",
+              "dir": "/d", "prompt_file": "/tmp/p.txt"}
+    return spawn.render_command(
+        sc["clients"]["claude"], values=values, prompt_file=Path("/tmp/p.txt"),
+        model=None, remote=True, strip_env=sc["strip_env"] if strip_env is None else strip_env,
+        set_env={}, after_exit=sc["after_exit"], client="claude", secret_env=secret_env,
+    )
+
+
+def test_secret_env_is_read_from_a_file_and_unset_afterwards(tmp_path):
+    secret_file = tmp_path / "token"
+    secret_file.write_text("s3cr3t-value")
+    line = _render_secret([("AGENT_BUS_AUTHORITY_TOKEN", secret_file)])
+    quoted = shlex.quote(str(secret_file))
+    assert line.startswith(
+        f'export AGENT_BUS_AUTHORITY_TOKEN="$(cat {quoted})"; rm -f {quoted}; env -u '
+    )
+    assert line.endswith('; unset AGENT_BUS_AUTHORITY_TOKEN; exec $SHELL -l')
+    assert "s3cr3t-value" not in line
+
+
+def test_invalid_secret_name_is_a_config_error(tmp_path):
+    with pytest.raises(ConfigError):
+        _render_secret([("bad name", tmp_path / "f")])
+
+
+def test_ordinary_spawn_strips_the_authority_token(storage, cfg, prompt):
+    result, _ = _go(storage, cfg, prompt)
+    assert "-u AGENT_BUS_AUTHORITY_TOKEN" in result.command
+    assert "export " not in result.command
+
+
+def test_secret_env_request_keeps_the_variable_out_of_the_strip_list(storage, cfg, prompt, tmp_path):
+    secret_file = tmp_path / "token"
+    secret_file.write_text("s3cr3t-value")
+    result, _ = _go(
+        storage, cfg, prompt,
+        secret_env=(("AGENT_BUS_AUTHORITY_TOKEN", secret_file),),
+    )
+    assert "-u AGENT_BUS_AUTHORITY_TOKEN" not in result.command
+    assert "unset AGENT_BUS_AUTHORITY_TOKEN;" in result.command
+    assert "s3cr3t-value" not in result.command
+
+
+def test_authority_token_of_the_caller_never_reaches_tmux(storage, cfg, prompt):
+    _, fake = _go(storage, cfg, prompt, env=_env(AGENT_BUS_AUTHORITY_TOKEN="caller-secret"))
+    assert fake.tmux_calls()[1][1]["env"] == {"PATH": "/usr/bin"}
+
+
+def test_role_is_stored_and_exempt_from_the_cap(storage, cfg, prompt):
+    cfg["spawn"]["max_sessions"] = 5
+    _fill(storage, 5)
+    result, _ = _go(storage, cfg, prompt, role="dispatcher")
+    assert result.launched
+    assert storage.get_spawn(result.name).role == "dispatcher"
+
+
+def test_role_row_does_not_count_toward_the_cap(storage, cfg, prompt):
+    cfg["spawn"]["max_sessions"] = 5
+    _fill(storage, 4)
+    _go(storage, cfg, prompt, name="chief", role="dispatcher")
+    assert _go(storage, cfg, prompt, name="other-job")[0].launched

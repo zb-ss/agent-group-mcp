@@ -349,3 +349,10 @@ def test_empty_comment_authors_allows_any_author():
     stories = {"1000000000000001": [story("2030-01-08T10:00:00.000Z", author="1000000000000077")]}
     src, _ = make([task("1000000000000001")], stories, comment_authors=[])
     assert src.fetch(today=TODAY)[0].newest_comment_at.startswith("2030-01-08")
+
+
+@pytest.mark.parametrize(("unmapped", "kept"), [([], 0), (["*"], 1)])
+def test_unmapped_project_tasks_need_unmapped_repos(unmapped, kept):
+    src, _ = make([task("1000000000000001", project="2999999999999999")],
+                  unmapped_repos=unmapped)
+    assert len(src.fetch(today=TODAY)) == kept

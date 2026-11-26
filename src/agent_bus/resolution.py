@@ -41,6 +41,8 @@ INSTANCE_ENV = "AGENT_BUS_INSTANCE"
 SESSION_ENV = "AGENT_BUS_SESSION"
 # set by `agent-bus spawn` only: proves a session is the one spawn started
 SPAWN_TOKEN_ENV = "AGENT_BUS_SPAWN_TOKEN"
+# set only by `agent-bus dispatcher start`: proves a sender is the dispatcher
+AUTHORITY_TOKEN_ENV = "AGENT_BUS_AUTHORITY_TOKEN"
 
 NAME_FILE = ".agent-bus-name"
 IGNORE_FILE = ".agent-bus-ignore"

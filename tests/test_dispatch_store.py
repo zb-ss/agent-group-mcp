@@ -169,7 +169,7 @@ def test_step_one_database_migrates_to_three(bus_db):
     conn.close()
 
     store.init_schema()
-    assert _version(store.path) == 3
+    assert _version(store.path) == MIGRATIONS[-1].step
     record = store.get("asana", "1")
     assert record is not None
     assert all(getattr(record, name) is None for name in NEW_FIELDS)
@@ -195,3 +195,73 @@ def test_unknown_extra_column_still_loads(bus_db):
     conn.close()
     record = store.get("asana", "1000000000000001")
     assert record is not None and record.title == "Fix login"
+
+
+M2_FIELDS = (
+    "client", "model", "candidate_type", "candidate_at", "decision", "decision_at",
+    "decision_reason", "decision_repo", "decision_client", "decision_model",
+)
+
+
+def test_step_three_database_migrates_to_four_keeping_records(bus_db):
+    store = DispatchStore()
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(store.path)
+    for migration in MIGRATIONS[:3]:
+        migration.apply(conn)
+    conn.execute("PRAGMA user_version = 3")
+    conn.execute(
+        "INSERT INTO tasks (source, task_id, title, url, first_seen_at) "
+        "VALUES ('asana', '1', 'T', 'https://example.com/t', ?)",
+        (NOW,),
+    )
+    conn.commit()
+    conn.close()
+
+    store.init_schema()
+    assert _version(store.path) == 4
+    record = store.get("asana", "1")
+    assert record is not None and record.title == "T"
+    assert all(getattr(record, name) is None for name in M2_FIELDS)
+    assert store.list_events() == []
+
+
+def test_m2_fields_round_trip(bus_db):
+    store = DispatchStore()
+    store.observe(_task(), project_id=None, now=NOW)
+    values = {name: f"value-{name}" for name in M2_FIELDS}
+    record = store.update("asana", "1000000000000001", **values)
+    assert all(getattr(record, name) == values[name] for name in M2_FIELDS)
+    assert record.project_id is None
+
+
+def test_log_event_round_trip_filter_and_limit(bus_db):
+    store = DispatchStore()
+    assert store.list_events() == []
+    for index, event in enumerate(("candidate", "decide", "candidate")):
+        store.log_event(
+            at=f"2026-01-01T00:00:0{index}Z", event=event, actor="dispatch",
+            source="asana", task_id=str(index), detail={"n": index},
+        )
+    store.log_event(at=NOW, event="routing", actor="dispatch")
+    everything = store.list_events()
+    assert [e["event"] for e in everything] == ["candidate", "decide", "candidate", "routing"]
+    assert everything[0]["detail"] == {"n": 0}
+    assert everything[-1]["detail"] == {} and everything[-1]["task_id"] is None
+    assert [e["task_id"] for e in store.list_events(event="candidate")] == ["0", "2"]
+    assert [e["task_id"] for e in store.list_events(event="candidate", limit=1)] == ["2"]
+
+
+def test_pending_candidates(bus_db):
+    store = DispatchStore()
+    assert store.pending_candidates() == []
+    for gid in ("1", "2", "3", "4"):
+        store.observe(
+            model.Task(source="asana", task_id=gid, title=gid, url="https://example.com/" + gid,
+                       due_on=None, modified_at=None, newest_comment_at=None),
+            project_id="p", now=NOW,
+        )
+    store.update("asana", "1", candidate_at=NOW, candidate_type="refinement")
+    store.update("asana", "2", candidate_at=NOW, decision="ask")
+    store.update("asana", "3", candidate_at=NOW, decision="skip")
+    assert [r.task_id for r in store.pending_candidates()] == ["1", "2"]

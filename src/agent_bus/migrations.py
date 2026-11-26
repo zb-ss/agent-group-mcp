@@ -237,6 +237,30 @@ def _add_session_links(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "agents", "links", "TEXT")
 
 
+def _add_authority(conn: sqlite3.Connection) -> None:
+    """`messages.authority`: role of a verified sender. NULL means an
+    unverified sender or an older binary. `spawns.role`: NULL means an
+    ordinary spawn. `authorities` holds the sha256 of each role token."""
+    _add_column_if_missing(conn, "messages", "authority", "TEXT")
+    _add_column_if_missing(conn, "spawns", "role", "TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS authorities (
+            token_sha256 TEXT PRIMARY KEY,
+            role TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            revoked_at TEXT
+        )
+        """
+    )
+
+
+def _add_authority_name(conn: sqlite3.Connection) -> None:
+    """`authorities.name`: bus address of the role's session. NULL means not
+    known (yet), or written by an older binary."""
+    _add_column_if_missing(conn, "authorities", "name", "TEXT")
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "base tables (0.4.x schema)", _create_base_tables),
     Migration(2, "group addressing columns", _add_group_addressing_columns),
@@ -244,6 +268,8 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(4, "wake routes and wake history", _add_wake_routes),
     Migration(5, "session state, repo ids and spawn records", _add_state_repos_and_spawns),
     Migration(6, "session links", _add_session_links),
+    Migration(7, "message authority, spawn roles and authority tokens", _add_authority),
+    Migration(8, "authority session address", _add_authority_name),
 )
 
 

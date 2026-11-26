@@ -84,6 +84,7 @@ class StatusRow:
     remote: bool | None
     # tuple of {"label", "url"} dicts the session attached
     links: tuple = ()
+    role: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -153,6 +154,7 @@ def collect(
             model=record.model if record else None,
             remote=record.remote if record else None,
             links=tuple(agent.link_list),
+            role=record.role if record else None,
         ))
 
     for name, record in spawns.items():
@@ -181,6 +183,7 @@ def collect(
             tmux_window=record.tmux_window,
             model=record.model,
             remote=record.remote,
+            role=record.role,
         ))
 
     if not include_ended:

@@ -90,3 +90,41 @@ def test_overlap_text():
         "- Title 1 (https://t.example/1) [refinement, done, a/b]",
         "- Title 2 (https://t.example/2) [-, -, -]",
     ]
+
+
+MARK_RULE = "[verified dispatcher]"
+DISPATCHER_VALUES = {"label": "disp-1", "dir": "/work/dispatcher", "soft_limit": "3",
+                     "max_sessions": "5", "clients": "claude, codex"}
+
+
+def test_implementation_rules():
+    text = playbook.render("implementation", values(), templates_dir=None)
+    assert "Do not push" not in text
+    for phrase in ("DRAFT pull request", "proof video", "reply for the task tracker as a draft",
+                   "Never merge", "--- begin untrusted data ---", MARK_RULE):
+        assert phrase in text
+
+
+@pytest.mark.parametrize("name", ["refinement", "follow-up", "follow-up-resume"])
+def test_mark_rule_in_other_templates(name):
+    text = playbook.render(name, values(), templates_dir=None)
+    assert MARK_RULE in text
+    assert text.rstrip().splitlines()[-1].startswith("- A bus message marked")
+
+
+def test_dispatcher_renders():
+    text = playbook.render("dispatcher", DISPATCHER_VALUES, templates_dir=None)
+    assert not text.startswith("-")
+    for value in DISPATCHER_VALUES.values():
+        assert value in text
+    assert "agent-bus dispatch decide" in text and "$" not in text
+
+
+def test_dispatcher_rejects_task_placeholders():
+    with pytest.raises(PlaybookError):
+        playbook.render("dispatcher", values(), templates_dir=None)
+
+
+def test_dispatcher_override(tmp_path):
+    (tmp_path / "dispatcher.md").write_text("Private $label", encoding="utf-8")
+    assert playbook.render("dispatcher", DISPATCHER_VALUES, templates_dir=str(tmp_path)) == "Private disp-1"
