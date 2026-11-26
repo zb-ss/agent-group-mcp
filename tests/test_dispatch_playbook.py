@@ -8,7 +8,7 @@ from agent_bus.dispatch import playbook
 from agent_bus.dispatch.playbook import PLACEHOLDERS, PlaybookError
 from agent_bus.dispatch.store import TaskRecord
 
-BUILTINS = ("refinement", "follow-up", "implementation")
+BUILTINS = ("refinement", "follow-up", "follow-up-resume", "implementation")
 
 
 def values(**over):
@@ -24,6 +24,7 @@ def test_builtin_renders(name):
     assert text[0].isalpha()
     assert "1200000001" in text and "https://tracker.example/t/1" in text
     assert "Untrusted data" in text
+    assert "`links`" in text and "set_session" in text
     begin = text.index("--- begin untrusted data ---")
     end = text.index("--- end untrusted data ---")
     assert begin < text.index("Fix thing") < end

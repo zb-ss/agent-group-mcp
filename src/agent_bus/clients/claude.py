@@ -21,14 +21,17 @@ later.
 from __future__ import annotations
 
 import functools
+import json
 import re
 import subprocess
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from .. import settings
 from . import base
-from .base import UnreadableConfigError, WiringState, WiringStatus, WorktreePrep
+from .base import (
+    ResumableSession, UnreadableConfigError, WiringState, WiringStatus, WorktreePrep,
+)
 
 CLIENT_ID = "claude"
 SESSION_KEY_ENV = "CLAUDE_CODE_SESSION_ID"
@@ -301,7 +304,8 @@ class ClaudeWiring:
             base.write_json_object(local_settings_path(repo), local)
 
     def prepare_worktree(
-        self, clone: Path, worktree: Path, *, name: str, bin_path: str, dry_run: bool = False
+        self, clone: Path, worktree: Path, *, name: str, bin_path: str,
+        dry_run: bool = False, options: Mapping | None = None,
     ) -> WorktreePrep:
         """Give a worktree what Claude Code needs to join the bus there.
 
@@ -405,3 +409,49 @@ def _blocks_by_event(*, name: str, bin_path: str) -> dict[str, list[dict]]:
                 build_watch_block(name=name, bin_path=bin_path, max_seconds=seconds)
             )
     return blocks
+
+
+# Claude Code's transcript format (a fixed external contract, not tunables):
+# a session's name is stored as a line {"type": "custom-title", "customTitle": ...}.
+_TITLE_TYPE = "custom-title"
+_TITLE_KEY = "customTitle"
+_TITLE_MARKER = b'"custom-title"'
+
+
+def _transcript_title(path: Path) -> str | None:
+    """The last name recorded in the transcript at `path`, None when it has
+    none; raises OSError when the file cannot be read."""
+    title = None
+    with path.open("rb") as handle:
+        for line in handle:
+            if _TITLE_MARKER not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict) and entry.get("type") == _TITLE_TYPE:
+                value = entry.get(_TITLE_KEY)
+                if isinstance(value, str):
+                    title = value
+    return title
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def find_session(paths: Iterable[Path], *, label: str) -> ResumableSession | None:
+    """The newest transcript among `paths` whose session is named `label`."""
+    for path in sorted((Path(p) for p in paths), key=_mtime, reverse=True):
+        try:
+            if _transcript_title(path) != label:
+                continue
+            size = path.stat().st_size
+        except OSError:
+            continue
+        return ResumableSession(path.stem, path, size)
+    return None

@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from ..migrations import Migration
+from ..migrations import Migration, _add_column_if_missing
 from . import settings
 from .model import Task
 
@@ -43,7 +43,37 @@ def _create_tasks(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_label ON tasks (label)")
 
 
-MIGRATIONS = (Migration(1, "tasks table", _create_tasks),)
+# Where the task's session was last started and what became of it:
+# `work_dir`/`clone_path` are the session's work folder and its clone;
+# `worktree_removed_at` is when dispatch removed that worktree; `held_at` is
+# when the needs-approval alert for the current hold was delivered;
+# `approved_at` is when the owner approved starting past the soft limit.
+# Both hold fields are cleared when the session starts.
+_M1_COLUMNS = (
+    "work_dir",
+    "clone_path",
+    "worktree_removed_at",
+    "held_at",
+    "approved_at",
+)
+
+
+def _add_m1_columns(conn: sqlite3.Connection) -> None:
+    for column in _M1_COLUMNS:
+        _add_column_if_missing(conn, "tasks", column, "TEXT")
+
+
+# The commit the session's branch started from: a branch still at it has made
+# no commits, so being "merged" into the base proves nothing.
+def _add_start_commit(conn: sqlite3.Connection) -> None:
+    _add_column_if_missing(conn, "tasks", "start_commit", "TEXT")
+
+
+MIGRATIONS = (
+    Migration(1, "tasks table", _create_tasks),
+    Migration(2, "worktree, hold and approval columns", _add_m1_columns),
+    Migration(3, "start commit column", _add_start_commit),
+)
 
 _UPDATABLE = frozenset(
     {
@@ -58,6 +88,8 @@ _UPDATABLE = frozenset(
         "last_comment_handled_at",
         "last_notified_state",
         "outcome",
+        *_M1_COLUMNS,
+        "start_commit",
     }
 )
 
@@ -102,13 +134,21 @@ class TaskRecord:
     last_comment_handled_at: str | None = None
     last_notified_state: str | None = None
     outcome: str | None = None
+    work_dir: str | None = None
+    clone_path: str | None = None
+    worktree_removed_at: str | None = None
+    held_at: str | None = None
+    approved_at: str | None = None
+    start_commit: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 def _record(row: sqlite3.Row) -> TaskRecord:
-    data = dict(row)
+    # A database a later build migrated may carry columns this build does not
+    # know; it must stay readable.
+    data = {k: v for k, v in dict(row).items() if k in TaskRecord.__dataclass_fields__}
     data["handled_types"] = tuple(json.loads(data["handled_types"] or "[]"))
     return TaskRecord(**data)
 

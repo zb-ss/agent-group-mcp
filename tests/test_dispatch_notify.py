@@ -142,12 +142,102 @@ def test_email_tls_order_and_body():
     message = calls[2][1]
     assert message["Subject"] == "[bus] needs review: Fix the thing"
     assert message["To"] == "owner@example.com"
-    assert message.get_content().splitlines() == [
+    assert message.get_body(preferencelist=("plain",)).get_content().splitlines() == [
         "Session: t123-demo",
         "State: needs review",
         "Task: Fix the thing",
         "Link: https://example.com/t/1",
     ]
+
+
+LINKS = (("PR", "https://example.com/pr/1"), ("", "https://example.com/a"))
+
+
+def _mail(n):
+    return EmailNotifier(email_cfg(), env={}, smtp_factory=None)._message(n)
+
+
+def test_email_is_multipart_with_links():
+    message = _mail(Notification("s1", "done", "T", "https://example.com/t/1", LINKS))
+    assert message.get_content_type() == "multipart/alternative"
+    assert [p.get_content_type() for p in message.iter_parts()] == [
+        "text/plain",
+        "text/html",
+    ]
+    plain = message.get_body(preferencelist=("plain",)).get_content().splitlines()
+    assert plain == [
+        "Session: s1",
+        "State: done",
+        "Task: T",
+        "Link: https://example.com/t/1",
+        "PR: https://example.com/pr/1",
+        "Link: https://example.com/a",
+    ]
+    body = message.get_body(preferencelist=("html",)).get_content()
+    assert '<a href="https://example.com/t/1">T</a>' in body
+    assert '<li>PR: <a href="https://example.com/pr/1">https://example.com/pr/1</a></li>' in body
+    assert "<li>Link: <a href=\"https://example.com/a\">" in body
+
+
+def test_email_html_escapes_every_value():
+    n = Notification(
+        "s<1>", "d&ne", 'T<b>"&', "https://example.com/?a=1&b=\"2\"<x>",
+        (('L<i>"&', "https://example.com/?q=1&r=\"<2>"),),
+    )
+    body = _mail(n).get_body(preferencelist=("html",)).get_content()
+    for raw in ("<b>", "<i>", "<x>", "<2>", "s<1>", 'b="2"', "d&ne", 'T<b>'):
+        assert raw not in body
+    assert "&lt;b&gt;&quot;&amp;" in body
+    assert "&amp;r=&quot;&lt;2&gt;" in body
+
+
+def test_email_non_http_task_url_has_no_anchor():
+    n = Notification("s", "done", "T", "javascript:alert(1)")
+    body = _mail(n).get_body(preferencelist=("html",)).get_content()
+    assert "<a " not in body
+    assert "T (javascript:alert(1))" in body
+    assert "<ul>" not in body
+
+
+def test_deliver_drops_unsafe_links_and_caps_count():
+    seen = []
+
+    class Spy:
+        name = "spy"
+
+        def send(self, notification):
+            seen.append(notification)
+
+    pairs = (("x", "javascript:alert(1)"), ("y", "ftp://example.com/f")) + tuple(
+        (f"L{i}", f"https://example.com/{i}") for i in range(12)
+    )
+    notify.deliver([Spy()], Notification("s", "done", "T", "u", pairs), max_chars=100)
+    kept = seen[0].links
+    assert len(kept) == 8
+    assert all(url.startswith("https://") for _, url in kept)
+
+
+def test_macos_argv_unchanged_with_links():
+    plain, linked = FakeRun(), FakeRun()
+    MacosNotifier(MACOS_CFG, run=plain, platform="darwin").send(NOTE)
+    MacosNotifier(MACOS_CFG, run=linked, platform="darwin").send(
+        Notification(NOTE.session, NOTE.state, NOTE.title, NOTE.url, LINKS)
+    )
+    assert plain.calls == linked.calls
+
+
+def test_log_line_gains_links(tmp_path):
+    path = tmp_path / "d.log"
+    LogNotifier(path).send(Notification("s", "done", "T", "u", LINKS))
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1
+    assert lines[0].endswith(
+        " url=u links=https://example.com/pr/1 https://example.com/a"
+    )
+
+
+def test_notification_takes_four_positional_arguments():
+    assert Notification("s", "done", "T", "u").links == ()
 
 
 def test_email_missing_password_names_variable_only():

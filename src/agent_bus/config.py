@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -110,7 +111,40 @@ _TEMPLATE_SCHEMA = {
     "remote": (_is_str_list, "a list of strings or null", True),
     "prompt": (_is_str_list, "a list of strings", False),
     "resume": (_is_str_list, "a list of strings or null", True),
+    "resume_prompt": (_is_str_list, "a list of strings or null", True),
+    "user_wired": (_is_str_list, "a list of strings or null", True),
+    "transcripts": (_is_str, "a string or null", True),
 }
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _check_model_env(client: str, value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str)
+        and _ENV_NAME.fullmatch(k) is not None
+        and isinstance(v, (str, dict, list))
+        for k, v in value.items()
+    ):
+        raise ConfigError(
+            f"spawn.clients.{client}.model_env must be an object of environment "
+            f"variable names to a string, object or list"
+        )
+
+
+def _check_worktree_trust(client: str, value: Any) -> None:
+    if value is None:
+        return
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("enabled"), bool)
+        or not all(isinstance(value.get(k), str) and value[k] for k in ("file", "key"))
+    ):
+        raise ConfigError(
+            f"spawn.clients.{client}.worktree_trust must be an object with a boolean "
+            f"enabled and non-empty string file and key"
+        )
 
 
 def _check_section(section: Any, schema: dict, prefix: str) -> None:
@@ -148,6 +182,8 @@ def _validate(cfg: dict[str, Any]) -> None:
         raise ConfigError("spawn.clients must be an object")
     for client, template in clients.items():
         _check_section(template, _TEMPLATE_SCHEMA, f"spawn.clients.{client}")
+        _check_model_env(client, template.get("model_env"))
+        _check_worktree_trust(client, template.get("worktree_trust"))
         if template.get("worktree_links") is None:
             continue
         links = template["worktree_links"]

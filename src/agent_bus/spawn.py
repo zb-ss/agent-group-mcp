@@ -10,6 +10,8 @@ refuse the spawn has passed and tmux is known to be present.
 
 from __future__ import annotations
 
+import glob
+import json
 import os
 import re
 import shlex
@@ -23,7 +25,7 @@ from typing import Any, Mapping, Sequence
 
 from . import clients, commands, identity, paths, repo_identity, resolution, status, tmux
 from . import storage as storage_mod
-from .clients.base import UnreadableConfigError
+from .clients.base import ResumableSession, UnreadableConfigError
 from .config import ConfigError
 from .storage import SpawnRecord, Storage
 
@@ -106,19 +108,26 @@ def render_command(
     set_env: Mapping[str, str],
     after_exit: str,
     client: str | None = None,
+    user_wired: bool = False,
+    command_key: str = "command",
 ) -> str:
     """The shell line a tmux window runs. Every token is quoted except
     `{prompt}`, which reads the prompt file at run time so the prompt never
-    travels inside the tmux command string."""
+    travels inside the tmux command string. `user_wired` adds the client's
+    `user_wired` fragment (session variables for a client wired per user)
+    right after the command."""
+    model_env = _model_env(template, values, model, client)
     fragments: list[list[str]] = []
-    for key in ("command", "model", "remote", "prompt"):
-        if key == "model" and model is None:
+    for key in (command_key, "user_wired", "model", "remote", "prompt"):
+        if key == "user_wired" and not user_wired:
+            continue
+        if key == "model" and (model is None or (model_env and template.get("model") is None)):
             continue
         if key == "remote" and not remote:
             continue
         fragment = _fragment(template, key, client)
         if fragment is None:
-            if key == "remote":
+            if key in ("remote", "user_wired"):
                 continue
             raise ConfigError(
                 f"spawn.clients.{client or '?'}.{key} must be a list of strings"
@@ -128,7 +137,8 @@ def render_command(
     parts = ["env"]
     for var in strip_env:
         parts += ["-u", shlex.quote(var)]
-    parts += [f"{key}={shlex.quote(value)}" for key, value in set_env.items()]
+    env_values = {**model_env, **set_env}
+    parts += [f"{key}={shlex.quote(value)}" for key, value in env_values.items()]
     for token in (t for fragment in fragments for t in fragment):
         if token == PROMPT_TOKEN:
             parts.append(f'"$(cat {shlex.quote(str(prompt_file))})"')
@@ -142,6 +152,43 @@ def render_command(
                 f"{', '.join('{' + k + '}' for k in values)}"
             ) from exc
     return " ".join(parts) + f"; {after_exit}"
+
+
+def _fill_leaves(node: Any, values: Mapping[str, str]) -> Any:
+    if isinstance(node, str):
+        return node.format_map(values)
+    if isinstance(node, list):
+        return [_fill_leaves(item, values) for item in node]
+    if isinstance(node, dict):
+        return {key: _fill_leaves(item, values) for key, item in node.items()}
+    return node
+
+
+def _model_env(
+    template: Mapping, values: Mapping[str, str], model: str | None, client: str | None
+) -> dict[str, str]:
+    """The variables that carry `--model` for a client without a model flag:
+    strings are filled, objects and lists are filled leaf by leaf and sent
+    as compact JSON."""
+    spec = template.get("model_env")
+    if model is None or not spec:
+        return {}
+    if not isinstance(spec, dict):
+        raise ConfigError(f"spawn.clients.{client or '?'}.model_env must be an object")
+    out: dict[str, str] = {}
+    for variable, value in spec.items():
+        try:
+            filled = _fill_leaves(value, values)
+        except (KeyError, IndexError, ValueError, AttributeError) as exc:
+            raise ConfigError(
+                f"spawn.clients.{client or '?'}.model_env: cannot fill {variable!r} "
+                f"({type(exc).__name__}: {exc}); placeholders are "
+                f"{', '.join('{' + k + '}' for k in values)}"
+            ) from exc
+        out[variable] = (
+            filled if isinstance(filled, str) else json.dumps(filled, separators=(",", ":"))
+        )
+    return out
 
 
 def resume_command(
@@ -333,8 +380,20 @@ def _wire_fresh_clone(
     notes.append(f"wired the new clone {dest} for {client}")
 
 
+def _is_user_wired(client: str, clone: Path) -> bool:
+    """Whether the client reaches the bus through the user's own wiring: it
+    is wirable, the clone exists and has no wiring of its own."""
+    return (
+        client in clients.wirable_clients()
+        and clone.exists()
+        and clients.wiring(client).inspect(clone).name is None
+        and clients.wired_for_user(client)
+    )
+
+
 def _address(
-    request: SpawnRequest, clone: Path, *, storage: Storage, notes: list[str]
+    request: SpawnRequest, clone: Path, *, storage: Storage, notes: list[str],
+    template: Mapping | None = None,
 ) -> tuple[str, str]:
     """(group, client part) the session joins the bus under."""
     client = request.client
@@ -343,7 +402,7 @@ def _address(
         state = clients.wiring(client).inspect(clone)
         wired_name = state.name
         if wired_name is None:
-            notes.append(_unwired_note(client, clone))
+            notes.append(_unwired_note(client, clone, template))
     if wired_name is not None:
         parsed = identity.parse_or_none(wired_name) if isinstance(wired_name, str) else None
         if parsed is None or parsed.client is None:
@@ -356,9 +415,14 @@ def _address(
     return parsed.group, parsed.client or client
 
 
-def _unwired_note(client: str, clone: Path) -> str:
+def _unwired_note(client: str, clone: Path, template: Mapping | None = None) -> str:
     """Why a clone with no wiring of its own may still join the bus."""
     if clients.wired_for_user(client):
+        if (template or {}).get("user_wired") is not None:
+            return (
+                f"{client} is wired for your user account, not for {clone}: the spawn "
+                f"passes the session variables through spawn.clients.{client}.user_wired"
+            )
         return (
             f"{client} is wired for your user account, not for {clone}: it does not "
             f"pass AGENT_BUS_SESSION to MCP servers, so the session is named after "
@@ -539,7 +603,7 @@ def _exclude_unless_ignored(
 
 def _prepare_client_worktree(
     request: SpawnRequest, clone: Path, target: Path, *,
-    timeout: float, run: commands.Runner, notes: list[str],
+    cfg: Mapping, timeout: float, run: commands.Runner, notes: list[str],
 ) -> None:
     """The client's own worktree step (if any), then the note for wiring files
     the repo tracks that the step did not make up for."""
@@ -550,6 +614,7 @@ def _prepare_client_worktree(
             prep = clients.prepare_worktree(
                 request.client, clone, target, name=state.name,
                 bin_path=state.bin_path or _default_bin(), dry_run=request.dry_run,
+                options=cfg["spawn"]["clients"][request.client],
             )
             notes.extend(prep.notes)
             covered = prep.covered
@@ -585,7 +650,7 @@ def _work_dir(
         _create_worktree(request, clone, target, entries, default=not configured,
                          timeout=timeout, run=run, notes=notes)
     _prepare_client_worktree(
-        request, clone, target, timeout=timeout, run=run, notes=notes,
+        request, clone, target, cfg=cfg, timeout=timeout, run=run, notes=notes,
     )
     return target
 
@@ -616,6 +681,26 @@ def _link_values(clone: Path, work_dir: Path) -> dict[str, str]:
         "clone_key": path_key(clone), "work_dir_key": path_key(work_dir),
         "clone": str(clone), "work_dir": str(work_dir),
     }
+
+
+def find_resumable(
+    client: str, *, cfg: Mapping, clone: Path, work_dir: Path, label: str
+) -> ResumableSession | None:
+    """The client's session named `label` that ran in `work_dir`, found through
+    the client's `transcripts` pattern; None when the client has none."""
+    pattern = (cfg["spawn"]["clients"].get(client) or {}).get("transcripts")
+    if not pattern:
+        return None
+    values = _link_values(clone, work_dir)
+    try:
+        filled = os.path.expanduser(pattern.format_map(values))
+    except (KeyError, IndexError, ValueError, AttributeError) as exc:
+        raise ConfigError(
+            f"spawn.clients.{client}.transcripts: cannot fill {pattern!r} "
+            f"({type(exc).__name__}: {exc}); placeholders are "
+            f"{', '.join('{' + k + '}' for k in values)}"
+        ) from exc
+    return clients.find_session(client, [Path(p) for p in glob.glob(filled)], label=label)
 
 
 def _render_link(client: str, entry: Mapping, values: Mapping[str, str]) -> tuple[Path, Path]:
@@ -707,10 +792,11 @@ def _validate_request(request: SpawnRequest, spawn_cfg: Mapping) -> _Checked:
     if not prompt_file.is_file():
         raise SpawnError(f"prompt file {request.prompt_file} is not a file", EXIT_USAGE)
     _check_prompt_start(prompt_file)
-    if request.model is not None and template.get("model") is None:
+    if request.model is not None and not template.get("model") and not template.get("model_env"):
         raise SpawnError(
-            f"the {request.client} template has no model fragment, so --model cannot "
-            f"be used; set spawn.clients.{request.client}.model in config.json",
+            f"the {request.client} template has neither a model fragment nor model_env, "
+            f"so --model cannot be used; set spawn.clients.{request.client}.model or "
+            f"spawn.clients.{request.client}.model_env in config.json",
             EXIT_USAGE,
         )
     if request.model is not None and request.model.startswith("-"):
@@ -771,12 +857,13 @@ def _session_env(
 
 def _render(
     request: SpawnRequest, checked: _Checked, spawn_cfg: Mapping, *,
-    values: Mapping[str, str], set_env: Mapping[str, str],
+    values: Mapping[str, str], set_env: Mapping[str, str], user_wired: bool = False,
 ) -> str:
     return render_command(
         checked.template, values=values, prompt_file=checked.prompt_file,
         model=request.model, remote=request.remote, strip_env=spawn_cfg["strip_env"],
         set_env=set_env, after_exit=spawn_cfg["after_exit"], client=request.client,
+        user_wired=user_wired,
     )
 
 
@@ -792,6 +879,7 @@ def _check_templates(
     _render(
         request, checked, spawn_cfg, values=values,
         set_env=_session_env(checked.label, provisional, provisional, env, "<token>"),
+        user_wired=True,
     )
     link_values = _link_values(provisional, Path("<work_dir>"))
     for entry in checked.template.get("worktree_links") or []:
@@ -814,10 +902,13 @@ def _check_capacity(
 
 
 def _compose_address(
-    request: SpawnRequest, clone: Path, label: str, *, storage: Storage, notes: list[str]
+    request: SpawnRequest, clone: Path, label: str, *, storage: Storage, notes: list[str],
+    template: Mapping | None = None,
 ) -> str:
     try:
-        group, client_part = _address(request, clone, storage=storage, notes=notes)
+        group, client_part = _address(
+            request, clone, storage=storage, notes=notes, template=template
+        )
         return identity.compose(group, client_part, label)
     except identity.InvalidNameError as exc:
         raise SpawnError(f"cannot address the session: {exc}", EXIT_FAILED) from exc
@@ -933,7 +1024,10 @@ def _spawn(
             f"{clone} opted out of the bus with {resolution.IGNORE_FILE}; remove that "
             f"file to spawn a session there"
         )
-    address = _compose_address(request, clone, checked.label, storage=storage, notes=notes)
+    address = _compose_address(
+        request, clone, checked.label, storage=storage, notes=notes,
+        template=checked.template,
+    )
     # a live session holds its address whatever state it reported (a finished
     # session stays open in its window)
     if any(r.name == address and (r.live or r.state in status.ACTIVE_STATES) for r in rows):
@@ -954,6 +1048,7 @@ def _spawn(
         command=_render(
             request, checked, spawn_cfg, values=values,
             set_env=_session_env(checked.label, clone, work_dir, env, stamp),
+            user_wired=_is_user_wired(request.client, clone),
         ),
     )
     if request.dry_run:
@@ -969,3 +1064,120 @@ def _spawn(
         request, result, storage=storage, spawn_cfg=spawn_cfg, run=run, env=env,
         checked=checked, stamp=stamp,
     )
+
+
+# -------------------------------- resume -----------------------------------
+
+
+@dataclass(frozen=True)
+class ResumeRequest:
+    """`address` is the session's current bus address (it may have been
+    renamed); `label` is the dispatch label: the tmux window name and the
+    name the client knows the session by."""
+
+    address: str
+    client: str
+    label: str
+    work_dir: Path
+    repo_path: Path
+    prompt_file: Path
+    session_id: str | None = None
+    model: str | None = None
+    remote: bool = True
+    dry_run: bool = False
+
+
+def resume(
+    request: ResumeRequest,
+    *,
+    storage: Storage,
+    cfg: Mapping,
+    run: commands.Runner = commands.run_command,
+    env: Mapping[str, str] | None = None,
+    now: datetime | None = None,
+) -> SpawnResult:
+    """Reopen an ended session in a new tmux window with a follow-up prompt, or
+    raise SpawnError / ConfigError (never anything else for an expected failure)."""
+    spawn_cfg = cfg["spawn"]
+    env = os.environ if env is None else env
+    checked, handle = _validate_resume(request, spawn_cfg)
+    work_dir, repo_path = Path(request.work_dir), Path(request.repo_path)
+    rows = _check_capacity(storage, spawn_cfg, now)
+    if any(r.name == request.address and (r.live or r.state in status.ACTIVE_STATES) for r in rows):
+        raise SpawnError(f"{request.address} is already running", EXIT_FAILED)
+    stamp = (now or datetime.now(timezone.utc)).strftime(storage_mod.TIMESTAMP_FORMAT)
+    values = {
+        "name": checked.label, "label": checked.label, "address": request.address,
+        "repo": identity.parse(request.address).group, "dir": str(work_dir),
+        "prompt_file": str(checked.prompt_file),
+    }
+    if request.session_id is not None:
+        values["session_id"] = request.session_id
+    if request.model is not None:
+        values["model"] = request.model
+    command = render_command(
+        checked.template, values=values, prompt_file=checked.prompt_file,
+        model=request.model, remote=request.remote, strip_env=spawn_cfg["strip_env"],
+        set_env=_session_env(handle, repo_path, work_dir, env, stamp),
+        after_exit=spawn_cfg["after_exit"], client=request.client, command_key="resume_prompt",
+    )
+    existing = storage.get_spawn(request.address)
+    result = SpawnResult(
+        name=request.address, client=request.client, label=checked.label,
+        repo_id=existing.repo_id if existing else None, repo_path=str(repo_path),
+        work_dir=str(work_dir), tmux_session=spawn_cfg["tmux_session"],
+        tmux_window=checked.label, command=command, launched=False,
+    )
+    if request.dry_run:
+        return result
+    tmux_bin = spawn_cfg["tmux_bin"]
+    if not tmux.available(tmux_bin):
+        raise SpawnError(
+            f"tmux is required to resume a session but {tmux_bin!r} was not found "
+            f"(spawn.tmux_bin in config.json); run the command by hand instead",
+            EXIT_FAILED, hint=f"cd {shlex.quote(str(work_dir))} && {command}",
+        )
+    spawn_request = SpawnRequest(
+        repo=str(repo_path), client=request.client, name=checked.label,
+        prompt_file=checked.prompt_file, model=request.model, worktree=None,
+        remote=request.remote,
+    )
+    return _register_and_launch(
+        spawn_request, result, storage=storage, spawn_cfg=spawn_cfg, run=run, env=env,
+        checked=checked, stamp=stamp,
+    )
+
+
+def _validate_resume(request: ResumeRequest, spawn_cfg: Mapping) -> tuple[_Checked, str]:
+    """(the checked template and prompt, the session handle of the address)."""
+    templates = spawn_cfg["clients"]
+    if request.client not in templates:
+        raise SpawnError(
+            f"unknown client {request.client!r}; configured clients: "
+            f"{', '.join(sorted(templates))}", EXIT_USAGE,
+        )
+    template = templates[request.client]
+    if not template.get("resume_prompt"):
+        raise SpawnError(
+            f"the {request.client} template has no resume_prompt, so its sessions "
+            f"cannot be resumed with a prompt", EXIT_USAGE,
+        )
+    try:
+        label = identity.normalize_label(request.label)
+        handle = identity.parse(request.address).handle
+        handle = identity.normalize_label(handle) if handle else None
+    except identity.InvalidNameError as exc:
+        raise SpawnError(str(exc), EXIT_USAGE) from exc
+    if handle is None:
+        raise SpawnError(f"{request.address} is not a session address", EXIT_USAGE)
+    prompt_file = Path(request.prompt_file).expanduser()
+    if not prompt_file.is_file():
+        raise SpawnError(f"prompt file {request.prompt_file} is not a file", EXIT_USAGE)
+    _check_prompt_start(prompt_file)
+    if request.model is not None and request.model.startswith("-"):
+        raise SpawnError(f"--model {request.model!r} must not start with '-'", EXIT_USAGE)
+    if not Path(request.work_dir).is_dir():
+        raise SpawnError(
+            f"cannot resume {request.address}: its working folder {request.work_dir} is gone"
+        )
+    return _Checked(template, label, prompt_file.resolve()), handle

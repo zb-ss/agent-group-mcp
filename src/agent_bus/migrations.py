@@ -231,12 +231,19 @@ def _add_state_repos_and_spawns(conn: sqlite3.Connection) -> None:
     )
 
 
+def _add_session_links(conn: sqlite3.Connection) -> None:
+    """`agents.links`: JSON list of {label, url}. NULL means none, or written
+    by an older binary."""
+    _add_column_if_missing(conn, "agents", "links", "TEXT")
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "base tables (0.4.x schema)", _create_base_tables),
     Migration(2, "group addressing columns", _add_group_addressing_columns),
     Migration(3, "sessions table and agent topics", _add_sessions),
     Migration(4, "wake routes and wake history", _add_wake_routes),
     Migration(5, "session state, repo ids and spawn records", _add_state_repos_and_spawns),
+    Migration(6, "session links", _add_session_links),
 )
 
 

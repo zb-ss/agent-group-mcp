@@ -69,6 +69,13 @@ BAD_VALUES = [
     ({"timer": {"interval_minutes": 0}}, "dispatch.timer.interval_minutes"),
     ({"timer": {"command": []}}, "dispatch.timer.command"),
     ({"timer": {"command": ["{other}"]}}, "dispatch.timer.command"),
+    ({"soft_limit": -1}, "dispatch.soft_limit"),
+    ({"soft_limit": "6"}, "dispatch.soft_limit"),
+    ({"resume_max_transcript_mb": -1}, "dispatch.resume_max_transcript_mb"),
+    ({"bus_sender": ""}, "dispatch.bus_sender"),
+    ({"worktree_cleanup": {"enabled": "yes"}}, "dispatch.worktree_cleanup.enabled"),
+    ({"notify_on": ["waiting", "bogus"]}, "dispatch.notify_on"),
+    ({"types": {"follow-up": {"resume_playbook": "a/b"}}}, "dispatch.types.follow-up.resume_playbook"),
 ]
 
 
@@ -117,6 +124,18 @@ def test_project_override_merges_over_defaults(bus_paths):
     assert settings.playbook_name(cfg, got, "follow-up") == "follow-up"
     got["playbooks"]["x"] = "y"
     assert "x" not in cfg["sources"]["asana"]["projects"][PROJECT]["playbooks"]
+
+
+def test_soft_limit_null_is_valid(bus_paths):
+    cfg = _load_with(bus_paths, {"dispatch": {"soft_limit": None}})
+    assert cfg["dispatch"]["soft_limit"] is None
+
+
+def test_resume_playbook_reader(bus_paths):
+    cfg = config.load()["dispatch"]
+    assert settings.resume_playbook(cfg, "follow-up") == "follow-up-resume"
+    assert settings.resume_playbook(cfg, "refinement") is None
+    assert settings.resume_playbook(cfg, "unknown") is None
 
 
 def test_type_action(bus_paths):

@@ -69,6 +69,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             _out(_decision_line(decision))
         for transition in report.transitions:
             _out("transition: " + " ".join(f"{k}={v}" for k, v in transition.items()))
+        for entry in report.cleanups:
+            if entry["result"] == "kept" and not args.dry_run:
+                continue
+            reason = f" ({entry['reason']})" if entry.get("reason") else ""
+            _out(f"cleanup: {entry['result']} {entry['work_dir']}{reason}")
     for error in report.errors:
         _err(error)
     return report.exit_code
@@ -133,6 +138,37 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         if resume:
             _out(f"    resume: {resume}")
+        if r.worktree_removed_at:
+            _out(f"    worktree removed: {r.worktree_removed_at}")
+        if r.held_at and not r.approved_at:
+            _out(f"    held: needs approval (agent-bus dispatch approve {r.task_id})")
+    return 0
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    from datetime import datetime, timezone
+
+    from ..storage import TIMESTAMP_FORMAT
+    from .store import DispatchStore
+
+    store = DispatchStore()
+    matches = [
+        r for r in store.list_tasks()
+        if r.task_id == args.task_id and (args.source is None or r.source == args.source)
+    ]
+    if not matches:
+        _err(f"unknown task {args.task_id}")
+        return 1
+    if len(matches) > 1:
+        sources = ", ".join(sorted(r.source for r in matches))
+        _err(f"task {args.task_id} exists in several sources ({sources}); pass --source")
+        return 1
+    record = matches[0]
+    store.update(
+        record.source, record.task_id,
+        approved_at=datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT),
+    )
+    _out(f"approved {record.task_id}: the next run starts it (the hard limit still applies)")
     return 0
 
 
@@ -241,6 +277,13 @@ def register(sub) -> None:
     s = dsub.add_parser("status", help="List dispatched tasks and their session state.")
     s.add_argument("--json", action="store_true", help="Emit JSON rows.")
     s.set_defaults(func=cmd_status)
+
+    s = dsub.add_parser(
+        "approve", help="Let a held task start past the soft limit on the next run."
+    )
+    s.add_argument("task_id", metavar="TASK_ID", help="The held task's id.")
+    s.add_argument("--source", help="Task source name, when the id exists in several.")
+    s.set_defaults(func=cmd_approve)
 
     s = dsub.add_parser("install-timer", help="Write the launchd/systemd timer files.")
     s.add_argument("--load", action="store_true", help="Also load/enable the timer now.")

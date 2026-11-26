@@ -6,7 +6,7 @@ OS reclaims file descriptors promptly when callers go away.
 
 Schema (created and versioned by `migrations.py`):
   agents(name PK, repo_path, registered_at, last_seen, group_name, client,
-         topic)
+         topic, state, state_at, links)
   messages(message_id PK, from_agent, to_agent, body, thread_id,
            sent_at, read_at, delivered_at,
            addressed_to, fanout_id, to_group, claimed_by)
@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import audit, identity, migrations, push, settings, wake
+from . import audit, identity, links as links_mod, migrations, push, settings, wake
 from .push import STATUS_RATE_LIMITED, STATUS_UNREGISTERED
 from .identity import BROADCAST, KIND_BROADCAST, KIND_DIRECT, KIND_GROUP
 from .paths import db_path, ensure_parents
@@ -203,7 +203,7 @@ class Message:
 
 AGENT_COLUMNS = (
     "name, repo_path, registered_at, last_seen, group_name, client, topic, "
-    "state, state_at"
+    "state, state_at, links"
 )
 
 # Session state vocabulary (protocol words, not tunables). Sessions report
@@ -233,6 +233,12 @@ class AgentRow:
     # NULL: written by an older binary, or never reported.
     state: str | None = None
     state_at: str | None = None
+    # JSON list of {label, url}. NULL: written by an older binary, or never set.
+    links: str | None = None
+
+    @property
+    def link_list(self) -> list[dict[str, str]]:
+        return links_mod.loads(self.links)
 
     @property
     def group(self) -> str:
@@ -273,6 +279,7 @@ class AgentRow:
             "topic": self.topic,
             "state": self.state,
             "state_at": self.state_at,
+            "links": self.link_list,
             "repo_path": self.repo_path,
             "registered_at": self.registered_at,
             "last_seen": self.last_seen,
@@ -523,6 +530,15 @@ class Storage:
         with self.connect() as conn:
             conn.execute(
                 "UPDATE agents SET topic = ? WHERE name = ?", (topic, name)
+            )
+
+    def set_links(self, name: str, links: list[dict] | None) -> None:
+        """Links the session wants alerts to carry. `None` or [] clears."""
+        self.init_schema()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE agents SET links = ? WHERE name = ?",
+                (links_mod.dumps(links or []), name),
             )
 
     def set_state(

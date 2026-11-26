@@ -225,12 +225,12 @@ def _tables(db: Path) -> set[str]:
         }
 
 
-def test_target_version_is_step_five():
-    assert migrations.target_version() == 1005
+def test_target_version_is_step_six():
+    assert migrations.target_version() == 1006
 
 
 def test_fresh_db_has_step_five_objects(bus_paths, storage):
-    assert _user_version(bus_paths["db"]) == 1005
+    assert _user_version(bus_paths["db"]) == 1006
     assert STEP_5_AGENT_COLUMNS <= _columns(bus_paths["db"], "agents")
     assert STEP_5_TABLES <= _tables(bus_paths["db"])
 
@@ -240,7 +240,7 @@ def test_legacy_db_gets_step_five_objects(legacy_db):
 
     Storage().init_schema()
 
-    assert _user_version(legacy_db) == 1005
+    assert _user_version(legacy_db) == 1006
     assert STEP_5_AGENT_COLUMNS <= _columns(legacy_db, "agents")
     assert STEP_5_TABLES <= _tables(legacy_db)
 
@@ -274,7 +274,7 @@ def test_step_four_db_migrates_without_renaming_anything(bus_paths):
 
     Storage().init_schema()
 
-    assert _user_version(db) == 1005
+    assert _user_version(db) == 1006
     assert STEP_5_AGENT_COLUMNS <= _columns(db, "agents")
     assert STEP_5_TABLES <= _tables(db)
     with sqlite3.connect(db) as conn:
@@ -308,3 +308,36 @@ def test_repos_table_has_no_unused_index(bus_paths, storage):
     with sqlite3.connect(bus_paths["db"]) as conn:
         names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
     assert "idx_repos_id" not in names
+
+
+def test_step_five_db_gains_the_links_column(bus_paths):
+    from agent_bus.storage import Storage
+
+    db = bus_paths["db"]
+    conn = sqlite3.connect(db, isolation_level=None)
+    try:
+        for migration in migrations.MIGRATIONS[:5]:
+            migration.apply(conn)
+        conn.execute(
+            "INSERT INTO agents (name, repo_path, registered_at, last_seen) "
+            "VALUES ('solo', '/code/solo', 't', 't')"
+        )
+        conn.execute("PRAGMA user_version = 1005")
+    finally:
+        conn.close()
+    assert "links" not in _columns(db, "agents")
+
+    Storage().init_schema()
+
+    assert _user_version(db) == 1006
+    assert "links" in _columns(db, "agents")
+    assert Storage().get_agent("solo").link_list == []
+
+
+def test_the_links_step_is_idempotent(bus_paths, storage):
+    conn = sqlite3.connect(bus_paths["db"], isolation_level=None)
+    try:
+        migrations.MIGRATIONS[-1].apply(conn)
+    finally:
+        conn.close()
+    assert "links" in _columns(bus_paths["db"], "agents")

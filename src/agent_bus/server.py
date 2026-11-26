@@ -19,7 +19,7 @@ from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import audit, clients, identity, procs, resolution, settings
+from . import audit, clients, identity, links as links_mod, procs, resolution, settings
 from .procs import Proc
 from .sessions import SessionError, SessionRegistry
 from .storage import KIND_SESSION, REPORTED_STATES, Storage
@@ -281,6 +281,7 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
             "last_seen": row.last_seen if row else None,
             "state": row.state if row else None,
             "state_at": row.state_at if row else None,
+            "links": row.link_list if row else [],
             "mcp_client": _mcp_client_name(ctx),
             "group_members": [
                 {
@@ -374,6 +375,7 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
         label: str | None = None,
         topic: str | None = None,
         state: str | None = None,
+        links: list[dict[str, str]] | None = None,
     ) -> dict:
         """Name this session after what it works on, so peers can reach it.
 
@@ -385,7 +387,8 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
         the session is: `working`, `waiting` (it needs a human) or `done`
         (the task it was given is finished). The hooks report `working` and
         `waiting` on their own, so an agent normally only reports `done`.
-        Returns {"name", "client_address", "topic", "state"}.
+        `links` is a list of objects {"label": "...", "url": "https://..."} (http or https only, at most 8): things the owner should be able to open from an alert, such as a pull request, an artifact, a handoff or this session's remote URL. It replaces the previous list; an empty list clears it.
+        Returns {"name", "client_address", "topic", "state", "links"}.
         """
         touch(ctx)
         if not me.holds_session or me.client_address is None:
@@ -401,11 +404,19 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
                     f"unknown state {state!r}; use one of: "
                     + ", ".join(REPORTED_STATES)
                 )
+        normalized = None
+        if links is not None:
+            try:
+                normalized = links_mod.normalize(links)
+            except links_mod.LinkError as exc:
+                raise SessionError(str(exc)) from exc
         if label is not None:
             assert me.registry is not None and me.process is not None
             me.name = me.registry.rename(me.process, me.client_address, label)
         if topic is not None:
             store.set_topic(me.name, topic.strip()[:MAX_TOPIC_LEN] or None)
+        if links is not None:
+            store.set_links(me.name, normalized or None)
         if wanted is not None:
             store.set_state(me.name, wanted)
         store.touch_agent(me.name)
@@ -415,6 +426,7 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
             "client_address": me.client_address,
             "topic": row.topic if row else None,
             "state": row.state if row else None,
+            "links": row.link_list if row else [],
         }
 
     return mcp

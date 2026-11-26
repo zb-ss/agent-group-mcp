@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -119,7 +120,7 @@ def _fail(storage, cfg, prompt, fake=None, **fields) -> SpawnError:
 
 
 def _render(client="claude", *, model=None, remote=True, name="fix-login",
-            prompt_file="/tmp/p.txt", cfg=None, set_env=None):
+            prompt_file="/tmp/p.txt", cfg=None, set_env=None, user_wired=False):
     cfg = cfg or config.defaults()
     sc = cfg["spawn"]
     values = {"name": name, "label": name, "address": "x", "repo": "r",
@@ -130,7 +131,7 @@ def _render(client="claude", *, model=None, remote=True, name="fix-login",
         sc["clients"][client], values=values,
         prompt_file=Path(prompt_file), model=model, remote=remote,
         strip_env=sc["strip_env"], set_env=set_env or {"AGENT_BUS_SESSION": name},
-        after_exit=sc["after_exit"], client=client,
+        after_exit=sc["after_exit"], client=client, user_wired=user_wired,
     )
 
 
@@ -237,10 +238,78 @@ def test_missing_prompt_file(storage, cfg, tmp_path):
     assert _fail(storage, cfg, tmp_path / "none.txt").exit_code == EXIT_USAGE
 
 
-def test_model_without_model_fragment(storage, cfg, prompt):
+def test_model_without_model_fragment_or_model_env(storage, cfg, prompt):
+    cfg["spawn"]["clients"]["opencode"]["model_env"] = None
     err = _fail(storage, cfg, prompt, client="opencode", model="m1")
     assert err.exit_code == EXIT_USAGE
     assert "spawn.clients.opencode.model" in str(err)
+    assert "spawn.clients.opencode.model_env" in str(err)
+
+
+def test_opencode_model_goes_through_model_env():
+    line = _render("opencode", model="m1")
+    assert "OPENCODE_CONFIG_CONTENT='{\"model\":\"m1\"}'" in line
+    assert "--model" not in line
+
+
+def test_model_env_json_survives_a_double_quote():
+    line = _render("opencode", model='a"b')
+    word = [w for w in shlex.split(line) if w.startswith("OPENCODE_CONFIG_CONTENT=")][0]
+    assert json.loads(word.split("=", 1)[1]) == {"model": 'a"b'}
+
+
+def test_session_variables_win_over_model_env():
+    cfg = config.defaults()
+    cfg["spawn"]["clients"]["opencode"]["model_env"] = {"AGENT_BUS_SESSION": "{model}"}
+    line = _render("opencode", model="m1", cfg=cfg)
+    assert line.count("AGENT_BUS_SESSION=") == 1
+    assert "AGENT_BUS_SESSION=fix-login" in line
+
+
+def test_broken_model_env_names_its_key():
+    cfg = config.defaults()
+    cfg["spawn"]["clients"]["opencode"]["model_env"] = {"X": "{nope}"}
+    with pytest.raises(config.ConfigError, match="spawn.clients.opencode.model_env"):
+        _render("opencode", model="m1", cfg=cfg)
+
+
+def test_user_wired_fragment_follows_the_command():
+    cfg = config.defaults()
+    fragment = cfg["spawn"]["clients"]["codex"]["user_wired"]
+    assert fragment
+    on = _render("codex", cfg=cfg, user_wired=True)
+    assert f"codex {shlex.join(fragment)} " in on.replace("'", "") or shlex.join(fragment) in on
+    assert on.index("codex") < on.index("mcp_servers.agent-bus.env_vars")
+    assert "mcp_servers" not in _render("codex", cfg=cfg)
+
+
+@pytest.mark.parametrize(
+    "wirable, exists, wired_name, for_user, expected",
+    [
+        (True, True, None, True, True),
+        (True, True, "repo-a/codex", True, False),
+        (True, True, None, False, False),
+        (True, False, None, True, False),
+        (False, True, None, True, False),
+    ],
+)
+def test_is_user_wired(monkeypatch, tmp_path, wirable, exists, wired_name, for_user, expected):
+    class _Wiring:
+        def inspect(self, _clone):
+            return type("S", (), {"name": wired_name})()
+
+    monkeypatch.setattr(clients, "wirable_clients", lambda: ("codex",) if wirable else ())
+    monkeypatch.setattr(clients, "wiring", lambda _c: _Wiring())
+    monkeypatch.setattr(clients, "wired_for_user", lambda _c: for_user)
+    clone = tmp_path if exists else tmp_path / "missing"
+    assert spawn._is_user_wired("codex", clone) is expected
+
+
+def test_unwired_note_names_the_user_wired_fragment(monkeypatch, tmp_path):
+    monkeypatch.setattr(clients, "wired_for_user", lambda _c: True)
+    with_fragment = spawn._unwired_note("codex", tmp_path, {"user_wired": ["-c", "x"]})
+    assert "spawn.clients.codex.user_wired" in with_fragment
+    assert "will not link" in spawn._unwired_note("codex", tmp_path, {"user_wired": None})
 
 
 # ------------------------------ missing clone -------------------------------
@@ -309,6 +378,7 @@ def _fill(storage, count, **kw):
 
 
 def test_cap_reached_launches_nothing(storage, cfg, prompt):
+    cfg["spawn"]["max_sessions"] = 5
     _fill(storage, 5)
     fake = FakeRun()
     err = _fail(storage, cfg, prompt, fake)
@@ -347,6 +417,7 @@ def test_live_done_session_still_holds_its_address(storage, cfg, prompt, monkeyp
 
 def test_cap_refusal_happens_before_any_clone(storage, cfg, prompt):
     cfg["repos"]["roots"] = []
+    cfg["spawn"]["max_sessions"] = 5
     _fill(storage, 5)
     fake = FakeRun()
     err = _fail(storage, cfg, prompt, fake, repo=URL, clone=True)
@@ -1021,6 +1092,11 @@ def test_codex_wired_for_the_user_gets_the_folder_name_note(
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     result, _ = _go(storage, cfg, prompt, client="codex", dry_run=True)
     assert not any("is not wired" in n for n in result.notes)
+    (note,) = [n for n in result.notes if "user account" in n]
+    assert "spawn.clients.codex.user_wired" in note
+    assert "--client codex" not in result.command and "mcp_servers.agent-bus.env_vars" in result.command
+    cfg["spawn"]["clients"]["codex"]["user_wired"] = None
+    result, _ = _go(storage, cfg, prompt, client="codex", dry_run=True)
     (note,) = [n for n in result.notes if "AGENT_BUS_SESSION" in n]
     assert "user account" in note and "will not link" in note
 
@@ -1212,3 +1288,139 @@ def test_resume_command_names_a_bad_placeholder():
             {"resume": ["claude", "--resume", "{nope}"]}, label="x", work_dir="/w",
             client="claude",
         )
+
+
+# ------------------------------- resume --------------------------------------
+
+ADDRESS = "repo-a/claude-fix-login"
+
+
+def _resume_request(tmp_path, repo, prompt, **fields):
+    work_dir = fields.pop("work_dir", repo)
+    fields = {
+        "address": ADDRESS, "client": "claude", "label": "fix-login", "work_dir": work_dir,
+        "repo_path": repo, "prompt_file": prompt, "session_id": "abc-123", **fields,
+    }
+    return spawn.ResumeRequest(**fields)
+
+
+def _resume(storage, cfg, request, fake=None):
+    fake = fake or FakeRun()
+    result = spawn.resume(request, storage=storage, cfg=cfg, run=fake, env=_env(), now=NOW)
+    return result, fake
+
+
+def _resume_fail(storage, cfg, request, fake=None) -> SpawnError:
+    with pytest.raises(SpawnError) as err:
+        _resume(storage, cfg, request, fake)
+    return err.value
+
+
+def _ended(storage, repo, state=STATE_DONE):
+    _record(storage, ADDRESS, state=state, repo=str(repo))
+
+
+def test_find_resumable_fills_the_work_dir_key(cfg, tmp_path):
+    work_dir = tmp_path / "wt"
+    work_dir.mkdir()
+    folder = tmp_path / "projects" / spawn.path_key(work_dir)
+    folder.mkdir(parents=True)
+    (folder / "sess-1.jsonl").write_text(
+        json.dumps({"type": "custom-title", "customTitle": "fix-login"}) + "\n"
+    )
+    cfg["spawn"]["clients"]["claude"]["transcripts"] = str(
+        tmp_path / "projects" / "{work_dir_key}" / "*.jsonl"
+    )
+    found = spawn.find_resumable(
+        "claude", cfg=cfg, clone=tmp_path, work_dir=work_dir, label="fix-login"
+    )
+    assert found is not None and found.session_id == "sess-1"
+    assert spawn.find_resumable(
+        "claude", cfg=cfg, clone=tmp_path, work_dir=work_dir, label="other"
+    ) is None
+
+
+def test_find_resumable_without_a_pattern_or_with_a_bad_one(cfg, tmp_path):
+    assert spawn.find_resumable(
+        "codex", cfg=cfg, clone=tmp_path, work_dir=tmp_path, label="x"
+    ) is None
+    cfg["spawn"]["clients"]["claude"]["transcripts"] = "{nope}/*.jsonl"
+    with pytest.raises(config.ConfigError, match="spawn.clients.claude.transcripts"):
+        spawn.find_resumable("claude", cfg=cfg, clone=tmp_path, work_dir=tmp_path, label="x")
+
+
+def test_resume_renders_the_command_and_opens_a_window(storage, cfg, prompt, repo, tmp_path):
+    _ended(storage, repo)
+    result, fake = _resume(
+        storage, cfg, _resume_request(tmp_path, repo, prompt), FakeRun(sessions=["agents"])
+    )
+    stamp = NOW.strftime(TIMESTAMP_FORMAT)
+    assert result.launched and result.command.endswith(
+        f"AGENT_BUS_SESSION=fix-login AGENT_BUS_SPAWN_TOKEN={stamp} "
+        f"claude --resume abc-123 --permission-mode auto --remote-control fix-login "
+        f'"$(cat {prompt})"; exec $SHELL -l'
+    )
+    assert "AGENT_BUS_REPO" not in result.command
+    window = fake.tmux_calls()[1][0]
+    assert window[1] == "new-window" and window[window.index("-n") + 1] == "fix-login"
+    assert window[window.index("-c") + 1] == str(repo)
+    assert storage.get_spawn(ADDRESS).spawned_at == stamp
+    assert storage.get_agent(ADDRESS).state == STATE_STARTING
+
+
+def test_resume_in_a_worktree_and_without_remote(storage, cfg, prompt, repo, tmp_path):
+    _ended(storage, repo)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    request = _resume_request(tmp_path, repo, prompt, work_dir=worktree, remote=False)
+    result, _ = _resume(storage, cfg, request)
+    assert f"AGENT_BUS_REPO={repo}" in result.command
+    assert "--remote-control" not in result.command
+
+
+def test_resume_refuses_a_running_address(storage, cfg, prompt, repo, tmp_path):
+    _ended(storage, repo, state=STATE_STARTING)
+    err = _resume_fail(storage, cfg, _resume_request(tmp_path, repo, prompt))
+    assert "already running" in str(err)
+
+
+def test_resume_honours_the_cap(storage, cfg, prompt, repo, tmp_path):
+    _ended(storage, repo)
+    cfg["spawn"]["max_sessions"] = 5
+    _fill(storage, 5)
+    fake = FakeRun()
+    err = _resume_fail(storage, cfg, _resume_request(tmp_path, repo, prompt), fake)
+    assert err.exit_code == EXIT_CAP_REACHED and not fake.tmux_calls()
+
+
+def test_resume_refusals(storage, cfg, prompt, repo, tmp_path):
+    _ended(storage, repo)
+    gone = _resume_request(tmp_path, repo, prompt, work_dir=tmp_path / "missing")
+    assert "is gone" in str(_resume_fail(storage, cfg, gone))
+    cfg["spawn"]["clients"]["codex"]["resume_prompt"] = None
+    nothing = _resume_request(tmp_path, repo, prompt, client="codex")
+    assert "no resume_prompt" in str(_resume_fail(storage, cfg, nothing))
+    no_id = _resume_request(tmp_path, repo, prompt, session_id=None)
+    with pytest.raises(config.ConfigError, match="session_id"):
+        _resume(storage, cfg, no_id)
+    numbered = _resume_request(tmp_path, repo, prompt, address="repo-a/claude-2")
+    assert _resume_fail(storage, cfg, numbered).exit_code == EXIT_USAGE
+
+
+def test_resume_tmux_failure_restores_the_earlier_state(storage, cfg, prompt, repo, tmp_path):
+    _ended(storage, repo)
+    before_record = storage.get_spawn(ADDRESS)
+    before_state = storage.get_agent(ADDRESS).state
+    fake = FakeRun(tmux_fails=True)
+    _resume_fail(storage, cfg, _resume_request(tmp_path, repo, prompt), fake)
+    assert storage.get_agent(ADDRESS).state == before_state
+    assert storage.get_spawn(ADDRESS) == before_record
+
+
+def test_resume_dry_run_writes_nothing(storage, cfg, prompt, repo, tmp_path):
+    result, fake = _resume(
+        storage, cfg, _resume_request(tmp_path, repo, prompt, dry_run=True)
+    )
+    assert not result.launched and "--resume abc-123" in result.command
+    assert not fake.tmux_calls()
+    assert storage.get_agent(ADDRESS) is None and storage.get_spawn(ADDRESS) is None

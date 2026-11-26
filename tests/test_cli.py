@@ -736,7 +736,7 @@ def test_cli_config_show_prints_defaults_without_a_file(bus_paths):
     data = json.loads(r.stdout)
     assert data["exists"] is False
     assert data["path"].endswith("config.json")
-    assert data["config"]["spawn"]["max_sessions"] == 5
+    assert data["config"]["spawn"]["max_sessions"] == 10
 
 
 def test_cli_config_show_reflects_a_user_override(bus_paths):

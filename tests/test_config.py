@@ -30,14 +30,14 @@ def test_blank_file_gives_defaults(bus_paths):
 def test_defaults_content():
     cfg = config.defaults()
     assert set(cfg["spawn"]["clients"]) == {"claude", "codex", "agy", "opencode"}
-    assert cfg["spawn"]["max_sessions"] == 5
+    assert cfg["spawn"]["max_sessions"] == 10
     assert cfg["spawn"]["strip_env"] == STRIP_ENV
 
 
 def test_defaults_are_fresh_each_call():
     first = config.defaults()
     first["spawn"]["max_sessions"] = 99
-    assert config.defaults()["spawn"]["max_sessions"] == 5
+    assert config.defaults()["spawn"]["max_sessions"] == 10
 
 
 def test_override_keeps_other_defaults(bus_paths):
@@ -112,6 +112,22 @@ def test_bad_worktree_links_shape_raises(bus_paths, bad):
         json.dumps({"spawn": {"clients": {"codex": {"worktree_links": bad}}}}), encoding="utf-8"
     )
     with pytest.raises(config.ConfigError, match=r"spawn\.clients\.codex\.worktree_links"):
+        config.load()
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("resume_prompt", "claude"), ("resume_prompt", [1]), ("transcripts", ["a"]),
+    ("user_wired", "-c"), ("model_env", "X"), ("model_env", {"1BAD": "x"}),
+    ("model_env", {"OK": 5}), ("worktree_trust", "yes"),
+    ("worktree_trust", {"enabled": "yes", "file": "f", "key": "k"}),
+    ("worktree_trust", {"enabled": True, "file": "", "key": "k"}),
+    ("worktree_trust", {"enabled": True, "file": "f"}),
+])
+def test_bad_new_client_keys_raise_naming_key(bus_paths, key, bad):
+    config.config_path().write_text(
+        json.dumps({"spawn": {"clients": {"claude": {key: bad}}}}), encoding="utf-8"
+    )
+    with pytest.raises(config.ConfigError, match=rf"spawn\.clients\.claude\.{key}"):
         config.load()
 
 

@@ -19,6 +19,7 @@ from ..config import (
     ConfigError,
     _check_section,
     _is_int,
+    _is_non_negative_number,
     _is_number,
     _is_str,
     _is_str_list,
@@ -47,6 +48,9 @@ def _is_obj(value: Any) -> bool:
 _TOP_SCHEMA = {
     "env_file": (_is_str, "a string or null", True),
     "max_spawns_per_run": (lambda v: _is_int(v) and v >= 0, "an integer >= 0", False),
+    "soft_limit": (lambda v: _is_int(v) and v >= 0, "an integer >= 0 or null", True),
+    "resume_max_transcript_mb": (_is_non_negative_number, "a number >= 0", False),
+    "bus_sender": (lambda v: _is_str(v) and bool(v), "a non-empty string", False),
     "title_max_chars": (lambda v: _is_int(v) and v >= 0, "an integer >= 0", False),
     "overlap_max_items": (lambda v: _is_int(v) and v >= 0, "an integer >= 0", False),
     "fetch_timeout_seconds": (_is_number, "a number", False),
@@ -212,6 +216,17 @@ def _check_types(section: Any) -> None:
             f"{key}.playbook",
             "a playbook name (lowercase letters, digits and dashes)",
         )
+        resume = entry.get("resume_playbook")
+        _require(
+            resume is None or (_is_str(resume) and PLAYBOOK_NAME.fullmatch(resume) is not None),
+            f"{key}.resume_playbook",
+            "null or a playbook name (lowercase letters, digits and dashes)",
+        )
+
+
+def _check_worktree_cleanup(section: Any) -> None:
+    _require(_is_obj(section), "worktree_cleanup", "an object")
+    _require(_is_bool(section.get("enabled")), "worktree_cleanup.enabled", "a boolean")
 
 
 def _check_patterns(value: Any, key: str) -> None:
@@ -224,7 +239,9 @@ def _check_patterns(value: Any, key: str) -> None:
 
 
 RULE_KEYS = frozenset({"type", "section", "title", "project", "handled_as", "new_comment"})
-NOTIFY_EVENTS = ("waiting", "done", "ended", "spawn_failed", "notify")
+NOTIFY_EVENTS = (
+    "waiting", "done", "ended", "spawn_failed", "notify", "needs_approval", "worktree_removed",
+)
 
 
 def _check_notify_on(value: Any) -> None:
@@ -363,6 +380,7 @@ def validate(section: Any) -> None:
     """Raise ConfigError naming the dotted key of the first bad value."""
     _check_section(section, _TOP_SCHEMA, "dispatch")
     _check_notify_on(section["notify_on"])
+    _check_worktree_cleanup(section.get("worktree_cleanup"))
     _check_working_hours(section.get("working_hours"))
     _check_label(section.get("label"))
     _check_handoff_channel(section["handoff_channel"])
@@ -399,6 +417,10 @@ def project_settings(dispatch_cfg: Mapping, source: str, project_id: str) -> dic
 def playbook_name(dispatch_cfg: Mapping, project: Mapping, task_type: str) -> str:
     override = project.get("playbooks", {}).get(task_type)
     return override or dispatch_cfg["types"][task_type]["playbook"]
+
+
+def resume_playbook(dispatch_cfg: Mapping, task_type: str) -> str | None:
+    return dispatch_cfg["types"].get(task_type, {}).get("resume_playbook") or None
 
 
 def type_action(dispatch_cfg: Mapping, task_type: str) -> str:

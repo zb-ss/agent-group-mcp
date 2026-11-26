@@ -15,7 +15,7 @@
     "hide_done_after_seconds": 86400
   },
   "spawn": {
-    "max_sessions": 5,
+    "max_sessions": 10,
     "startup_grace_seconds": 120,
     "tmux_bin": "tmux",
     "tmux_session": "agents",
@@ -27,15 +27,27 @@
     "clients": {
       "claude": {"command": ["claude", "-n", "{name}", "--permission-mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control", "{name}"], "prompt": ["{prompt}"],
         "resume": ["claude", "--resume", "{label}"],
+        "resume_prompt": ["claude", "--resume", "{session_id}", "--permission-mode", "auto"],
+        "transcripts": "~/.claude/projects/{work_dir_key}/*.jsonl",
         "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
-      "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "resume": ["codex", "resume"], "worktree_links": []},
-      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": []},
-      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "resume": null, "worktree_links": []}
+      "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "resume": ["codex", "resume"], "worktree_links": [],
+        "resume_prompt": null, "transcripts": null,
+        "user_wired": ["-c", "mcp_servers.agent-bus.env_vars=[\"AGENT_BUS_SESSION\", \"AGENT_BUS_SPAWN_TOKEN\", \"AGENT_BUS_REPO\", \"AGENT_BUS_DB\", \"AGENT_BUS_AUDIT_LOG\"]"]},
+      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": [],
+        "resume_prompt": null, "transcripts": null,
+        "worktree_trust": {"enabled": false, "file": "~/.gemini/antigravity-cli/settings.json", "key": "trustedWorkspaces"}},
+      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "resume": null, "worktree_links": [],
+        "resume_prompt": null, "transcripts": null,
+        "model_env": {"OPENCODE_CONFIG_CONTENT": {"model": "{model}"}}}
     }
   },
   "dispatch": {
     "env_file": null,
-    "max_spawns_per_run": 2,
+    "max_spawns_per_run": 4,
+    "soft_limit": 6,
+    "resume_max_transcript_mb": 20,
+    "bus_sender": "dispatch",
+    "worktree_cleanup": {"enabled": true},
     "working_hours": {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "19:00"},
     "label": {"template": "t{gid_suffix}-{slug}", "gid_suffix_length": 8},
     "handoff_channel": "{label}",
@@ -44,11 +56,11 @@
     "title_max_chars": 120,
     "overlap_max_items": 10,
     "fetch_timeout_seconds": 120,
-    "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify"],
+    "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify", "needs_approval", "worktree_removed"],
     "defaults": {"client": "claude", "model": null, "worktree": null, "fetch": false, "clone": false, "remote": true},
     "types": {
       "refinement": {"action": "spawn", "playbook": "refinement"},
-      "follow-up": {"action": "spawn", "playbook": "follow-up"},
+      "follow-up": {"action": "spawn", "playbook": "follow-up", "resume_playbook": "follow-up-resume"},
       "implementation": {"action": "notify", "playbook": "implementation"}
     },
     "rules": [

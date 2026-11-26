@@ -21,8 +21,10 @@ from typing import Any
 from .. import commands, identity, repo_identity, spawn, status
 from ..config import ConfigError
 from ..spawn import SpawnError, SpawnRequest
-from ..storage import Storage
-from . import classify, playbook, settings
+from ..clients import agy as agy_client
+from ..clients.base import ResumableSession
+from ..storage import Storage, UnknownRecipientError
+from . import classify, cleanup, playbook, settings
 from .asana import AsanaSource
 from .model import (
     OUTCOME_DONE,
@@ -43,7 +45,8 @@ from .store import DispatchStore, TaskRecord
 SOURCES: dict[str, Callable[..., TaskSource]] = {"asana": AsanaSource}
 
 RESULTS = (
-    "spawned", "would_spawn", "notified", "would_notify", "skipped", "failed", "ignored",
+    "spawned", "would_spawn", "held", "would_hold", "notified", "would_notify",
+    "messaged", "would_message", "resumed", "would_resume", "skipped", "failed", "ignored",
 )
 UNKNOWN = "unknown"
 HEAD = "HEAD"
@@ -73,6 +76,7 @@ class RunReport:
     skipped: str | None = None
     decisions: list[TaskDecision] = field(default_factory=list)
     transitions: list[dict] = field(default_factory=list)
+    cleanups: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -95,9 +99,13 @@ class _Ctx:
     dry_run: bool
     run: commands.Runner
     spawn_fn: Callable[..., Any]
+    resume_fn: Callable[..., Any]
+    find_session: Callable[..., Any]
+    send: Callable[..., dict]
     rows: list
     report: RunReport
     spawns: int = 0
+    fetched: set[str] = field(default_factory=set)
 
     @property
     def stamp(self) -> str:
@@ -172,6 +180,21 @@ def find_row(rows: Sequence[Any], record: TaskRecord) -> Any | None:
     )
 
 
+def _answered(record: TaskRecord, row: Any | None) -> bool:
+    """True when the session reported a state after the follow-up was messaged."""
+    return bool(row is not None and row.state_at and row.state_at > (record.handled_at or ""))
+
+
+def _not_yet_answered(record: TaskRecord, row: Any | None) -> bool:
+    """After a follow-up was messaged, the session's state is only news once it
+    was reported after that message; an unchanged row is the state notified
+    before the follow-up."""
+    if row is None or row.state == "ended":
+        # A dead session can no longer answer; its end is news.
+        return False
+    return not _answered(record, row)
+
+
 def _transition(ctx: _Ctx, record: TaskRecord, rows: Sequence[Any]) -> None:
     row = find_row(rows, record)
     state = row.state if row is not None else "ended"
@@ -179,15 +202,29 @@ def _transition(ctx: _Ctx, record: TaskRecord, rows: Sequence[Any]) -> None:
         record = ctx.store.update(record.source, record.task_id, session_name=row.name)
     if state == record.last_notified_state:
         return
+    if record.last_notified_state == "messaged" and _not_yet_answered(record, row):
+        return
     notified = state in STATE_LABELS and state in ctx.dispatch["notify_on"]
     delivered = False
     if not ctx.dry_run:
+        links = tuple(
+            (entry.get("label") or "", entry["url"])
+            for entry in (row.links if row is not None else ())
+        )
         delivered = notified and _notify(
-            ctx, Notification(record.session_name, STATE_LABELS[state], record.title, record.url)
+            ctx,
+            Notification(record.session_name, STATE_LABELS[state], record.title, record.url,
+                         links=links),
         )
         fields: dict[str, Any] = {"outcome": _OUTCOME_FOR_STATE.get(state, OUTCOME_SPAWNED)}
         if delivered or not notified:
             fields["last_notified_state"] = state
+        if (record.last_notified_state == "messaged" and state == "ended"
+                and not _answered(record, row)):
+            # The messaged session died unanswered: reopen the follow-up so
+            # the next run resumes or re-spawns for that comment. A session
+            # that answered and then ended keeps the comment handled.
+            fields["last_comment_handled_at"] = None
         ctx.store.update(record.source, record.task_id, **fields)
     ctx.report.transitions.append(
         {"task_id": record.task_id, "session": record.session_name, "state": state,
@@ -199,6 +236,74 @@ def _transitions(ctx: _Ctx) -> None:
     for record in ctx.store.list_tasks():
         if record.session_name and record.outcome in _WATCHED_OUTCOMES:
             _transition(ctx, record, ctx.rows)
+
+
+def _cleanup_paths(record: TaskRecord, row: Any | None) -> tuple[str, str] | None:
+    spawned = row is not None and row.spawned
+    work_dir = record.work_dir or (row.work_dir if spawned else None)
+    clone = record.clone_path or (row.repo_path if spawned else None)
+    if not work_dir or not clone or work_dir == clone or not Path(work_dir).is_dir():
+        return None
+    return work_dir, clone
+
+
+def _cleanup(ctx: _Ctx) -> None:
+    if not ctx.dispatch["worktree_cleanup"]["enabled"]:
+        return
+    timeout = ctx.cfg["repos"]["git_timeout_seconds"]
+    remote = ctx.cfg["repos"]["remote"]
+    for record in ctx.store.list_tasks():
+        if not record.label or record.worktree_removed_at:
+            continue
+        row = find_row(ctx.rows, record) if record.session_name else None
+        paths = _cleanup_paths(record, row)
+        if paths is None:
+            continue
+        if row is not None and (row.live or row.state in status.ACTIVE_STATES):
+            continue
+        project = settings.project_settings(ctx.dispatch, record.source, record.project_id)
+        if project is None or not project.get("worktree"):
+            continue
+        work_dir, clone = paths
+        if project.get("fetch") and not ctx.dry_run and clone not in ctx.fetched:
+            _git_out(ctx, ["git", "-C", clone, "fetch", "--quiet", remote],
+                     ctx.dispatch["fetch_timeout_seconds"])
+            ctx.fetched.add(clone)
+        entry = {"task_id": record.task_id, "work_dir": work_dir}
+        reason = cleanup.keep_reason(
+            Path(work_dir), Path(clone), base=project["worktree"], remote=remote,
+            timeout=timeout, run=ctx.run, start_commit=record.start_commit,
+        )
+        if reason:
+            ctx.report.cleanups.append({**entry, "result": "kept", "reason": reason})
+        elif ctx.dry_run:
+            ctx.report.cleanups.append({**entry, "result": "would_remove"})
+        else:
+            _remove_worktree(ctx, record, entry, Path(work_dir), Path(clone), timeout)
+
+
+def _drop_agy_trust(ctx: _Ctx, record: TaskRecord, work_dir: Path) -> dict:
+    project = settings.project_settings(ctx.dispatch, record.source, record.project_id) or {}
+    if project.get("client") != agy_client.CLIENT_ID:
+        return {}
+    options = ctx.cfg["spawn"]["clients"].get(agy_client.CLIENT_ID)
+    notes = agy_client.AgyWiring().release_worktree(work_dir, options=options)
+    return {"notes": notes} if notes else {}
+
+
+def _remove_worktree(
+    ctx: _Ctx, record: TaskRecord, entry: dict, work_dir: Path, clone: Path, timeout: float
+) -> None:
+    error = cleanup.remove(work_dir, clone, timeout=timeout, run=ctx.run)
+    if error:
+        ctx.report.cleanups.append({**entry, "result": "failed", "reason": error})
+        return
+    ctx.store.update(record.source, record.task_id, worktree_removed_at=ctx.stamp)
+    entry = {**entry, **_drop_agy_trust(ctx, record, work_dir)}
+    if "worktree_removed" in ctx.dispatch["notify_on"]:
+        _notify(ctx, Notification(record.session_name, "worktree removed",
+                                  record.title, record.url))
+    ctx.report.cleanups.append({**entry, "result": "removed"})
 
 
 # --------------------------------- tasks ------------------------------------
@@ -269,19 +374,57 @@ def _notify_only(
     return _decision(ctx, task, type_, "notify", "notified")
 
 
+def _running(ctx: _Ctx) -> int:
+    """Spawned sessions in an active state plus the ones started in this run."""
+    active = sum(1 for r in ctx.rows if r.spawned and r.state in status.ACTIVE_STATES)
+    return active + ctx.spawns
+
+
+def _over_soft_limit(ctx: _Ctx, record: TaskRecord | None) -> bool:
+    soft = ctx.dispatch["soft_limit"]
+    if soft is None or (record is not None and record.approved_at):
+        return False
+    return _running(ctx) >= soft
+
+
+def _hold(
+    ctx: _Ctx, task: Task, record: TaskRecord | None, type_: str, label: str,
+) -> TaskDecision:
+    """Hold a spawn past the soft limit until the owner approves it. Nothing but
+    `held_at` is recorded, so the task is classified the same way next run."""
+    reason = (
+        f"needs approval: {_running(ctx)} sessions running, soft limit "
+        f"{ctx.dispatch['soft_limit']}; run `agent-bus dispatch approve {task.task_id}`"
+    )
+    if ctx.dry_run:
+        return _decision(ctx, task, type_, "spawn", "would_hold", reason=reason, label=label)
+    if record is None or record.held_at is None:
+        wanted = "needs_approval" in ctx.dispatch["notify_on"]
+        # An undelivered alert is retried next run, like the other notifications.
+        if not wanted or _notify(
+            ctx, Notification(label, "needs approval", task.title, task.url)
+        ):
+            ctx.store.update(task.source, task.task_id, held_at=ctx.stamp)
+    return _decision(ctx, task, type_, "spawn", "held", reason=reason, label=label)
+
+
+def _session_rows(ctx: _Ctx, label: str, record: TaskRecord | None) -> list:
+    """The status rows of this task's session (a renamed session has moved)."""
+    return [
+        row for row in ctx.rows
+        if row.name == (record.session_name if record else None)
+        or row.label == label
+        or (row.spawned and row.tmux_window == label)
+        or (record is not None and find_row([row], record) is not None)
+    ]
+
+
 def _skip_reason(ctx: _Ctx, label: str, record: TaskRecord | None) -> str | None:
     """Why a spawn must not happen now, or None."""
-    for row in ctx.rows:
-        same = (
-            row.name == (record.session_name if record else None)
-            or row.label == label
-            or (row.spawned and row.tmux_window == label)
-            or (record is not None and find_row([row], record) is not None)
-        )
-        if same and (row.live or row.state in status.ACTIVE_STATES):
+    for row in _session_rows(ctx, label, record):
+        if row.live or row.state in status.ACTIVE_STATES:
             return "session active"
-    active = sum(1 for r in ctx.rows if r.spawned and r.state in status.ACTIVE_STATES)
-    if active + ctx.spawns >= ctx.cfg["spawn"]["max_sessions"]:
+    if _running(ctx) >= ctx.cfg["spawn"]["max_sessions"]:
         return "spawn cap reached"
     if ctx.spawns >= ctx.dispatch["max_spawns_per_run"]:
         return "per-run limit reached"
@@ -395,19 +538,37 @@ def _spawn_task(
     label, failure = _label_for(ctx, task, type_)
     if failure is not None:
         return _decision(ctx, task, type_, "spawn", "failed", reason=failure, label=label)
+    resume_playbook = settings.resume_playbook(ctx.dispatch, type_)
+    rows = _session_rows(ctx, label, record)
+    if resume_playbook:
+        live = [row for row in rows if row.live]
+        if live:
+            return _message_live(ctx, task, record, type_, project_id, project, label,
+                                 _latest(live), resume_playbook)
     reason = _skip_reason(ctx, label, record)
     if reason is not None:
         return _decision(ctx, task, type_, "spawn", "skipped", reason=reason, label=label)
+    if _over_soft_limit(ctx, record):
+        return _hold(ctx, task, record, type_, label)
+    new_reason = None
+    if resume_playbook and record.session_name:
+        prior = find_row(ctx.rows, record) or (_latest(rows) if rows else None)
+        found, why = _resumable(ctx, record, prior, project, label)
+        if found is not None:
+            return _resume_task(ctx, task, record, type_, project_id, project, label,
+                                prior, found, resume_playbook)
+        new_reason = f"new session: {why}"
     try:
+        values = _values(ctx, task, type_, label, project_id, project)
         text = playbook.render(
-            settings.playbook_name(ctx.dispatch, project, type_),
-            _values(ctx, task, type_, label, project_id, project),
+            settings.playbook_name(ctx.dispatch, project, type_), values,
             templates_dir=ctx.dispatch["templates_dir"],
         )
         if ctx.dry_run:
             # Count it so the per-run limit and session cap read like a real run.
             ctx.spawns += 1
-            return _decision(ctx, task, type_, "spawn", "would_spawn", label=label)
+            return _decision(ctx, task, type_, "spawn", "would_spawn",
+                             reason=new_reason, label=label)
         prompt = playbook.write_prompt(
             text, label=label, prompts_dir=settings.prompts_dir(ctx.dispatch))
         result = ctx.spawn_fn(
@@ -421,22 +582,132 @@ def _spawn_task(
         return _spawn_failed(ctx, task, record, type_, project, label, exc)
     except _SPAWN_FAILURES as exc:
         return _spawn_failed(ctx, task, record, type_, project, label, exc)
-    return _spawned(ctx, task, record, type_, project, label, result.name)
+    return _spawned(ctx, task, record, type_, project, label, result, reason=new_reason,
+                    start_commit=values["head_sha"])
+
+
+def _latest(rows: Sequence[Any]) -> Any:
+    return max(rows, key=lambda r: (r.state_at or "", r.last_seen or ""))
+
+
+def _message_live(
+    ctx: _Ctx, task: Task, record: TaskRecord, type_: str, project_id: str,
+    project: Mapping, label: str, row: Any, playbook_name: str,
+) -> TaskDecision:
+    """A live session gets the follow-up through the bus. It counts against no
+    limit: nothing is started."""
+    try:
+        text = playbook.render(
+            playbook_name, _values(ctx, task, type_, label, project_id, project),
+            templates_dir=ctx.dispatch["templates_dir"],
+        )
+    except PlaybookError as exc:
+        return _decision(ctx, task, type_, "message", "failed", reason=str(exc),
+                         label=label, session=row.name)
+    if ctx.dry_run:
+        return _decision(ctx, task, type_, "message", "would_message",
+                         label=label, session=row.name)
+    try:
+        ctx.send(from_agent=ctx.dispatch["bus_sender"], to=row.name, body=text)
+    except (UnknownRecipientError, ValueError):
+        return _decision(ctx, task, type_, "message", "failed",
+                         reason=f"could not message {row.name}; will retry",
+                         label=label, session=row.name)
+    # The marker state differs from every reported state; _transition holds
+    # back until the session reports a state after handled_at, so that report
+    # notifies even when it equals the one notified before.
+    ctx.store.update(
+        task.source, task.task_id, type=type_, handled_types=_with_type(record, type_),
+        repo=project["repo"], label=label, session_name=row.name,
+        handled_at=ctx.stamp, last_comment_handled_at=task.newest_comment_at,
+        outcome=OUTCOME_SPAWNED, last_notified_state="messaged",
+    )
+    return _decision(ctx, task, type_, "message", "messaged", label=label, session=row.name)
+
+
+def _resumable(
+    ctx: _Ctx, record: TaskRecord, row: Any | None, project: Mapping, label: str,
+) -> tuple[ResumableSession | None, str]:
+    """(the session to resume, or None and why it cannot be)."""
+    client = project["client"]
+    if not (ctx.cfg["spawn"]["clients"].get(client) or {}).get("resume_prompt"):
+        return None, f"no resume template for {client}"
+    work_dir = record.work_dir or (row.work_dir if row else None)
+    clone = record.clone_path or (row.repo_path if row else None)
+    if not work_dir or not clone or not Path(work_dir).is_dir():
+        return None, "its working folder is gone"
+    found = ctx.find_session(
+        client, cfg=ctx.cfg, clone=Path(clone), work_dir=Path(work_dir),
+        label=record.label or label,
+    )
+    if found is None:
+        return None, "no resumable session"
+    limit = ctx.dispatch["resume_max_transcript_mb"]
+    if found.size_bytes > limit * 1024 * 1024:
+        return None, f"transcript over {limit} MB"
+    return found, ""
+
+
+def _resume_task(
+    ctx: _Ctx, task: Task, record: TaskRecord, type_: str, project_id: str,
+    project: Mapping, label: str, row: Any | None, found: ResumableSession,
+    playbook_name: str,
+) -> TaskDecision:
+    address = row.name if row else record.session_name
+    work_dir = record.work_dir or row.work_dir
+    clone = record.clone_path or row.repo_path
+    try:
+        text = playbook.render(
+            playbook_name, _values(ctx, task, type_, label, project_id, project),
+            templates_dir=ctx.dispatch["templates_dir"],
+        )
+        if ctx.dry_run:
+            ctx.spawns += 1
+            return _decision(ctx, task, type_, "resume", "would_resume",
+                             label=label, session=address)
+        prompt = playbook.write_prompt(
+            text, label=label, prompts_dir=settings.prompts_dir(ctx.dispatch))
+        result = ctx.resume_fn(
+            spawn.ResumeRequest(
+                address=address, client=project["client"], label=label,
+                work_dir=Path(work_dir), repo_path=Path(clone), prompt_file=prompt,
+                session_id=found.session_id, model=project["model"],
+                remote=project["remote"],
+            ),
+            storage=ctx.storage, cfg=ctx.cfg, run=ctx.run, now=ctx.now,
+        )
+    except SpawnError as exc:
+        if exc.exit_code == spawn.EXIT_CAP_REACHED:
+            return _decision(ctx, task, type_, "resume", "skipped",
+                             reason="spawn cap reached", label=label)
+        return _spawn_failed(ctx, task, record, type_, project, label, exc)
+    except _SPAWN_FAILURES as exc:
+        return _spawn_failed(ctx, task, record, type_, project, label, exc)
+    return _spawned(ctx, task, record, type_, project, label, result,
+                    action="resume", decision_result="resumed")
 
 
 def _spawned(
     ctx: _Ctx, task: Task, record: TaskRecord, type_: str, project: Mapping,
-    label: str, session: str,
+    label: str, result: Any, *, reason: str | None = None, action: str = "spawn",
+    decision_result: str = "spawned", start_commit: str | None = None,
 ) -> TaskDecision:
+    session = result.name
+    extra: dict[str, Any] = {}
+    if action == "spawn":  # a resume keeps the folder, so keeps its start commit
+        extra["start_commit"] = start_commit if start_commit != UNKNOWN else None
     ctx.store.update(
         task.source, task.task_id, type=type_, handled_types=_with_type(record, type_),
         repo=project["repo"], label=label, session_name=session,
         last_spawned_at=ctx.stamp, handled_at=ctx.stamp,
         last_comment_handled_at=task.newest_comment_at,
         outcome=OUTCOME_SPAWNED, last_notified_state="starting",
+        work_dir=result.work_dir, clone_path=result.repo_path,
+        worktree_removed_at=None, held_at=None, approved_at=None, **extra,
     )
     ctx.spawns += 1
-    return _decision(ctx, task, type_, "spawn", "spawned", label=label, session=session)
+    return _decision(ctx, task, type_, action, decision_result, reason=reason,
+                     label=label, session=session)
 
 
 def _spawn_failed(
@@ -482,6 +753,9 @@ def run(
     ignore_hours: bool = False,
     run: commands.Runner = commands.run_command,
     spawn_fn: Callable[..., Any] = spawn.spawn,
+    resume_fn: Callable[..., Any] = spawn.resume,
+    find_session: Callable[..., Any] = spawn.find_resumable,
+    send: Callable[..., dict] | None = None,
     collect: Callable[..., list] = status.collect,
 ) -> RunReport:
     now = now or datetime.now(timezone.utc)
@@ -491,7 +765,8 @@ def run(
         return RunReport(skipped="outside working hours")
     ctx = _Ctx(
         cfg=cfg, dispatch=d, storage=storage, store=store, notifiers=notifiers, now=now,
-        dry_run=dry_run, run=run, spawn_fn=spawn_fn, rows=[],
+        dry_run=dry_run, run=run, spawn_fn=spawn_fn, resume_fn=resume_fn,
+        find_session=find_session, send=send or storage.send_message, rows=[],
         report=RunReport(dry_run=dry_run),
     )
     if dry_run:
@@ -508,5 +783,6 @@ def _execute(ctx: _Ctx, sources: Sequence[TaskSource], today, collect) -> RunRep
         now=ctx.now, include_ended=True,
     )
     _transitions(ctx)
+    _cleanup(ctx)
     _fetch_all(ctx, sources, today)
     return ctx.report

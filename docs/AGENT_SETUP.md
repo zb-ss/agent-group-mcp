@@ -454,15 +454,18 @@ tmux attach -t agents     # one window per session
 `<clone>/.worktrees/<label>` (excluded through the repository's
 `info/exclude`; `spawn.worktree_root` moves it elsewhere). Inside the clone it
 inherits the clone's folder trust in Claude Code and Codex, so no trust prompt
-blocks an unattended session; Antigravity CLI asks again, and opencode never
-asks. IDEs, containers and file watchers that mount the main folder also see
+blocks an unattended session; opencode never asks. Antigravity CLI asks
+again unless you opt in to `spawn.clients.agy.worktree_trust` (`enabled`,
+off by default): when the clone is already trusted in agy's settings file,
+the worktree path is added to the same list. It writes that file, which a
+running agy may rewrite. IDEs, containers and file watchers that mount the main folder also see
 `.worktrees/`. For Claude Code, spawn writes a worktree-local
 `.claude/settings.local.json` that approves the server and, if the worktree's
 committed `.claude/settings.json` lacks the agent-bus hooks, carries them.
 
 Spawned sessions are started in the client's auto permission mode, with
 Remote Control on where the client has it (`--no-remote` turns it off). To
-change the commands, the cap of five sessions, or the folders searched for
+change the commands, the cap of ten sessions, or the folders searched for
 clones, create `~/.claude-agent-bus/config.json` (see the README's
 *Configuration*). Ask the agent in its prompt to call
 `set_session(state="done")` when it has finished; `status` then stops
@@ -499,6 +502,14 @@ For an unattended timer, also set `sources.asana.comment_authors` to the user gi
 5. Check the result with `agent-bus dispatch status` and `agent-bus status`.
 6. Run `agent-bus dispatch install-timer` from a shell whose `PATH` has `tmux` and your clients. It prints the files it wrote and loads nothing. Only when the owner says so, run `agent-bus dispatch install-timer --load`.
 
+Limits: a run holds new sessions at `dispatch.soft_limit` (default 6 running), reports them as `held` and sends one `needs_approval` alert; `agent-bus dispatch approve <task-id>` lets the next run start the task. `spawn.max_sessions` (default 10) is the hard limit and `dispatch.max_spawns_per_run` (default 4) the per-run limit. Add `needs_approval` and `worktree_removed` to `dispatch.notify_on` if your config sets that list itself.
+
+Follow-ups: a live session gets the follow-up as a bus message. An ended Claude Code session is resumed in a new tmux window when its transcript is at most `dispatch.resume_max_transcript_mb` (default 20); a larger transcript, a missing session or a client without `resume_prompt` and `transcripts` templates starts a new session that reads the task's handoff channel first.
+
+Cleanup: each run removes a dispatched worktree once its branch has commits of its own and is merged into the base ref (merge commits, rebase merges and single-commit squashes are detected), the session is not live or active and nothing is uncommitted or unpushed. It never forces the removal and sends a `worktree_removed` alert. Detached worktrees, branches with no commits of their own, tasks recorded without a start commit, and branches merged by squashing several commits are kept: remove them with `git worktree remove <path>`. `dispatch.worktree_cleanup.enabled: false` turns this off.
+
+Links: sessions can attach links with `set_session(links=[{"label": "PR", "url": "https://example.com/pr/1"}])`; dispatch alerts and the HTML email carry them.
+
 To remove it: `agent-bus dispatch uninstall-timer --unload`.
 
 ---
@@ -523,16 +534,19 @@ To remove it: `agent-bus dispatch uninstall-timer --unload`.
 | An idle agy session is not woken | Its agent has not run `agent-bus wake-register` (the user declined, or refused the permission), an agy whose `agentapi` has no `send-message`, a `wake.json` entry for the agent, `AGENT_BUS_NATIVE_WAKE=0`, or the hourly limit | Check `agent-bus tail` for `unregistered`; ask the agent to run `agent-bus wake-register --client agy` and allow it; set `AGENT_BUS_AGY_BIN` if the sender cannot run `agy` |
 | `spawn` says tmux was not found | tmux is not installed or not on `PATH` | Install tmux, or set `spawn.tmux_bin`; spawn printed the command to run by hand |
 | A spawned worktree session lacks the project memory | Memory lives outside the repo, per folder | Claude links it by default through `spawn.clients.claude.worktree_links` (source `~/.claude/projects/{clone_key}/memory`, target `~/.claude/projects/{work_dir_key}/memory`); the source must exist. Set the list to `[]` in `config.json` to switch it off |
-| A spawned session stays `starting`, then disappears | The repo is not wired for that client, or the worktree lacks the wiring; or the client is waiting on a folder-trust or MCP-approval prompt: it shows `starting`, then `ended` after `spawn.startup_grace_seconds`, and becomes live again once it joins | Run `agent-bus init` for the repo and client (for Claude Code this also approves the server). In a worktree, untracked wiring files are linked in, and for Claude Code spawn writes a worktree-local `.claude/settings.local.json` (server approval, plus the hooks when the committed `.claude/settings.json` lacks them); other tracked wiring files keep their committed copy and spawn prints a note naming them. Answer a folder-trust prompt in the tmux window (Antigravity CLI asks in a new folder; Claude Code and Codex do not inside `<clone>/.worktrees`), or raise `spawn.startup_grace_seconds` in `config.json` |
-| A spawned Codex session is not linked to the spawn in `status` | Codex is wired once per user and does not pass `AGENT_BUS_SESSION` to MCP servers, so it registers under the folder's name | Wire the repo with `agent-bus init --clients codex`, which passes the variable through |
+| A spawned session stays `starting`, then disappears | The repo is not wired for that client, or the worktree lacks the wiring; or the client is waiting on a folder-trust or MCP-approval prompt: it shows `starting`, then `ended` after `spawn.startup_grace_seconds`, and becomes live again once it joins | Run `agent-bus init` for the repo and client (for Claude Code this also approves the server). In a worktree, untracked wiring files are linked in, and for Claude Code spawn writes a worktree-local `.claude/settings.local.json` (server approval, plus the hooks when the committed `.claude/settings.json` lacks them); other tracked wiring files keep their committed copy and spawn prints a note naming them. Answer a folder-trust prompt in the tmux window (Antigravity CLI asks in a new folder unless `worktree_trust` is on; Claude Code and Codex do not inside `<clone>/.worktrees`), or raise `spawn.startup_grace_seconds` in `config.json` |
+| A spawned Codex session is not linked to the spawn in `status` | The repo was wired for Codex by an older version, which does not pass the spawn variables to the MCP server, or Codex is wired for the user only and `spawn.clients.codex.user_wired` is `null` or was overridden | Re-run `agent-bus init --clients codex` for the repo, or check `spawn.clients.codex.user_wired` |
 | A spawned opencode session joins as a stranger | opencode's shared background service gave its MCP server the environment of an earlier launch | The default template uses `opencode --standalone`; keep it in custom templates |
+| A spawned opencode session runs on a different model than `--model` or your default | opencode 2.4.1 ignores configured models when started with `--prompt`, which spawn uses | Check the model shown in its window and switch it there; the override applies to `opencode run` and to opencode started without a prompt |
 | `claude --resume` in the repo does not list a spawned session | The session ran in a worktree, and the picker shows the current folder only | Run the `resume:` command `agent-bus dispatch status` prints, `claude --resume <label>` from the repo, or press Ctrl+W in the picker to list every worktree |
 | `environment variable ... is not set` when the timer runs | launchd and systemd do not inherit your shell environment | Set `dispatch.env_file` to a `chmod 600` file with the `KEY=VALUE` line |
 | The timer runs but nothing happens | Outside `dispatch.working_hours`, the source is not `enabled`, or another run holds the lock | Read `dispatch.log` and `dispatch-timer.log` beside the database; try `agent-bus dispatch run --dry-run --ignore-hours` |
-| `dispatch` reports `spawn cap reached` | `spawn.max_sessions` or `dispatch.max_spawns_per_run` is reached | Wait for sessions to report `done`, or raise the limit in `config.json` |
+| `dispatch` reports `spawn cap reached` | `spawn.max_sessions` (default 10) or `dispatch.max_spawns_per_run` (default 4) is reached | Wait for sessions to report `done`, or raise the limit in `config.json` |
 | A task is not picked up | Its project is not in `projects`, it has no due date or is due after the lookahead, it is not assigned to the token's user, or no rule matches | Check with `dispatch run --dry-run --json`; adjust `projects`, `lookahead_days` or `rules` |
 | The timer cannot find tmux or the client | The unit's `PATH` is the one of the shell that ran `install-timer` | Re-run `install-timer` from a shell whose `PATH` has them |
-| `spawn` exits 4 | The cap (`spawn.max_sessions`, default 5) is reached | Wait, have a finished session report `done`, or raise the cap in `config.json` |
+| A task shows `held` and you got a needs-approval alert | The running sessions reached `dispatch.soft_limit` (default 6) | Wait for sessions to finish, run `agent-bus dispatch approve <task-id>`, or raise or null `dispatch.soft_limit`. A `notify_on` set in your config must include `needs_approval` for the alert |
+| A merged worktree is not removed | A keep reason holds; `agent-bus dispatch run --dry-run` prints it: it is a detached worktree (never removed; use `git worktree remove <path>`), `branch <name> has no commits of its own` (nothing committed since the spawn), `start commit unknown` (dispatched before start commits were recorded), the branch is not merged into the base ref (a squash of several commits is not detected), uncommitted changes, commits not pushed to the remote, the session is live or active, or `dispatch.worktree_cleanup.enabled` is `false` | Fix the reason, or remove the worktree by hand with `git worktree remove <path>` |
+| `spawn` exits 4 | The cap (`spawn.max_sessions`, default 10) is reached | Wait, have a finished session report `done`, or raise the cap in `config.json` |
 | `spawn --repo` says the repo is ambiguous | Two different clones match | Give the full id or the bus name, or remove the stray clone from `repos.roots` |
 | A woken agent and another keep waking each other | Two agents answering every message | The hourly limit (`AGENT_BUS_WAKES_PER_HOUR`, default 20) stops it; lower it if needed |
 

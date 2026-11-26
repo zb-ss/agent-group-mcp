@@ -11,6 +11,7 @@ Three things shape this adapter:
     `agent-bus` outside the markers is somebody else's and stays untouched.
   * Codex starts MCP servers with a minimal environment, so the variables a
     second session needs are listed in `env_vars` to be passed through.
+    AGENT_BUS_SPAWN_TOKEN is what links a spawned session to its spawn record.
   * Codex asks the user to approve each hook and ties the approval to the
     hook's definition. The hook commands therefore carry no agent name —
     the hook finds its agent from the payload's `cwd` — and come out
@@ -57,7 +58,7 @@ HOOK_EVENTS = (
     ("Stop", "hook-stop"),
 )
 PASSED_THROUGH_ENV = (
-    "AGENT_BUS_SESSION", "AGENT_BUS_INSTANCE", "AGENT_BUS_DB", "AGENT_BUS_AUDIT_LOG",
+    "AGENT_BUS_SESSION", "AGENT_BUS_SPAWN_TOKEN", "AGENT_BUS_INSTANCE", "AGENT_BUS_DB", "AGENT_BUS_AUDIT_LOG",
 )
 
 # Where Codex keeps its per-user config; it honours this variable itself.

@@ -41,6 +41,7 @@ from .base import (
     UnreadableConfigError,
     WiringState,
     WiringStatus,
+    WorktreePrep,
 )
 
 CLIENT_ID = "agy"
@@ -128,7 +129,10 @@ class AgyWiring:
     limitations = (
         "agy has no prompt-submit hook: pending mail is injected before each "
         "model call as a transient system message.",
-        "agy loads a repo's .agents/ plugins only for a workspace it trusts.",
+        "agy loads a repo's .agents/ plugins only for a workspace it trusts; "
+        "a spawned worktree is a new folder, so it is trusted only with the "
+        "opt-in spawn.clients.agy.worktree_trust option, which copies the "
+        "clone's trust over.",
         "An idle agy session can be woken by mail once its agent has run "
         "`agent-bus wake-register`, which it is asked to do when the session "
         "starts. agy asks you to allow that command: allow it always, and it "
@@ -176,3 +180,68 @@ class AgyWiring:
             }]
             for event, subcommand in HOOK_EVENTS
         }})
+
+    def prepare_worktree(
+        self, clone: Path, worktree: Path, *, name: str, bin_path: str,
+        dry_run: bool = False, options: Mapping | None = None,
+    ) -> WorktreePrep:
+        """Opt-in: trust a worktree in agy when its clone is trusted there.
+
+        `options["worktree_trust"]` names agy's settings file and the key
+        holding its list of trusted folders; only that list is appended to."""
+        trust = (options or {}).get("worktree_trust") or {}
+        if not trust.get("enabled"):
+            return WorktreePrep()
+        path = Path(trust["file"]).expanduser()
+        try:
+            data = base.load_json_object(path)
+        except UnreadableConfigError as exc:
+            return WorktreePrep([f"not carrying agy folder trust: {exc}"])
+        trusted = data.get(trust["key"])
+        if not isinstance(trusted, list):
+            return WorktreePrep([
+                f"agy has no trusted folders recorded in {path}; trust the clone in agy first"
+            ])
+        real = {os.path.realpath(item) for item in trusted if isinstance(item, str)}
+        if os.path.realpath(clone) not in real:
+            return WorktreePrep([
+                f"{clone} is not trusted in agy, so the worktree is not trusted either"
+            ])
+        if os.path.realpath(worktree) in real:
+            return WorktreePrep()
+        if dry_run:
+            return WorktreePrep([f"would trust {worktree} in agy ({path})"])
+        data[trust["key"]] = [*trusted, str(worktree)]
+        base.write_json_object(path, data)
+        return WorktreePrep([
+            f"trusted {worktree} in agy, carried over from the clone; a running agy "
+            f"may rewrite {path} and drop it"
+        ])
+
+    def release_worktree(self, worktree: Path, *, options: Mapping | None = None) -> list[str]:
+        """Opt-in counterpart of `prepare_worktree`, run after the worktree is
+        removed: drop its path from agy's trusted folders. Only that list is
+        touched; a missing or unreadable file is a note, not an error."""
+        trust = (options or {}).get("worktree_trust") or {}
+        if not trust.get("enabled"):
+            return []
+        path = Path(trust["file"]).expanduser()
+        if not path.exists():
+            return [f"agy settings {path} not found; no folder trust to drop"]
+        try:
+            data = base.load_json_object(path)
+            trusted = data.get(trust["key"])
+            if not isinstance(trusted, list):
+                return []
+            target = os.path.realpath(worktree)
+            kept = [
+                item for item in trusted
+                if not (isinstance(item, str) and os.path.realpath(item) == target)
+            ]
+            if len(kept) == len(trusted):
+                return []
+            data[trust["key"]] = kept
+            base.write_json_object(path, data)
+        except (UnreadableConfigError, OSError) as exc:
+            return [f"not dropping agy folder trust: {exc}"]
+        return [f"dropped agy folder trust for {worktree}"]

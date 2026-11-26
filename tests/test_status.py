@@ -149,7 +149,7 @@ def test_to_dict_has_exactly_the_documented_keys(storage, fake_procs):
         "name", "group", "client", "label", "state", "reported_state",
         "state_at", "live", "spawned", "last_seen", "topic", "pending_count",
         "repo_path", "repo_id", "work_dir", "tmux_session", "tmux_window",
-        "model", "remote",
+        "model", "remote", "links",
     ])
 
 
@@ -228,3 +228,12 @@ def test_dead_session_that_reported_is_ended_inside_the_grace(reported):
 
 def test_dead_session_that_never_reported_is_starting_inside_the_grace():
     assert _state(None, live=False, spawned_at=_ts(10)) == "starting"
+
+
+def test_the_row_carries_the_session_links(storage, fake_procs):
+    name, _ = _start(storage, fake_procs)
+    links = [{"label": "PR", "url": "https://example.com/pr/1"}]
+    storage.set_links(name, links)
+    (row,) = _collect(storage)
+    assert row.links == tuple(links)
+    assert row.to_dict()["links"] == tuple(links)
