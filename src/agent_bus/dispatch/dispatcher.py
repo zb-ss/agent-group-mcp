@@ -82,10 +82,11 @@ def _timeouts(cfg: Mapping) -> dict[str, Any]:
     return {"tmux_bin": spawn_cfg["tmux_bin"], "timeout": spawn_cfg["tmux_timeout_seconds"]}
 
 
-def _prepare(
-    cfg: Mapping, work_dir: Path, *, storage: Storage, run: commands.Runner, notes: list[str]
+def prepare_folder(
+    cfg: Mapping, work_dir: Path, *, group: str, client: str, storage: Storage,
+    run: commands.Runner, notes: list[str],
 ) -> None:
-    d = cfg["dispatch"]["dispatcher"]
+    """Make `work_dir` a wired, repo-less session folder for `group/client`."""
     work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not (work_dir / ".git").exists():
         # A local git folder with no remote: only so the existing wiring and
@@ -100,11 +101,21 @@ def _prepare(
             )
     name_file = work_dir / NAME_FILE
     if not name_file.exists():
-        name_file.write_text(d["group"] + "\n", encoding="utf-8")
-    spawn.wire_repo(d["client"], work_dir, storage=storage, notes=notes)
+        name_file.write_text(group + "\n", encoding="utf-8")
+    spawn.wire_repo(client, work_dir, storage=storage, notes=notes)
     # spawn finds a repo by alias through the roster; this folder has no
     # remote and lies outside the scan roots, so put its client address there
-    storage.ensure_agent(f"{d['group']}/{d['client']}", str(work_dir))
+    storage.ensure_agent(f"{group}/{client}", str(work_dir))
+
+
+def _prepare(
+    cfg: Mapping, work_dir: Path, *, storage: Storage, run: commands.Runner, notes: list[str]
+) -> None:
+    d = cfg["dispatch"]["dispatcher"]
+    prepare_folder(
+        cfg, work_dir, group=d["group"], client=d["client"], storage=storage, run=run,
+        notes=notes,
+    )
 
 
 PLACEHOLDERS = ("label", "dir", "soft_limit", "max_sessions", "clients")

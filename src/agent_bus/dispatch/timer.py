@@ -4,6 +4,11 @@ launchd on macOS, a systemd user service + timer on Linux. Planning is pure;
 `install` and `uninstall` write files and only touch launchctl/systemctl when
 the caller asks to load or unload, through an injected `commands.Runner`.
 
+With `dispatch.timer.always` false the timer fires on the working-hours slots
+only. With it true the timer fires every `interval_minutes` all week
+(`StartInterval` / `OnUnitActiveSec`); each message source then gates itself by
+its own schedule and the task pipeline by `dispatch.working_hours`.
+
 The environment written into a unit holds PATH, AGENT_BUS_DB and
 AGENT_BUS_AUDIT_LOG (when set) plus `dispatch.timer.environment`. No secret
 belongs there: unit files are plain text. Secrets go in `dispatch.env_file`.
@@ -105,11 +110,17 @@ def _launchd(name, argv, environment, output, days, day_slots, home, uid, timer)
     document = {
         "Label": name,
         "ProgramArguments": argv,
-        "StartCalendarInterval": [
-            {"Weekday": _LAUNCHD_WEEKDAYS[day], "Hour": hour, "Minute": minute}
-            for day in days
-            for hour, minute in day_slots
-        ],
+        **(
+            {"StartInterval": timer["interval_minutes"] * 60}
+            if timer.get("always")
+            else {
+                "StartCalendarInterval": [
+                    {"Weekday": _LAUNCHD_WEEKDAYS[day], "Hour": hour, "Minute": minute}
+                    for day in days
+                    for hour, minute in day_slots
+                ]
+            }
+        ),
         "EnvironmentVariables": environment,
         "StandardOutPath": str(output),
         "StandardErrorPath": str(output),
@@ -147,12 +158,16 @@ def _systemd(name, argv, environment, output, days, day_slots, home, timer) -> T
         "",
     ]
     day_list = ",".join(day.capitalize() for day in days)
+    if timer.get("always"):
+        triggers = ["OnActiveSec=60", f"OnUnitActiveSec={timer['interval_minutes']}min"]
+    else:
+        triggers = [f"OnCalendar={day_list} *-*-* {h:02d}:{m:02d}:00" for h, m in day_slots]
     timer_unit = [
         "[Unit]",
         f"Description={name}: schedule for agent-bus dispatch",
         "",
         "[Timer]",
-        *(f"OnCalendar={day_list} *-*-* {h:02d}:{m:02d}:00" for h, m in day_slots),
+        *triggers,
         "Persistent=false",
         "",
         "[Install]",

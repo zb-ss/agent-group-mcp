@@ -132,3 +132,19 @@ def test_uninstall_plan_needs_no_absolute_binary(cfg, tmp_path):
     plan = timer.plan(cfg, bin_path="agent-bus", platform="linux", home=tmp_path, env=ENV,
                       uninstall=True)
     assert plan.unload_commands
+
+
+def test_always_timer_uses_plain_intervals(cfg, tmp_path):
+    cfg["dispatch"]["timer"].update(always=True, interval_minutes=5)
+    doc = plistlib.loads(_plan(cfg, tmp_path, "darwin").files[0].content)
+    assert doc["StartInterval"] == 300 and "StartCalendarInterval" not in doc
+    unit = _plan(cfg, tmp_path, "linux").files[1].content.decode()
+    assert "OnUnitActiveSec=5min" in unit and "OnActiveSec=60" in unit
+    assert "OnCalendar" not in unit
+
+
+def test_always_off_keeps_the_calendar_files(cfg, tmp_path):
+    base = _plan(cfg, tmp_path, "linux").files[1].content
+    cfg["dispatch"]["timer"]["always"] = False
+    assert _plan(cfg, tmp_path, "linux").files[1].content == base
+    assert b"OnUnitActiveSec" not in base

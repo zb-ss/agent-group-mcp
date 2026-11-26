@@ -356,3 +356,94 @@ def test_unmapped_project_tasks_need_unmapped_repos(unmapped, kept):
     src, _ = make([task("1000000000000001", project="2999999999999999")],
                   unmapped_repos=unmapped)
     assert len(src.fetch(today=TODAY)) == kept
+
+
+def test_send_refuses_http(monkeypatch):
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: pytest.fail("called"))
+    with pytest.raises(SourceError) as info:
+        source.default_http_send("http://example.com/x?secret=1", None, {}, 1.0)
+    assert "secret" not in str(info.value)
+
+
+def test_send_redirect_refused(monkeypatch):
+    import email.message
+    import io
+    import urllib.response
+
+    class FakeHttps(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            msg = email.message.Message()
+            msg["Location"] = "https://other.example.net/x"
+            resp = urllib.response.addinfourl(io.BytesIO(b""), msg, req.full_url, 302)
+            resp.msg = "Found"
+            return resp
+
+    monkeypatch.setattr(
+        source, "_build_opener", lambda: urllib.request.build_opener(source._NoRedirect, FakeHttps)
+    )
+    with pytest.raises(SourceError) as info:
+        source.default_http_send("https://x.example.com/a", b"a=1", {}, 1.0)
+    assert str(info.value) == "HTTP 302 from x.example.com"
+
+
+class _HeaderResponse(_FakeResponse):
+    def __init__(self, body=b"{}", headers=None):
+        super().__init__(body)
+        self.headers = headers or {}
+
+
+class _RecordingOpener(_ScriptedOpener):
+    def open(self, request, timeout=None):
+        self.requests = getattr(self, "requests", []) + [request]
+        return super().open(request, timeout)
+
+
+def test_send_post_vs_get_and_lowercased_headers(monkeypatch):
+    opener = _RecordingOpener([
+        _HeaderResponse(b"a", {"X-OAuth-Scopes": "search:read"}), _HeaderResponse(b"b"),
+    ])
+    monkeypatch.setattr(source, "_build_opener", lambda: opener)
+    posted = source.default_http_send("https://x.example.com/a", b"k=v", {}, 1.0)
+    got = source.default_http_send("https://x.example.com/a", None, {}, 1.0)
+    assert posted.body == b"a" and posted.headers == {"x-oauth-scopes": "search:read"}
+    assert got.body == b"b"
+    assert [r.get_method() for r in opener.requests] == ["POST", "GET"]
+    assert opener.requests[0].data == b"k=v"
+
+
+def test_send_429_honours_and_caps_retry_after(monkeypatch):
+    opener = _ScriptedOpener([_http_error(429, {"Retry-After": "7"}), _FakeResponse(b"ok")])
+    monkeypatch.setattr(source, "_build_opener", lambda: opener)
+    sleeps: list[float] = []
+    out = source.default_http_send("https://x.example.com/a", b"", {}, 1.0, sleep=sleeps.append)
+    assert out.body == b"ok" and sleeps == [7.0]
+
+    opener = _ScriptedOpener([_http_error(429, {"Retry-After": "900"}), _FakeResponse()])
+    monkeypatch.setattr(source, "_build_opener", lambda: opener)
+    sleeps = []
+    source.default_http_send(
+        "https://x.example.com/a", None, {}, 1.0, max_retry_wait=5, sleep=sleeps.append
+    )
+    assert sleeps == [5.0]
+
+    opener = _ScriptedOpener([_http_error(429), _http_error(429)])
+    monkeypatch.setattr(source, "_build_opener", lambda: opener)
+    with pytest.raises(SourceError) as info:
+        source.default_http_send("https://x.example.com/a", None, {}, 1.0, sleep=lambda s: None)
+    assert str(info.value) == "HTTP 429 from x.example.com"
+
+
+def test_send_network_error_names_host_only(monkeypatch):
+    import urllib.error
+
+    opener = _ScriptedOpener([urllib.error.URLError("secret detail")])
+    monkeypatch.setattr(source, "_build_opener", lambda: opener)
+    with pytest.raises(SourceError) as info:
+        source.default_http_send("https://x.example.com/a?t=secret", b"a", {}, 1.0)
+    assert str(info.value) == "request to x.example.com failed"
+
+
+def test_schedule_attribute_comes_from_config():
+    assert AsanaSource({}, env={}).schedule is None
+    schedule = {"interval_minutes": 30, "hours": "working"}
+    assert AsanaSource({"schedule": schedule}, env={}).schedule == schedule

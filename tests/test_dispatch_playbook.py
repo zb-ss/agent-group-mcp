@@ -128,3 +128,18 @@ def test_dispatcher_rejects_task_placeholders():
 def test_dispatcher_override(tmp_path):
     (tmp_path / "dispatcher.md").write_text("Private $label", encoding="utf-8")
     assert playbook.render("dispatcher", DISPATCHER_VALUES, templates_dir=str(tmp_path)) == "Private disp-1"
+
+
+def test_dispatcher_playbook_names_the_drafts_commands():
+    import re
+
+    from agent_bus.dispatch.playbook import load_template
+
+    text = load_template("dispatcher", templates_dir=None)
+    assert set(re.findall(r"\$([a-z_]+)", text)) == {
+        "label", "dir", "clients", "max_sessions", "soft_limit"
+    }
+    for command in ("list", "show ID", "edit ID --file FILE", "approve ID", "discard ID"):
+        assert f"agent-bus dispatch drafts {command}" in text
+    assert "[--clone]" in text
+    assert "approving a draft the owner told you to approve" in text

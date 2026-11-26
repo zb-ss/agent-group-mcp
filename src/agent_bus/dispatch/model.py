@@ -83,3 +83,24 @@ def clean_untrusted(text: str, max_chars: int) -> str:
     dashes also collapse to one, so a value cannot spell the template's
     `--- begin/end untrusted data ---` markers inline."""
     return _truncate(_DASH_RUN.sub("-", _flatten(text)), max_chars)
+
+
+_NEWLINE_RUN = re.compile(r"\n{3,}")
+
+
+def clean_multiline(text: str, max_chars: int) -> str:
+    """Keep the line structure of untrusted text but nothing that can forge
+    markup: control and line/paragraph separators become spaces, newline runs
+    shrink to one blank line, and dash runs collapse like `clean_untrusted`."""
+    unified = text.replace("\r\n", "\n").replace("\r", "\n")
+    printable = "".join(
+        " "
+        if ch != "\n"
+        and (unicodedata.category(ch).startswith("C") or unicodedata.category(ch) in ("Zl", "Zp"))
+        else ch
+        for ch in unified
+    )
+    printable = "\n".join(line.rstrip(" ") for line in printable.split("\n"))
+    printable = _NEWLINE_RUN.sub("\n\n", printable)
+    printable = _DASH_RUN.sub("-", printable)
+    return _truncate(printable.strip(), max_chars)

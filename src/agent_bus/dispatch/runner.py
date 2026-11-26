@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import fcntl
 import shutil
+import sqlite3
 import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,9 @@ from ..spawn import SpawnError, SpawnRequest
 from ..clients import agy as agy_client
 from ..clients.base import ResumableSession
 from ..storage import TIMESTAMP_FORMAT, Storage, UnknownRecipientError
-from . import classify, cleanup, decision_model, playbook, routing, settings, triage
+from . import (
+    classify, cleanup, decision_model, messages, playbook, routing, scan, settings, triage,
+)
 from .asana import AsanaSource
 from .model import (
     OUTCOME_DONE,
@@ -38,6 +41,7 @@ from .model import (
     clean_untrusted,
     format_now,
 )
+from .messages import MessageSource
 from .notify import Notification, Notifier, deliver
 from .playbook import PlaybookError
 from .source import HttpGet, SourceError, TaskSource
@@ -57,6 +61,10 @@ RESULTS = (
     "spawned", "would_spawn", "held", "would_hold", "notified", "would_notify",
     "messaged", "would_message", "resumed", "would_resume", "delegated", "would_delegate",
     "skipped", "failed", "ignored",
+    # message sources (`scan`, `incident`)
+    "would_scan", "drafted", "needs_owner", "escalated", "scan_failed", "incident_opened",
+    "incident_repeat", "incident_closed", "would_respond", "would_close", "would_report",
+    "rate_limited",
 )
 UNKNOWN = "unknown"
 HEAD = "HEAD"
@@ -66,7 +74,8 @@ _WATCHED_OUTCOMES = (OUTCOME_SPAWNED, OUTCOME_DONE, OUTCOME_ENDED)
 _SPAWN_FAILURES = (SpawnError, ConfigError, PlaybookError, OSError)
 _CLEAR_TRIAGE: dict[str, None] = dict.fromkeys(TRIAGE_FIELDS)
 _REOPEN: dict[str, None] = dict.fromkeys(
-    ("decision", "decision_at", "decision_reason", "decision_repo", "decision_client", "decision_model")
+    ("decision", "decision_at", "decision_reason", "decision_repo", "decision_client",
+     "decision_model", "decision_clone")
 )
 _DECISIONS_TO_EXECUTE = ("start", "resume")
 
@@ -93,13 +102,16 @@ class RunReport:
     transitions: list[dict] = field(default_factory=list)
     cleanups: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    messages: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @property
     def exit_code(self) -> int:
-        failed = any(d.result == "failed" for d in self.decisions)
+        failed = any(d.result == "failed" for d in self.decisions) or any(
+            m.get("result") == "failed" for m in self.messages
+        )
         return 1 if self.errors or failed else 0
 
 
@@ -126,6 +138,8 @@ class _Ctx:
     repo_ids: dict[str, str | None] = field(default_factory=dict)
     spawns: int = 0
     fetched: set[str] = field(default_factory=set)
+    force: bool = False
+    local: datetime | None = None
 
     @property
     def stamp(self) -> str:
@@ -142,7 +156,9 @@ def build_sources(
     for name, source_cfg in dispatch_cfg["sources"].items():
         if not source_cfg.get("enabled"):
             continue
-        factory = SOURCES.get(name)
+        if settings.source_type(name, source_cfg) in settings.MESSAGE_SOURCE_TYPES:
+            continue
+        factory = SOURCES.get(settings.source_type(name, source_cfg))
         if factory is None:
             raise ConfigError(f"dispatch.sources.{name} is enabled but there is no such source")
         built.append(factory(source_cfg, env=env, http_get=http_get))
@@ -796,7 +812,10 @@ def _spawn_task(
                                 prior, found, resume_playbook)
         new_reason = f"new session: {why}"
     route, answer = _route(ctx, task, record, type_, project_id, project)
-    project = {**project, "client": route.client, "model": route.model}
+    project = {
+        **project, "client": route.client, "model": route.model,
+        "clone": bool(project["clone"] or (record is not None and record.decision_clone)),
+    }
     try:
         values = _values(ctx, task, type_, label, project_id, project)
         text = playbook.render(
@@ -1047,11 +1066,25 @@ def _spawn_failed(
 
 def _fetch_all(ctx: _Ctx, sources: Sequence[TaskSource], today) -> None:
     for source in sources:
+        schedule = getattr(source, "schedule", None)
+        if schedule is not None and not ctx.force:
+            state = ctx.store.source_state(source.name)
+            if not settings.schedule_due(
+                schedule,
+                working_hours=ctx.dispatch["working_hours"],
+                last_run_at=(state.last_run_at if state else None) or None,
+                now=ctx.now,
+                local=ctx.local,
+                tolerance_seconds=ctx.dispatch["schedule_tolerance_seconds"],
+            ):
+                continue
         try:
             tasks = source.fetch(today=today)
         except SourceError as exc:
             ctx.report.errors.append(f"{source.name}: {exc}")
             continue
+        if schedule is not None and not ctx.dry_run:
+            ctx.store.save_source_state(source.name, now=ctx.stamp, last_run_at=ctx.stamp)
         for task in tasks:
             _handle_task(ctx, task)
 
@@ -1085,12 +1118,15 @@ def run(
     available: Callable[[str], bool] | None = None,
     http_post: Callable[..., bytes] = decision_model.default_http_post,
     quota: Callable[[str], float] = routing.no_quota,
+    message_sources: Sequence[MessageSource] = (),
+    env: Mapping[str, str] | None = None,
+    http_send: Callable[..., Any] | None = None,
+    scanner_fn: Callable[..., Any] | None = None,
 ) -> RunReport:
     now = now or datetime.now(timezone.utc)
     local = now.astimezone(tz)
     d = cfg["dispatch"]
-    if not (dry_run or ignore_hours or settings.within_working_hours(d["working_hours"], local)):
-        return RunReport(skipped="outside working hours")
+    force = dry_run or ignore_hours
     if available is None:
         available = _client_available(cfg)
     ctx = _Ctx(
@@ -1098,14 +1134,60 @@ def run(
         dry_run=dry_run, run=run, spawn_fn=spawn_fn, resume_fn=resume_fn,
         find_session=find_session, send=send or storage.send_message, rows=[],
         report=RunReport(dry_run=dry_run), available=available, http_post=http_post,
-        quota=quota,
+        quota=quota, force=force, local=local,
     )
+    pctx = messages.PassCtx(
+        cfg=cfg, dispatch=d, storage=storage, store=store, notifiers=notifiers, now=now,
+        dry_run=dry_run, env=env if env is not None else {}, run=run, spawn_fn=spawn_fn,
+        send=ctx.send, rows=[], dispatcher=None, available=available, quota=quota,
+        http_send=http_send, scanner_fn=scanner_fn,
+    )
+    tasks_due = force or settings.within_working_hours(d["working_hours"], local)
+    due_messages = [s for s in message_sources if scan.due(s, pctx, local=local, force=force)]
+    if not tasks_due and not due_messages:
+        return RunReport(skipped="outside working hours")
     if dry_run:
-        return _execute(ctx, sources, local.date(), collect)
+        _execute(ctx, pctx, sources, due_messages, tasks_due, collect)
+        return _finish(ctx, pctx)
     with run_lock(settings.lock_path()) as acquired:
         if not acquired:
             return RunReport(skipped="another run is in progress")
-        return _execute(ctx, sources, local.date(), collect)
+        queued = _execute(ctx, pctx, sources, due_messages, tasks_due, collect)
+        _prune_messages(ctx)
+    if queued:
+        _scan_after(pctx, queued)
+    return _finish(ctx, pctx)
+
+
+def _prune_messages(ctx: _Ctx) -> None:
+    """Forget message items past the retention window (real runs only; the
+    store keeps items a pending draft or an open incident still needs)."""
+    cutoff = format_now(ctx.now - timedelta(days=ctx.dispatch["message_retention_days"]))
+    try:
+        ctx.store.prune_message_items(cutoff)
+    except sqlite3.Error as exc:
+        ctx.report.errors.append(f"message items not pruned ({type(exc).__name__})")
+
+
+def _finish(ctx: _Ctx, pctx: messages.PassCtx) -> RunReport:
+    ctx.report.messages.extend(pctx.decisions)
+    ctx.report.errors.extend(pctx.errors)
+    return ctx.report
+
+
+def _scan_after(pctx: messages.PassCtx, queued: list) -> None:
+    """The scanner batches run after the run lock is released, under their own
+    lock, so a slow model run never delays alert polling."""
+    with run_lock(settings.scan_lock_path()) as acquired:
+        if acquired:
+            scan.scan_phase(pctx, queued)
+            return
+    for source in dict.fromkeys(q.source.name for q in queued):
+        pctx.decisions.append({
+            "source": source, "item_id": None, "container": None, "rule": None,
+            "action": "scan", "result": "skipped", "reason": "another scan is in progress",
+            "url": "",
+        })
 
 
 def _live_dispatcher(ctx: _Ctx) -> Any | None:
@@ -1118,13 +1200,19 @@ def _live_dispatcher(ctx: _Ctx) -> Any | None:
     return None
 
 
-def _execute(ctx: _Ctx, sources: Sequence[TaskSource], today, collect) -> RunReport:
+def _execute(
+    ctx: _Ctx, pctx: messages.PassCtx, sources: Sequence[TaskSource],
+    due_messages: Sequence[MessageSource], tasks_due: bool, collect,
+) -> list:
     ctx.rows = collect(
         ctx.storage, grace_seconds=ctx.cfg["spawn"]["startup_grace_seconds"],
         now=ctx.now, include_ended=True,
     )
     ctx.dispatcher = _live_dispatcher(ctx)
-    _transitions(ctx)
-    _cleanup(ctx)
-    _fetch_all(ctx, sources, today)
-    return ctx.report
+    pctx.rows, pctx.dispatcher = ctx.rows, ctx.dispatcher
+    queued = scan.main_phase(pctx, due_messages)
+    if tasks_due:
+        _transitions(ctx)
+        _cleanup(ctx)
+        _fetch_all(ctx, sources, ctx.local.date())
+    return queued

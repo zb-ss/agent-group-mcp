@@ -25,6 +25,12 @@ def _decision_line(d: dict) -> str:
     return f"{line} ({d['reason']})" if d["reason"] else line
 
 
+def _message_line(m: dict) -> str:
+    """One line per message decision; never any message text."""
+    line = f"message: {m['result']} {m['source']} {m.get('rule') or '-'} {m.get('url') or '-'}"
+    return f"{line} ({m['reason']})" if m.get("reason") else line
+
+
 def _keep_dispatcher_alive(cfg, storage) -> None:
     from . import dispatcher
 
@@ -40,7 +46,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     from .. import commands, config
     from ..storage import Storage
-    from . import envfile, notify, runner, settings
+    from datetime import datetime
+
+    from . import envfile, notify, runner, scan, settings
     from .store import DispatchStore
 
     try:
@@ -48,20 +56,24 @@ def cmd_run(args: argparse.Namespace) -> int:
         d = cfg["dispatch"]
         env = envfile.load(d["env_file"], base=os.environ)
         sources = runner.build_sources(d, env=env)
+        message_sources = scan.build_sources(d, env=env)
     except config.ConfigError as e:
         _err(str(e))
         return 1
-    if not sources:
+    if not sources and not message_sources:
         _err(
             "no dispatch source is enabled "
-            "(set dispatch.sources.asana.enabled in config.json)"
+            "(set dispatch.sources.<name>.enabled in config.json)"
         )
         return 0
     notifiers = notify.build(
         d["notifiers"], env=env, run=commands.run_command, log_path=settings.log_path(d)
     )
     storage = Storage()
-    if d["dispatcher"]["keep_alive"] and not args.dry_run:
+    in_hours = args.ignore_hours or settings.within_working_hours(
+        d["working_hours"], datetime.now().astimezone()
+    )
+    if d["dispatcher"]["keep_alive"] and not args.dry_run and in_hours:
         _keep_dispatcher_alive(cfg, storage)
     report = runner.run(
         cfg=cfg,
@@ -71,6 +83,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         notifiers=notifiers,
         dry_run=args.dry_run,
         ignore_hours=args.ignore_hours,
+        message_sources=message_sources,
+        env=env,
     )
     if args.json:
         _out(json.dumps(report.to_dict(), indent=2))
@@ -80,6 +94,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         for decision in report.to_dict()["decisions"]:
             _out(_decision_line(decision))
+        for message in report.messages:
+            _out(_message_line(message))
         for transition in report.transitions:
             _out("transition: " + " ".join(f"{k}={v}" for k, v in transition.items()))
         for entry in report.cleanups:
@@ -249,7 +265,7 @@ def cmd_decide(args: argparse.Namespace) -> int:
         decisions.decide(
             DispatchStore(), cfg, args.task_id, rows=rows, action=args.action, source=args.source,
             reason=args.reason, repo=args.repo, client=args.client, model=args.model,
-            now=_now(), actor=decisions.ACTOR_DISPATCHER,
+            clone=args.clone, now=_now(), actor=decisions.ACTOR_DISPATCHER,
         )
     except (decisions.DecisionError, config.ConfigError) as e:
         _err(str(e))
@@ -259,6 +275,267 @@ def cmd_decide(args: argparse.Namespace) -> int:
         "the next dispatch run applies it (agent-bus dispatch run)"
     )
     return 0
+
+
+def _draft_failure(e: Exception) -> int:
+    _err(str(e))
+    return 1
+
+
+def cmd_drafts_list(args: argparse.Namespace) -> int:
+    from .. import config
+    from . import drafts
+    from .store import DispatchStore
+
+    try:
+        cfg = config.load()
+    except config.ConfigError as e:
+        return _draft_failure(e)
+    items = drafts.listing(
+        DispatchStore(), now=_now(), include_closed=args.all,
+        stale_minutes=cfg["dispatch"]["drafts"]["sending_stale_minutes"],
+    )
+    if args.json:
+        _out(json.dumps(items, indent=2))
+        return 0
+    if not items:
+        _out("(no pending drafts)")
+        return 0
+    _out("ID  STATUS  KIND  SOURCE  RULE  URL")
+    for i in items:
+        status = f"{i['status']}(stale)" if i["stale"] else i["status"]
+        _out("  ".join(
+            [str(i["id"]), status, i["kind"], i["source"], i["rule"] or "-", i["url"] or "-"]
+        ))
+    if any(i["stale"] for i in items):
+        _out(
+            "a stale draft's delivery never recorded a result; check its destination, then "
+            "`agent-bus dispatch drafts reset ID` makes it pending again"
+        )
+    return 0
+
+
+def cmd_drafts_show(args: argparse.Namespace) -> int:
+    from .. import config
+    from . import drafts
+    from .store import DispatchStore
+
+    try:
+        config.load()
+        store = DispatchStore()
+        item = drafts.show(store, args.draft_id)
+        draft = store.get_draft(args.draft_id)
+    except (drafts.DraftError, config.ConfigError) as e:
+        return _draft_failure(e)
+    if args.json:
+        _out(json.dumps(item, indent=2))
+        return 0
+    _out(f"draft {item['id']}  {item['status']}  {item['kind']}  {item['source']}  "
+         f"{item['rule'] or '-'}  {item['url'] or '-'}")
+    for key, value in sorted(item["target"].items()):
+        _out(f"  {key}: {value}")
+    _out(
+        f"lines starting with {drafts.UNTRUSTED_PREFIX.strip()!r} are untrusted: the "
+        "sender's headers and a reply drafted by a model from untrusted message data; "
+        "review them before approving"
+    )
+    for line in drafts.untrusted_lines(draft):
+        _out(line)
+    return 0
+
+
+def _owner(drafts, store, draft_id: int, operation: str, storage, env) -> str:
+    """The acting owner; a refused agent session is written to the decision log."""
+    try:
+        return drafts.owner_actor(storage, env)
+    except drafts.DraftRefused:
+        drafts.log_refused(store, draft_id, operation=operation, env=env, now=_now())
+        raise
+
+
+def cmd_drafts_edit(args: argparse.Namespace) -> int:
+    import os
+
+    from .. import config
+    from ..storage import Storage
+    from . import drafts
+    from .store import DispatchStore
+
+    try:
+        cfg = config.load()
+        store = DispatchStore()
+        actor = _owner(drafts, store, args.draft_id, "edit", Storage(), os.environ)
+        if args.file == "-":
+            text = sys.stdin.read()
+        else:
+            with open(args.file, encoding="utf-8") as handle:
+                text = handle.read()
+        drafts.edit(
+            store, args.draft_id, text, actor=actor, now=_now(),
+            max_chars=drafts.max_chars_for(
+                drafts.pending_draft(store, args.draft_id), cfg["dispatch"]
+            ),
+        )
+    except (drafts.DraftError, config.ConfigError, OSError, UnicodeDecodeError) as e:
+        return _draft_failure(e)
+    _out(f"edited draft {args.draft_id}")
+    return 0
+
+
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
+
+
+def _ask(prompt: str) -> str:
+    return input(prompt)
+
+
+def cmd_drafts_approve(args: argparse.Namespace) -> int:
+    import os
+    from datetime import datetime, timezone
+
+    from .. import config
+    from ..storage import Storage
+    from . import drafts, envfile
+    from .store import DispatchStore
+
+    try:
+        cfg = config.load()
+        env = envfile.load(cfg["dispatch"]["env_file"], base=os.environ)
+        store = DispatchStore()
+        actor = _owner(drafts, store, args.draft_id, "approve", Storage(), os.environ)
+        drafts.confirm_owner_approval(
+            drafts.pending_draft(store, args.draft_id), cfg, actor=actor,
+            assume_yes=args.yes, is_tty=_stdin_is_tty, ask=_ask, show=_out,
+        )
+        done = drafts.approve(
+            store, cfg, args.draft_id, actor=actor,
+            now=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), env=env,
+        )
+    except (drafts.DraftError, config.ConfigError, envfile.EnvFileError) as e:
+        return _draft_failure(e)
+    if done.kind == drafts.KIND_SLACK:
+        _out(f"sent draft {args.draft_id} to Slack")
+    else:
+        _out(
+            f"placed draft {args.draft_id} in the mailbox Drafts folder; "
+            "send it from your mail client"
+        )
+    return 0
+
+
+def cmd_drafts_discard(args: argparse.Namespace) -> int:
+    import os
+
+    from .. import config
+    from ..storage import Storage
+    from . import drafts
+    from .store import DispatchStore
+
+    try:
+        config.load()
+        store = DispatchStore()
+        actor = _owner(drafts, store, args.draft_id, "discard", Storage(), os.environ)
+        drafts.discard(store, args.draft_id, actor=actor, now=_now())
+    except (drafts.DraftError, config.ConfigError) as e:
+        return _draft_failure(e)
+    _out(f"discarded draft {args.draft_id}")
+    return 0
+
+
+def cmd_drafts_reset(args: argparse.Namespace) -> int:
+    import os
+
+    from .. import config
+    from ..storage import Storage
+    from . import drafts
+    from .store import DispatchStore
+
+    try:
+        cfg = config.load()
+        stale_minutes = cfg["dispatch"]["drafts"]["sending_stale_minutes"]
+        store = DispatchStore()
+        actor = _owner(drafts, store, args.draft_id, "reset", Storage(), os.environ)
+        now = _now()
+        drafts.confirm_owner_reset(
+            drafts.stale_draft(store, args.draft_id, now=now, stale_minutes=stale_minutes),
+            actor=actor, assume_yes=args.yes, is_tty=_stdin_is_tty, ask=_ask, show=_out,
+        )
+        drafts.reset(store, args.draft_id, actor=actor, now=now, stale_minutes=stale_minutes)
+    except (drafts.DraftError, config.ConfigError) as e:
+        return _draft_failure(e)
+    _out(f"draft {args.draft_id} is pending again; approve it once you checked its destination")
+    return 0
+
+
+def cmd_incidents_list(args: argparse.Namespace) -> int:
+    from .. import config
+    from . import incident
+    from .store import DispatchStore
+
+    try:
+        config.load()
+    except config.ConfigError as e:
+        return _draft_failure(e)
+    items = incident.listing(DispatchStore(), include_closed=args.all)
+    if args.json:
+        _out(json.dumps(items, indent=2))
+        return 0
+    if not items:
+        _out("(no open incidents)")
+        return 0
+    _out("ID  STATE  SOURCE  RULE  OPENED  REPEATS  SESSION  URL")
+    for i in items:
+        _out("  ".join([
+            str(i["id"]), i["state"], i["source"], i["rule"] or "-", i["opened_at"],
+            str(i["repeats"]), i["session"] or "-", i["url"] or "-",
+        ]))
+    return 0
+
+
+def cmd_incidents_close(args: argparse.Namespace) -> int:
+    import os
+
+    from .. import config, status
+    from ..storage import Storage
+    from . import incident
+    from .store import DispatchStore
+
+    try:
+        cfg = config.load()
+        storage = Storage()
+        actor = incident.manual_actor(storage, os.environ)
+        rows = status.collect(
+            storage, grace_seconds=cfg["spawn"]["startup_grace_seconds"], include_ended=True
+        )
+        told = incident.close_manual(
+            DispatchStore(), args.incident_id, actor=actor, stamp=_now(), rows=rows,
+            send=storage.send_message, sender=cfg["dispatch"]["bus_sender"],
+        )
+    except (incident.IncidentError, config.ConfigError) as e:
+        return _draft_failure(e)
+    _out(f"closed incident {args.incident_id}" + (" and told its session" if told else ""))
+    return 0
+
+
+def cmd_scanner_check(args: argparse.Namespace) -> int:
+    import os
+
+    from .. import config
+    from . import envfile, scanner
+
+    try:
+        cfg = config.load()
+        env = envfile.load(cfg["dispatch"]["env_file"], base=os.environ)
+    except (config.ConfigError, envfile.EnvFileError) as e:
+        return _draft_failure(e)
+    result = scanner.check(cfg["dispatch"], env=env)
+    if result.ok:
+        _out("scanner check passed: no file created, output parses")
+        return 0
+    for problem in result.problems:
+        _err(f"scanner check failed: {problem}")
+    return 1
 
 
 def cmd_decisions(args: argparse.Namespace) -> int:
@@ -481,7 +758,76 @@ def register(sub) -> None:
     s.add_argument("--repo", help="Repo remote for a task of an unmapped project.")
     s.add_argument("--client", help="Client to start the session with.")
     s.add_argument("--model", help="Model for that client (needs --client).")
+    s.add_argument(
+        "--clone", action="store_true",
+        help="Clone the repository when no local clone exists (start and resume only).",
+    )
     s.set_defaults(func=cmd_decide)
+
+    p = dsub.add_parser("drafts", help="Review, edit, approve or discard reply drafts.")
+    psub = p.add_subparsers(dest="drafts_command", required=True)
+
+    s = psub.add_parser("list", help="List pending drafts and drafts still sending.")
+    s.add_argument("--all", action="store_true", help="Include sent, placed and discarded drafts.")
+    s.add_argument("--json", action="store_true", help="Emit JSON rows.")
+    s.set_defaults(func=cmd_drafts_list)
+
+    s = psub.add_parser("show", help="Show one draft (its text is untrusted model output).")
+    s.add_argument("draft_id", type=int, metavar="ID")
+    s.add_argument("--json", action="store_true", help="Emit JSON.")
+    s.set_defaults(func=cmd_drafts_show)
+
+    s = psub.add_parser("edit", help="Replace a pending draft's text from a file.")
+    s.add_argument("draft_id", type=int, metavar="ID")
+    s.add_argument("--file", required=True, help="File with the new text; - reads stdin.")
+    s.set_defaults(func=cmd_drafts_edit)
+
+    s = psub.add_parser(
+        "approve", help="Deliver a draft: post to Slack, or place it in the mailbox Drafts folder."
+    )
+    s.add_argument("draft_id", type=int, metavar="ID")
+    s.add_argument(
+        "--yes", action="store_true",
+        help="Skip the terminal confirmation; accepted only for the verified dispatcher.",
+    )
+    s.set_defaults(func=cmd_drafts_approve)
+
+    s = psub.add_parser("discard", help="Discard a pending draft.")
+    s.add_argument("draft_id", type=int, metavar="ID")
+    s.set_defaults(func=cmd_drafts_discard)
+
+    s = psub.add_parser(
+        "reset",
+        help="Make a draft stuck in sending (past dispatch.drafts.sending_stale_minutes) "
+        "pending again.",
+    )
+    s.add_argument("draft_id", type=int, metavar="ID")
+    s.add_argument(
+        "--yes", action="store_true",
+        help="Skip the terminal confirmation; accepted only for the verified dispatcher.",
+    )
+    s.set_defaults(func=cmd_drafts_reset)
+
+    p = dsub.add_parser("incidents", help="List or close infrastructure incidents.")
+    isub = p.add_subparsers(dest="incidents_command", required=True)
+
+    s = isub.add_parser("list", help="List open incidents.")
+    s.add_argument("--all", action="store_true", help="Include closed incidents.")
+    s.add_argument("--json", action="store_true", help="Emit JSON rows.")
+    s.set_defaults(func=cmd_incidents_list)
+
+    s = isub.add_parser("close", help="Close an open incident and tell its session.")
+    s.add_argument("incident_id", type=int, metavar="ID")
+    s.set_defaults(func=cmd_incidents_close)
+
+    p = dsub.add_parser("scanner", help="Check the message scanner.")
+    ssub = p.add_subparsers(dest="scanner_command", required=True)
+
+    s = ssub.add_parser(
+        "check",
+        help="Run a read-only canary with the configured scanner (exit 1 on failure).",
+    )
+    s.set_defaults(func=cmd_scanner_check)
 
     s = dsub.add_parser("decisions", help="Show the decision log (candidates, decisions, routing).")
     s.add_argument("--json", action="store_true", help="Emit JSON rows.")

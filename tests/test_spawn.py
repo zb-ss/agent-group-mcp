@@ -388,6 +388,19 @@ def test_broken_model_env_names_its_key():
         _render("opencode", model="m1", cfg=cfg)
 
 
+def test_env_from_template_fills_strings_and_nested_objects():
+    out = spawn.env_from_template(
+        {"PLAIN": "m-{model}", "NESTED": {"a": ["{model}", 1]}},
+        {"model": "x1"}, where="here",
+    )
+    assert out == {"PLAIN": "m-x1", "NESTED": '{"a":["x1",1]}'}
+
+
+def test_env_from_template_bad_placeholder_names_where_and_variable():
+    with pytest.raises(ConfigError, match=r"here: cannot fill 'X'"):
+        spawn.env_from_template({"X": "{nope}"}, {"model": "x1"}, where="here")
+
+
 def test_user_wired_fragment_follows_the_command():
     cfg = config.defaults()
     fragment = cfg["spawn"]["clients"]["codex"]["user_wired"]
@@ -437,6 +450,8 @@ def test_missing_clone_without_flag_prints_clone_command(storage, cfg, prompt, t
     assert err.exit_code == EXIT_FAILED
     assert err.hint == f"git clone -- {URL} {tmp_path / 'clones' / 'repo-a'}"
     assert not fake.argvs("git", "clone")
+    assert "repos.roots" in str(err)
+    assert "pass --clone to clone it, or add the folder" in str(err)
 
 
 def test_missing_clone_with_flag_clones_then_continues(storage, cfg, prompt, tmp_path):
