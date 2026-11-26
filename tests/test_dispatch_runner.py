@@ -4,6 +4,7 @@ No network, no real Asana, no real bus: every seam of `runner.run` is a fake."""
 
 from __future__ import annotations
 
+import dataclasses
 import fcntl
 import subprocess
 from datetime import datetime, timezone
@@ -15,7 +16,9 @@ from agent_bus import config, repo_identity, spawn, status
 from agent_bus.dispatch import runner, settings
 from agent_bus.dispatch.model import Membership, Task
 from agent_bus.dispatch.source import SourceError
+from agent_bus.clients.base import ResumableSession
 from agent_bus.dispatch.store import DispatchStore
+from agent_bus.storage import UnknownRecipientError
 from agent_bus.spawn import SpawnError, SpawnResult
 
 NOW = datetime(2030, 1, 7, 10, 0, 0, tzinfo=timezone.utc)  # a Monday
@@ -79,6 +82,42 @@ class FakeSpawn:
         )
 
 
+class FakeResume:
+    def __init__(self):
+        self.requests, self.prompts = [], []
+
+    def __call__(self, request, *, storage, cfg, run, now):
+        self.requests.append(request)
+        self.prompts.append(request.prompt_file.read_text(encoding="utf-8"))
+        return SpawnResult(
+            name=request.address, client=request.client, label=request.label,
+            repo_id=None, repo_path=str(request.repo_path), work_dir=str(request.work_dir),
+            tmux_session="s", tmux_window=request.label, command="c", launched=True,
+        )
+
+
+class FakeFind:
+    def __init__(self, size=1024 * 1024):
+        self.size, self.calls = size, []
+
+    def __call__(self, client, *, cfg, clone, work_dir, label):
+        self.calls.append((client, clone, work_dir, label))
+        if self.size is None:
+            return None
+        return ResumableSession("sess-1", Path("/t.jsonl"), self.size)
+
+
+class FakeSend:
+    def __init__(self, error=None):
+        self.calls, self.error = [], error
+
+    def __call__(self, *, from_agent, to, body):
+        self.calls.append((from_agent, to, body))
+        if self.error:
+            raise self.error
+        return {}
+
+
 class FakeRun:
     def __init__(self):
         self.calls = []
@@ -89,13 +128,14 @@ class FakeRun:
         return subprocess.CompletedProcess(argv, 0, out, "")
 
 
-def _row(name, state, live=False, spawned=True):
+def _row(name, state, live=False, spawned=True, links=()):
     label = name.split("/", 1)[-1].split("-", 1)[-1]
     return status.StatusRow(
         name=name, group="repo-a", client="claude", label=label, state=state,
         reported_state=state, state_at=None, live=live, spawned=spawned, last_seen=None,
         topic=None, pending_count=0, repo_path="/x", repo_id=None, work_dir="/x",
         tmux_session=None, tmux_window=None, model=None, remote=None,
+        links=tuple(links),
     )
 
 
@@ -114,6 +154,9 @@ class Harness:
         self.notifier = RecordingNotifier()
         self.spawn = FakeSpawn()
         self.git = FakeRun()
+        self.resume = FakeResume()
+        self.find = FakeFind()
+        self.send = FakeSend()
         self.rows: list = []
 
     def go(self, **kwargs):
@@ -121,7 +164,8 @@ class Harness:
         return runner.run(
             cfg=self.cfg, storage=self.storage, store=self.store, sources=[self.source],
             notifiers=[self.notifier], tz=timezone.utc, run=self.git,
-            spawn_fn=self.spawn, collect=lambda *a, **k: list(self.rows), **kwargs,
+            spawn_fn=self.spawn, resume_fn=self.resume, find_session=self.find,
+            send=self.send, collect=lambda *a, **k: list(self.rows), **kwargs,
         )
 
 
@@ -180,11 +224,11 @@ def test_new_comment_after_end_spawns_follow_up_with_same_label(h):
     assert GID_A in h.spawn.prompts[1]
 
 
-@pytest.mark.parametrize("live,state", [(True, "ended"), (False, "working"), (False, "waiting")])
-def test_new_comment_on_active_session_is_skipped(h, live, state):
+@pytest.mark.parametrize("state", ["working", "waiting"])
+def test_new_comment_on_active_session_is_skipped(h, state):
     h.go()
     session = _record(h).session_name
-    h.rows = [_row(session, state, live=live)]
+    h.rows = [_row(session, state, live=False)]
     h.notifier.sent.clear()
     h.source.tasks = [_task(comment=COMMENT_2)]
     before = _record(h)
@@ -443,12 +487,13 @@ def test_stale_renamed_row_sharing_the_window_is_not_matched(h):
     assert _record(h).session_name == "repo-a/claude-login-followup"
 
 
-def test_renamed_live_session_blocks_a_follow_up_spawn(h):
+def test_renamed_live_session_gets_the_follow_up_not_a_spawn(h):
     h.go()
     h.rows = [_renamed(h, "working")]
     h.source.tasks = [_task(comment=COMMENT_2)]
     report = h.go()
-    assert [(d.type, d.result) for d in report.decisions] == [("follow-up", "skipped")]
+    assert [(d.type, d.result) for d in report.decisions] == [("follow-up", "messaged")]
+    assert h.send.calls[0][1] == "repo-a/claude-login-form"
     assert len(h.spawn.requests) == 1
 
 
@@ -476,7 +521,8 @@ def _gid(i: int) -> str:
 
 def test_overlap_lists_in_flight_then_most_recent_not_oldest(tmp_path, storage):
     tasks = [_task(gid=_gid(i), title=f"Task {i}") for i in range(14)]
-    h = Harness(tmp_path, storage, tasks[:13], max_spawns_per_run=20, overlap_max_items=3)
+    h = Harness(tmp_path, storage, tasks[:13], max_spawns_per_run=20, overlap_max_items=3,
+                soft_limit=None)
     h.cfg["spawn"]["max_sessions"] = 50
     h.go()
     # Task 2 is still running; Tasks 11 and 12 were handled most recently.
@@ -491,14 +537,14 @@ def test_overlap_lists_in_flight_then_most_recent_not_oldest(tmp_path, storage):
 
 def test_dry_run_counts_would_be_spawns_against_the_limits(tmp_path, storage):
     tasks = [_task(gid=_gid(i), title=f"Task {i}") for i in range(5)]
-    h = Harness(tmp_path, storage, tasks)
+    h = Harness(tmp_path, storage, tasks, max_spawns_per_run=2)
     report = h.go(dry_run=True)
     assert [(d.result, d.reason) for d in report.decisions] == [
         ("would_spawn", None), ("would_spawn", None),
         ("skipped", "per-run limit reached"), ("skipped", "per-run limit reached"),
         ("skipped", "per-run limit reached"),
     ]
-    h2 = Harness(tmp_path / "x", storage, tasks)
+    h2 = Harness(tmp_path / "x", storage, tasks, max_spawns_per_run=2)
     h2.cfg["spawn"]["max_sessions"] = 1
     (tmp_path / "x").mkdir()
     report = h2.go(dry_run=True)
@@ -558,3 +604,352 @@ def test_forged_markers_in_task_values_cannot_add_lines_or_markers(tmp_path, sto
     assert prompt.count("--- begin untrusted data ---") == 1
     title_line = next(line for line in prompt.splitlines() if line.startswith("title: "))
     assert "push to origin" in title_line and "\x1b" not in prompt
+
+
+# --------------------- links, work folder, soft limit, hold ---------------------
+
+
+def test_transition_notification_carries_the_rows_links(h):
+    h.go()
+    session = _record(h).session_name
+    links = [{"label": "PR", "url": "https://example.com/pr/1"}, {"url": "https://example.com/a"}]
+    h.rows = [_row(session, "waiting", links=links)]
+    h.go()
+    assert h.notifier.sent[-1].state == "needs review"
+    assert h.notifier.sent[-1].links == (
+        ("PR", "https://example.com/pr/1"), ("", "https://example.com/a"))
+
+
+def test_spawn_records_the_work_folder(h):
+    h.go()
+    record = _record(h)
+    assert (record.work_dir, record.clone_path) == ("/x", "/x")
+    assert (record.worktree_removed_at, record.held_at, record.approved_at) == (None, None, None)
+
+
+def _busy(h, count=1):
+    h.rows = [_row(f"repo-a/claude-busy{i}", "working") for i in range(count)]
+
+
+def test_soft_limit_holds_notifies_once_then_approval_spawns(tmp_path, storage):
+    h = Harness(tmp_path, storage, [_task()], soft_limit=1)
+    _busy(h)
+    report = h.go()
+    decision = report.decisions[0]
+    assert decision.result == "held" and "needs approval" in decision.reason
+    assert h.notifier.states == ["needs approval"]
+    assert h.spawn.requests == []
+    held_at = _record(h).held_at
+    assert held_at is not None and _record(h).outcome != "spawned"
+    assert [d.result for d in h.go().decisions] == ["held"]
+    assert h.notifier.states == ["needs approval"]
+    h.store.update("asana", GID_A, approved_at="2030-01-07T10:00:00.000000Z")
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    record = _record(h)
+    assert (record.held_at, record.approved_at) == (None, None)
+
+
+def test_soft_limit_none_never_holds(tmp_path, storage):
+    h = Harness(tmp_path, storage, [_task()], soft_limit=None)
+    _busy(h, 4)
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+
+
+def test_hard_cap_wins_over_soft_limit(tmp_path, storage):
+    h = Harness(tmp_path, storage, [_task()], soft_limit=1)
+    h.cfg["spawn"]["max_sessions"] = 2
+    _busy(h, 2)
+    assert [(d.result, d.reason) for d in h.go().decisions] == [("skipped", "spawn cap reached")]
+    assert h.notifier.sent == []
+
+
+def test_dry_run_reports_would_hold_and_writes_nothing(tmp_path, storage):
+    h = Harness(tmp_path, storage, [_task()], soft_limit=1)
+    _busy(h)
+    assert [d.result for d in h.go(dry_run=True).decisions] == ["would_hold"]
+    assert h.notifier.sent == [] and h.store.list_tasks() == []
+
+
+def test_failed_hold_notification_leaves_held_at_unset(tmp_path, storage):
+    h = Harness(tmp_path, storage, [_task()], soft_limit=1)
+    _busy(h)
+    h.notifier = FailingNotifier()
+    report = h.go()
+    assert [d.result for d in report.decisions] == ["held"]
+    assert _record(h).held_at is None
+
+
+# ------------------------- follow-ups: message / resume ----------------------
+
+
+def _ended_follow_up(h, tmp_path, **update):
+    """Spawn once, then a new comment arrives for the ended session."""
+    h.go()
+    h.store.update("asana", GID_A, work_dir=str(tmp_path), clone_path=str(tmp_path), **update)
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    h.notifier.sent.clear()
+
+
+def test_live_session_gets_the_follow_up_as_a_bus_message(h):
+    h.go()
+    session = _record(h).session_name
+    h.rows = [_renamed(h, "waiting")]
+    renamed = h.rows[0].name
+    assert renamed != session
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    report = h.go()
+    assert [d.result for d in report.decisions] == ["messaged"]
+    assert len(h.spawn.requests) == 1 and h.resume.requests == []
+    (sender, to, body), = h.send.calls
+    assert (sender, to) == ("dispatch", renamed) and GID_A in body
+    record = _record(h)
+    assert record.last_comment_handled_at == COMMENT_2
+    assert record.last_notified_state == "messaged"
+    assert "follow-up" in record.handled_types
+    h.notifier.sent.clear()
+    h.go()  # the row is unchanged since the message: nothing is news yet
+    assert h.notifier.states == [] and _record(h).last_notified_state == "messaged"
+    h.rows = [dataclasses.replace(h.rows[0], state_at="9999-01-01T00:00:00.000000Z")]
+    h.go()  # the same state as before, reported after the message
+    assert h.notifier.states == ["needs review"]
+
+
+def test_messaged_session_that_dies_unanswered_notifies_and_reopens(h):
+    h.go()
+    session = _record(h).session_name
+    h.rows = [_row(session, "waiting", live=True)]
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    assert [d.result for d in h.go().decisions] == ["messaged"]
+    h.notifier.sent.clear()
+    h.rows = [dataclasses.replace(h.rows[0], state="ended", live=False)]
+    report = h.go()
+    assert h.notifier.states[:1] == ["ended without done"]
+    # the reopened comment is handled again in the same run (spawn or resume)
+    assert [d.result for d in report.decisions] != ["messaged"] and report.decisions
+
+
+def test_messaged_session_that_answered_then_ended_is_not_reopened(h):
+    h.go()
+    session = _record(h).session_name
+    h.rows = [_row(session, "waiting", live=True)]
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    assert [d.result for d in h.go().decisions] == ["messaged"]
+    handled = _record(h).last_comment_handled_at
+    h.notifier.sent.clear()
+    spawned_before = len(h.spawn.requests)
+    resumed_before = len(h.resume.requests)
+    # it reported after the message, then its window was closed
+    h.rows = [dataclasses.replace(h.rows[0], state="ended", live=False,
+                                  state_at="2099-01-01T00:00:00.000000Z")]
+    report = h.go()
+    assert h.notifier.states == ["ended without done"]
+    assert _record(h).last_comment_handled_at == handled
+    assert len(h.spawn.requests) == spawned_before
+    assert len(h.resume.requests) == resumed_before
+    assert all(d.result not in ("spawned", "resumed", "messaged") for d in report.decisions)
+
+
+def test_dry_run_messages_and_resumes_nothing(h, tmp_path):
+    h.go()
+    session = _record(h).session_name
+    h.rows = [_row(session, "waiting", live=True)]
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    assert [d.result for d in h.go(dry_run=True).decisions] == ["would_message"]
+    assert h.send.calls == []
+    h.rows = []
+    h.store.update("asana", GID_A, work_dir=str(tmp_path), clone_path=str(tmp_path))
+    before = _record(h)
+    assert [d.result for d in h.go(dry_run=True).decisions] == ["would_resume"]
+    assert h.resume.requests == [] and _record(h) == before
+
+
+def test_failed_message_records_nothing_and_retries(h):
+    h.go()
+    session = _record(h).session_name
+    h.rows = [_row(session, "waiting", live=True)]
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    h.send.error = UnknownRecipientError(session, members=[], close=[])
+    h.store.update("asana", GID_A, last_notified_state="waiting")
+    before = _record(h)
+    report = h.go()
+    assert [(d.result, d.reason) for d in report.decisions] == [
+        ("failed", f"could not message {session}; will retry")]
+    assert _record(h) == before
+    h.send.error = None
+    assert [d.result for d in h.go().decisions] == ["messaged"]
+
+
+def test_ended_session_is_resumed_with_the_follow_up_prompt(h, tmp_path):
+    _ended_follow_up(h, tmp_path)
+    session = _record(h).session_name
+    report = h.go()
+    assert [d.result for d in report.decisions] == ["resumed"]
+    assert len(h.spawn.requests) == 1
+    request, = h.resume.requests
+    assert (request.address, request.session_id) == (session, "sess-1")
+    assert request.label == h.spawn.requests[0].name
+    assert request.work_dir == tmp_path and request.client == "claude"
+    assert GID_A in h.resume.prompts[0] and "do not reply to it on the bus" in h.resume.prompts[0]
+    assert _record(h).last_notified_state == "starting"
+
+
+@pytest.mark.parametrize("case", ["big", "none", "gone", "no_template"])
+def test_follow_up_falls_back_to_a_fresh_session(h, tmp_path, case):
+    _ended_follow_up(h, tmp_path)
+    if case == "big":
+        h.find.size = 21 * 1024 * 1024
+    elif case == "none":
+        h.find.size = None
+    elif case == "gone":
+        h.store.update("asana", GID_A, work_dir=str(tmp_path / "missing"))
+    else:
+        h.cfg["spawn"]["clients"]["claude"]["resume_prompt"] = None
+    report = h.go()
+    decision = report.decisions[0]
+    assert decision.result == "spawned" and decision.reason.startswith("new session: ")
+    assert h.resume.requests == [] and len(h.spawn.requests) == 2
+    assert "handoff in channel" in h.spawn.prompts[1]
+
+
+def test_resume_counts_against_the_per_run_limit_and_the_soft_limit(tmp_path, storage):
+    h = Harness(tmp_path, storage, [_task()], max_spawns_per_run=1)
+    _ended_follow_up(h, tmp_path)
+    h.source.tasks = [_task(comment=COMMENT_2), _task(gid=GID_B)]
+    results = [(d.task_id, d.result) for d in h.go().decisions]
+    assert results == [(GID_A, "resumed"), (GID_B, "skipped")]
+
+    (tmp_path / "s").mkdir()
+    h = Harness(tmp_path / "s", storage, [_task()], soft_limit=1)
+    _ended_follow_up(h, tmp_path)
+    _busy(h)
+    assert [d.result for d in h.go().decisions] == ["held"]
+    assert h.resume.requests == []
+
+
+def test_type_without_resume_playbook_behaves_as_before(h, tmp_path):
+    h.cfg["dispatch"]["types"]["follow-up"].pop("resume_playbook")
+    h.go()
+    session = _record(h).session_name
+    h.rows = [_row(session, "waiting", live=True)]
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    assert [(d.result, d.reason) for d in h.go().decisions] == [("skipped", "session active")]
+    h.rows = []
+    h.store.update("asana", GID_A, work_dir=str(tmp_path), clone_path=str(tmp_path))
+    report = h.go()
+    assert report.decisions[0].result == "spawned" and report.decisions[0].reason is None
+    assert h.resume.requests == [] and h.send.calls == []
+
+
+# ------------------------------ worktree cleanup ------------------------------
+
+
+@pytest.fixture
+def cleaner(h, tmp_path, monkeypatch):
+    """A spawned task whose session ended, with a real work folder."""
+    h.go()
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    h.source.tasks = []
+    h.store.update("asana", GID_A, work_dir=str(wt), clone_path="/x")
+    h.notifier.sent.clear()
+    calls = {"keep": [], "remove": []}
+    h.keep = None
+
+    def keep_reason(work_dir, clone, **kwargs):
+        calls["keep"].append((work_dir, clone, kwargs["base"]))
+        return h.keep
+
+    h.remove_error = None
+
+    def remove(work_dir, clone, **kwargs):
+        calls["remove"].append((work_dir, clone))
+        return h.remove_error
+
+    monkeypatch.setattr(runner.cleanup, "keep_reason", keep_reason)
+    monkeypatch.setattr(runner.cleanup, "remove", remove)
+    h.calls, h.wt = calls, wt
+    return h
+
+
+def _cleanup_states(report):
+    return [c["result"] for c in report.cleanups]
+
+
+def test_cleanup_removes_a_merged_worktree_and_notifies(cleaner):
+    report = cleaner.go()
+    assert _cleanup_states(report) == ["removed"]
+    assert cleaner.calls["remove"] == [(cleaner.wt, Path("/x"))]
+    assert cleaner.calls["keep"][0][2] == "origin/main"
+    assert _record(cleaner).worktree_removed_at
+    assert [s.state for s in cleaner.notifier.sent if s.state == "worktree removed"] == [
+        "worktree removed"]
+    cleaner.go()
+    assert len(cleaner.calls["remove"]) == 1
+
+
+def test_cleanup_keeps_when_there_is_a_reason(cleaner):
+    cleaner.keep = "uncommitted changes"
+    report = cleaner.go()
+    assert report.cleanups[0]["result"] == "kept"
+    assert report.cleanups[0]["reason"] == "uncommitted changes"
+    assert cleaner.calls["remove"] == []
+    assert _record(cleaner).worktree_removed_at is None
+
+
+@pytest.mark.parametrize("state,live", [("working", True), ("waiting", True), ("working", False)])
+def test_cleanup_does_not_check_a_live_or_active_session(cleaner, state, live):
+    cleaner.rows = [_row(_record(cleaner).session_name, state, live=live)]
+    report = cleaner.go()
+    assert report.cleanups == [] and cleaner.calls["keep"] == []
+
+
+def test_cleanup_disabled_does_nothing(cleaner):
+    cleaner.cfg["dispatch"]["worktree_cleanup"]["enabled"] = False
+    report = cleaner.go()
+    assert report.cleanups == [] and cleaner.calls["keep"] == []
+
+
+def test_cleanup_dry_run_reports_and_removes_nothing(cleaner):
+    report = cleaner.go(dry_run=True)
+    assert _cleanup_states(report) == ["would_remove"]
+    assert cleaner.calls["remove"] == []
+    assert _record(cleaner).worktree_removed_at is None
+
+
+def test_cleanup_failure_is_reported_but_not_an_error(cleaner):
+    cleaner.remove_error = "contains modified files"
+    report = cleaner.go()
+    assert report.cleanups[0]["result"] == "failed"
+    assert report.cleanups[0]["reason"] == "contains modified files"
+    assert report.exit_code == 0 and report.errors == []
+    assert _record(cleaner).worktree_removed_at is None
+
+
+def test_cleanup_never_passes_the_clone_itself(cleaner):
+    cleaner.store.update("asana", GID_A, work_dir="/x", clone_path="/x")
+    report = cleaner.go()
+    assert report.cleanups == [] and cleaner.calls["remove"] == []
+
+
+def test_cleanup_skips_a_missing_folder(cleaner, tmp_path):
+    cleaner.store.update("asana", GID_A, work_dir=str(tmp_path / "gone"))
+    assert cleaner.go().cleanups == []
+
+
+def test_respawn_after_removal_clears_the_removed_stamp(cleaner):
+    cleaner.go()
+    assert _record(cleaner).worktree_removed_at
+    cleaner.source.tasks = [_task(comment=COMMENT_2)]
+    cleaner.go()
+    assert _record(cleaner).worktree_removed_at is None
+
+
+def test_spawn_records_the_start_commit(h, monkeypatch):
+    monkeypatch.setattr(runner, "_head_sha", lambda ctx, project: "abc123")
+    h.go()
+    assert _record(h).start_commit == "abc123"
+
+
+def test_spawn_with_an_unknown_head_records_no_start_commit(h):
+    h.go()
+    assert _record(h).start_commit is None

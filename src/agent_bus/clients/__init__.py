@@ -9,11 +9,12 @@ and a client that follows the standard hook contract needs no dialect.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from . import agy, claude, codex, opencode
 from .base import (
-    ClientWiring, HookDialect, PushRegistration, StandardHookDialect, WorktreePrep,
+    ClientWiring, HookDialect, PushRegistration, ResumableSession, StandardHookDialect,
+    WorktreePrep,
 )
 
 _HOOK_DIALECTS: dict[str, HookDialect] = {
@@ -123,6 +124,21 @@ def push_registration(client: str | None) -> PushRegistration | None:
     return _PUSH_REGISTRATIONS.get(client or "")
 
 
+# Clients whose session transcripts can be searched for a session by name.
+_SESSION_FINDERS: dict[str, Callable[..., ResumableSession | None]] = {
+    claude.CLIENT_ID: claude.find_session,
+}
+
+
+def find_session(
+    client: str, paths: Iterable[Path], *, label: str
+) -> ResumableSession | None:
+    """The newest session of `client` named `label` among the transcript
+    files `paths`; None when none matches or the client has no finder."""
+    finder = _SESSION_FINDERS.get(client)
+    return finder(paths, label=label) if finder else None
+
+
 def wirable_clients() -> tuple[str, ...]:
     """Client ids `agent-bus init` knows how to wire."""
     return tuple(sorted(_WIRINGS))
@@ -134,14 +150,17 @@ def wiring(client: str) -> ClientWiring:
 
 
 def prepare_worktree(
-    client: str, clone: Path, worktree: Path, *, name: str, bin_path: str, dry_run: bool = False
+    client: str, clone: Path, worktree: Path, *, name: str, bin_path: str,
+    dry_run: bool = False, options: Mapping | None = None,
 ) -> WorktreePrep:
     """The client's extra worktree setup, if it has any (see `ClientWiring`);
     nothing to do for a client without it."""
     step = getattr(_WIRINGS[client], "prepare_worktree", None)
     if step is None:
         return WorktreePrep()
-    return step(clone, worktree, name=name, bin_path=bin_path, dry_run=dry_run)
+    return step(
+        clone, worktree, name=name, bin_path=bin_path, dry_run=dry_run, options=options,
+    )
 
 
 def wired_for_user(client: str) -> bool:

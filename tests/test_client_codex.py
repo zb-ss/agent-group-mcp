@@ -46,6 +46,8 @@ def test_fresh_repo_gets_a_server_entry_and_both_hooks(tmp_path, codex):
     assert server["env"] == {"AGENT_BUS_NAME": "repo-a/codex", "AGENT_BUS_REPO": str(repo)}
     # Codex does not pass its environment on to MCP servers
     assert "AGENT_BUS_INSTANCE" in server["env_vars"]
+    # the token links a spawned session to its spawn record
+    assert "AGENT_BUS_SPAWN_TOKEN" in server["env_vars"]
 
     assert _hook_commands(repo, "UserPromptSubmit") == [
         f"{BIN} hook-user-prompt --client codex || true"

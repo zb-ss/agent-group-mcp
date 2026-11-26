@@ -488,6 +488,11 @@ class SessionRegistry:
                 "(SELECT topic FROM agents WHERE name = ?)) WHERE name = ?",
                 (row.name, old.name),
             )
+            conn.execute(
+                "UPDATE agents SET links = COALESCE(links, "
+                "(SELECT links FROM agents WHERE name = ?)) WHERE name = ?",
+                (row.name, old.name),
+            )
             _move_unread(conn, row.name, old.name)
             _rewrite_sender(conn, row.name, old.name)
             conn.execute("DELETE FROM agents WHERE name = ?", (row.name,))
@@ -584,7 +589,7 @@ class SessionRegistry:
                     (new, client_address),
                 )
                 topic = conn.execute(
-                    "SELECT topic, state, state_at FROM agents WHERE name = ?",
+                    "SELECT topic, state, state_at, links FROM agents WHERE name = ?",
                     (row.name,),
                 ).fetchone()
                 register_in(conn, new, row.repo_path, overwrite_repo=True, now=now)
@@ -592,6 +597,12 @@ class SessionRegistry:
                     conn.execute(
                         "UPDATE agents SET topic = COALESCE(topic, ?) WHERE name = ?",
                         (topic["topic"], new),
+                    )
+                if topic is not None and topic["links"] is not None:
+                    # its own links win; otherwise the label's earlier ones stay
+                    conn.execute(
+                        "UPDATE agents SET links = COALESCE(?, links) WHERE name = ?",
+                        (topic["links"], new),
                     )
                 if row.name != client_address:
                     # the renaming session's own state wins over a stale one

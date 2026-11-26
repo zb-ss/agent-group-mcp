@@ -211,3 +211,67 @@ def test_uninstall_timer_works_without_an_absolute_binary(home, capsys, monkeypa
     monkeypatch.setattr("shutil.which", lambda name: None)
     assert cli.main(["dispatch", "uninstall-timer"]) == 0
     assert "not absolute" not in capsys.readouterr().err
+
+
+def test_approve_sets_approved_at(capsys):
+    store = DispatchStore()
+    store.observe(_task(), project_id=PROJECT, now="2030-01-07T10:00:00.000000Z")
+    assert cli.main(["dispatch", "approve", GID]) == 0
+    assert f"approved {GID}" in capsys.readouterr().out
+    assert store.get("asana", GID).approved_at
+    assert cli.main(["dispatch", "approve", GID, "--source", "asana"]) == 0
+
+
+def test_approve_unknown_task_exits_1(capsys):
+    assert cli.main(["dispatch", "approve", "nope"]) == 1
+    assert "unknown task nope" in capsys.readouterr().err
+
+
+def test_status_prints_the_held_line_until_approved(capsys):
+    store = DispatchStore()
+    store.observe(_task(), project_id=PROJECT, now="2030-01-07T10:00:00.000000Z")
+    store.update("asana", GID, held_at="2030-01-07T10:00:00.000000Z")
+    assert cli.main(["dispatch", "status"]) == 0
+    assert f"held: needs approval (agent-bus dispatch approve {GID})" in capsys.readouterr().out
+    cli.main(["dispatch", "approve", GID])
+    capsys.readouterr()
+    assert cli.main(["dispatch", "status"]) == 0
+    assert "held:" not in capsys.readouterr().out
+
+
+def test_status_prints_the_worktree_removed_line(capsys):
+    store = DispatchStore()
+    store.observe(_task(), project_id=PROJECT, now="2030-01-07T10:00:00.000000Z")
+    store.update("asana", GID, worktree_removed_at="2030-01-08T10:00:00.000000Z")
+    assert cli.main(["dispatch", "status"]) == 0
+    assert "    worktree removed: 2030-01-08T10:00:00.000000Z" in capsys.readouterr().out
+
+
+def _stub_report(monkeypatch, cleanups):
+    report = runner.RunReport(cleanups=cleanups)
+    monkeypatch.setattr(runner, "build_sources", lambda d, env, **k: [FakeSource()])
+    monkeypatch.setattr(runner, "run", lambda **k: report)
+
+
+CLEANUPS = [
+    {"task_id": "t1", "work_dir": "/w/a", "result": "removed"},
+    {"task_id": "t2", "work_dir": "/w/b", "result": "kept", "reason": "unpushed commits"},
+    {"task_id": "t3", "work_dir": "/w/c", "result": "failed", "reason": "locked"},
+]
+
+
+def test_run_prints_cleanup_lines_without_kept_entries(capsys, monkeypatch):
+    _enable_asana()
+    _stub_report(monkeypatch, CLEANUPS)
+    assert cli.main(["dispatch", "run"]) == 0
+    out = capsys.readouterr().out
+    assert "cleanup: removed /w/a\n" in out
+    assert "cleanup: failed /w/c (locked)" in out
+    assert "/w/b" not in out
+
+
+def test_dry_run_prints_kept_cleanup_entries(capsys, monkeypatch):
+    _enable_asana()
+    _stub_report(monkeypatch, CLEANUPS)
+    assert cli.main(["dispatch", "run", "--dry-run"]) == 0
+    assert "cleanup: kept /w/b (unpushed commits)" in capsys.readouterr().out

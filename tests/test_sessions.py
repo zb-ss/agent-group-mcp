@@ -373,7 +373,7 @@ def test_set_session_names_the_session_for_its_peers(storage, fake_procs):
     out = _call(second, "set_session", {"label": "release-notes", "topic": "changelog draft"})
     assert out == {
         "name": "shared/claude-release-notes", "client_address": CLAUDE, "topic": "changelog draft",
-        "state": None,
+        "state": None, "links": [],
     }
     _call(first, "send_message", {"to": "shared/claude-release-notes", "body": "review?"})
     assert [m["body"] for m in _call(second, "read_inbox", {})] == ["review?"]
@@ -1003,3 +1003,64 @@ def test_a_reconnect_of_the_spawned_session_keeps_its_state_and_spawn_record(
     assert again == name
     assert storage.get_agent(again).state == "working"
     assert storage.get_spawn(again) is not None
+
+
+def test_links_survive_a_rename(storage, registry, fake_procs):
+    name, server, _ = _start(registry, fake_procs)
+    links = [{"label": "PR", "url": "https://example.com/pr/1"}]
+    storage.set_links(name, links)
+
+    new = registry.rename(server, CLAUDE, "docs")
+
+    assert storage.get_agent(new).link_list == links
+
+
+def test_a_rename_keeps_the_links_a_label_already_had(storage, registry, fake_procs):
+    old, old_server, _ = _start(registry, fake_procs, pinned="docs")
+    earlier = [{"label": "Earlier", "url": "https://example.com/e"}]
+    storage.set_links(old, earlier)
+    registry.release(old_server, CLAUDE)
+
+    _, server, _ = _start(registry, fake_procs)
+    assert registry.rename(server, CLAUDE, "docs") == old
+    assert storage.get_agent(old).link_list == earlier
+
+
+def test_set_session_stores_replaces_and_clears_links(storage, fake_procs):
+    mcp = _server(storage, fake_procs)
+    first = [{"label": "PR", "url": "https://example.com/pr/1"}]
+    out = _call(mcp, "set_session", {"label": "docs", "links": first})
+    assert out["links"] == first
+    name = out["name"]
+
+    assert _call(mcp, "set_session", {"topic": "x"})["links"] == first
+    assert _call(mcp, "whoami", {})["links"] == first
+    roster = {a["name"]: a for a in _call(mcp, "list_agents", {"group": "shared"})}
+    assert roster[name]["links"] == first
+
+    second = [{"label": "", "url": "https://example.com/b"}]
+    assert _call(mcp, "set_session", {"links": second})["links"] == second
+    assert _call(mcp, "set_session", {"links": []})["links"] == []
+    assert storage.get_agent(name).links is None
+
+
+@pytest.mark.parametrize("bad", [
+    [{"label": "x", "url": "ftp://example.com/x"}],
+    [{"label": "x", "url": "javascript:alert(1)"}],
+    [{"label": "x", "url": "https://example.com/a b"}],
+    [{"label": "x"}],
+    [{"url": "https://example.com/x"}] * 9,
+])
+def test_set_session_rejects_bad_links_and_writes_nothing(storage, fake_procs, bad):
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    mcp = _server(storage, fake_procs)
+    good = [{"label": "ok", "url": "https://example.com/ok"}]
+    name = _call(mcp, "set_session", {"label": "docs", "links": good})["name"]
+
+    with pytest.raises(ToolError):
+        _call(mcp, "set_session", {"label": "other", "topic": "t", "links": bad})
+
+    row = storage.get_agent(name)
+    assert row is not None and row.link_list == good and row.topic is None
+    assert storage.get_agent("shared/claude-other") is None

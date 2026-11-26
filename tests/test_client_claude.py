@@ -221,3 +221,55 @@ def test_prepare_worktree_is_idempotent(tmp_path):
     assert local["enabledMcpjsonServers"] == ["agent-bus"]
     assert len(local["hooks"]["UserPromptSubmit"]) == 1
     assert local["permissions"]["allow"].count("mcp__agent-bus__whoami") == 1
+
+
+# ------------------------------ find_session --------------------------------
+
+
+def _transcript(path: Path, *titles: str, extra: tuple[str, ...] = ()) -> Path:
+    lines = [json.dumps({"type": "user", "message": "hello"})]
+    lines += [json.dumps({"type": "custom-title", "customTitle": t}) for t in titles]
+    lines += list(extra)
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _age(path: Path, seconds: int) -> Path:
+    os.utime(path, (1_900_000_000 + seconds, 1_900_000_000 + seconds))
+    return path
+
+
+def test_find_session_picks_the_newest_matching_file(tmp_path):
+    old = _age(_transcript(tmp_path / "aaa.jsonl", "fix-login"), 1)
+    new = _age(_transcript(tmp_path / "bbb.jsonl", "fix-login"), 2)
+    other = _age(_transcript(tmp_path / "ccc.jsonl", "other-task"), 3)
+    found = claude.find_session([old, new, other], label="fix-login")
+    assert found is not None
+    assert (found.session_id, found.path) == ("bbb", new)
+    assert found.size_bytes == new.stat().st_size
+
+
+def test_find_session_last_title_wins(tmp_path):
+    renamed = _transcript(tmp_path / "aaa.jsonl", "fix-login", "fix-login-2")
+    assert claude.find_session([renamed], label="fix-login") is None
+    assert claude.find_session([renamed], label="fix-login-2").session_id == "aaa"
+
+
+def test_find_session_ignores_broken_lines_and_unreadable_files(tmp_path):
+    broken = _transcript(
+        tmp_path / "aaa.jsonl", "fix-login", extra=('{"custom-title": oops', "not json")
+    )
+    missing = tmp_path / "gone.jsonl"
+    found = claude.find_session([missing, broken], label="fix-login")
+    assert found is not None and found.session_id == "aaa"
+
+
+def test_find_session_without_a_match(tmp_path):
+    assert claude.find_session([_transcript(tmp_path / "a.jsonl", "x-y")], label="fix-login") is None
+    assert claude.find_session([], label="fix-login") is None
+
+
+def test_registry_finds_sessions_for_claude_only(tmp_path):
+    path = _transcript(tmp_path / "aaa.jsonl", "fix-login")
+    assert clients.find_session("claude", [path], label="fix-login").session_id == "aaa"
+    assert clients.find_session("codex", [path], label="fix-login") is None

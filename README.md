@@ -142,7 +142,7 @@ All tools are auto-attributed to the server's identity.
 | `list_agents(group=None)`                    | `[{name, kind, group, client, topic, state, state_at, repo_path, last_seen, pending_count, live}, …]`; pass a bare repo name as `group` to see one repo; `kind` is `session`, `client` or `agent`, and `live` says whether a running server holds a session |
 | `send_message(to, body, thread_id=None)`     | `{to, kind, message_ids, recipients, thread_id, sent_at}`, plus `message_id` when exactly one agent received it and `note` when no running session is there to read it |
 | `read_inbox(mark_read=True, limit=50)`       | Unread messages for this session — its own, plus any sent to its client address that no other session took — oldest first: `[{message_id, from, to, addressed_to, kind, claimed_by, body, sent_at, thread_id, read_at, delivered_at}]` |
-| `set_session(label=None, topic=None, state=None)` | Renames this session to `<repo>/<client>-<label>` and/or sets the topic shown in `list_agents`, and/or reports its state (`working`, `waiting` or `done`; anything else is rejected): `{name, client_address, topic, state}` |
+| `set_session(label=None, topic=None, state=None, links=None)` | Renames this session to `<repo>/<client>-<label>` and/or sets the topic shown in `list_agents`, and/or reports its state (`working`, `waiting` or `done`; anything else is rejected), and/or attaches links (a list of `{label, url}` objects, at most 8, `http` or `https` only, each URL at most 2048 characters without whitespace; the list replaces the previous one, `[]` clears it, omitting it leaves it unchanged): `{name, client_address, topic, state, links}`. `whoami`, `list_agents` and `agent-bus status --json` show the links |
 | `read_thread(thread_id, limit=100)`          | Full conversation across participants, ordered by `sent_at`.                                                                           |
 | `tail_audit(limit=50)`                       | Last N audit-log entries (any agent).                                                                                                  |
 
@@ -927,7 +927,7 @@ agent-bus status
   hand.
 - **Remote Control** is on by default for the clients that have it
   (`claude`, `agy`). `--no-remote` turns it off.
-- **Cap.** At most `spawn.max_sessions` (default 5) spawned sessions can
+- **Cap.** At most `spawn.max_sessions` (default 10) spawned sessions can
   be active (`starting`, `running`, `working` or `waiting`). Another spawn
   exits 4 and names the running ones. A session that reported `done`, or
   has ended, does not count. Spawning a name whose address is still active
@@ -974,7 +974,8 @@ agent-bus status
   to trust any new folder, which an unattended session cannot answer.
   Claude Code and Codex treat a folder inside a trusted clone as trusted,
   so the worktree starts without a prompt; Antigravity CLI asks again
-  (answer it in the tmux window); opencode never asks. The trade-off: tools
+  unless you opt in to `spawn.clients.agy.worktree_trust` (below), in which
+  case answer it in the tmux window; opencode never asks. The trade-off: tools
   that scan or mount the main folder (IDEs, containers, file watchers) also
   see `.worktrees/`. Repo discovery (`init --scan`, `repos.roots`) skips
   `.worktrees` folders, so they are never taken for repos.
@@ -1043,7 +1044,7 @@ stops `spawn` with an error naming it; `status` warns and carries on.
     "hide_done_after_seconds": 86400
   },
   "spawn": {
-    "max_sessions": 5,
+    "max_sessions": 10,
     "startup_grace_seconds": 120,
     "tmux_bin": "tmux",
     "tmux_session": "agents",
@@ -1055,15 +1056,27 @@ stops `spawn` with an error naming it; `status` warns and carries on.
     "clients": {
       "claude": {"command": ["claude", "-n", "{name}", "--permission-mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control", "{name}"], "prompt": ["{prompt}"],
         "resume": ["claude", "--resume", "{label}"],
+        "resume_prompt": ["claude", "--resume", "{session_id}", "--permission-mode", "auto"],
+        "transcripts": "~/.claude/projects/{work_dir_key}/*.jsonl",
         "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
-      "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "resume": ["codex", "resume"], "worktree_links": []},
-      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": []},
-      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "resume": null, "worktree_links": []}
+      "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "resume": ["codex", "resume"], "worktree_links": [],
+        "resume_prompt": null, "transcripts": null,
+        "user_wired": ["-c", "mcp_servers.agent-bus.env_vars=[\"AGENT_BUS_SESSION\", \"AGENT_BUS_SPAWN_TOKEN\", \"AGENT_BUS_REPO\", \"AGENT_BUS_DB\", \"AGENT_BUS_AUDIT_LOG\"]"]},
+      "agy": {"command": ["agy", "--mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": [],
+        "resume_prompt": null, "transcripts": null,
+        "worktree_trust": {"enabled": false, "file": "~/.gemini/antigravity-cli/settings.json", "key": "trustedWorkspaces"}},
+      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "resume": null, "worktree_links": [],
+        "resume_prompt": null, "transcripts": null,
+        "model_env": {"OPENCODE_CONFIG_CONTENT": {"model": "{model}"}}}
     }
   },
   "dispatch": {
     "env_file": null,
-    "max_spawns_per_run": 2,
+    "max_spawns_per_run": 4,
+    "soft_limit": 6,
+    "resume_max_transcript_mb": 20,
+    "bus_sender": "dispatch",
+    "worktree_cleanup": {"enabled": true},
     "working_hours": {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "19:00"},
     "label": {"template": "t{gid_suffix}-{slug}", "gid_suffix_length": 8},
     "handoff_channel": "{label}",
@@ -1072,11 +1085,11 @@ stops `spawn` with an error naming it; `status` warns and carries on.
     "title_max_chars": 120,
     "overlap_max_items": 10,
     "fetch_timeout_seconds": 120,
-    "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify"],
+    "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify", "needs_approval", "worktree_removed"],
     "defaults": {"client": "claude", "model": null, "worktree": null, "fetch": false, "clone": false, "remote": true},
     "types": {
       "refinement": {"action": "spawn", "playbook": "refinement"},
-      "follow-up": {"action": "spawn", "playbook": "follow-up"},
+      "follow-up": {"action": "spawn", "playbook": "follow-up", "resume_playbook": "follow-up-resume"},
       "implementation": {"action": "notify", "playbook": "implementation"}
     },
     "rules": [
@@ -1140,11 +1153,36 @@ stops `spawn` with an error naming it; `status` warns and carries on.
   of the launching process.
 - Codex is usually wired once per user (`[mcp_servers.agent-bus]` in
   `~/.codex/config.toml`, or under `$CODEX_HOME`). When spawn finds that, it
-  does not claim the repo is unwired; it notes that Codex does not pass
-  `AGENT_BUS_SESSION` to its MCP servers, so the session is named after the
-  folder rather than the label and `agent-bus status` will not link it to the
-  spawn. A per-repo Codex wiring (`agent-bus init --clients codex`) passes
-  the variable through.
+  does not claim the repo is unwired; it adds the `user_wired` fragment
+  (below), because Codex does not pass `AGENT_BUS_SESSION` to MCP servers
+  that a user-level wiring does not name. If the session is still named
+  after the folder rather than the label and `agent-bus status` does not
+  link it to the spawn, wire the repo (`agent-bus init --clients codex`),
+  which passes the variables through.
+- Codex: the managed per-repo block passes `AGENT_BUS_SPAWN_TOKEN` to the
+  MCP server along with `AGENT_BUS_SESSION`, so a spawned Codex session is
+  linked to its spawn. A repo wired for Codex by an earlier version needs
+  `agent-bus init --clients codex` again to get the token. When Codex is
+  wired for the user only, the client's `user_wired` fragment (a list of
+  arguments, `-c mcp_servers.agent-bus.env_vars=[...]` by default) is added
+  right after `command`, so the spawned session passes the variables through
+  for that launch; a repo-wired or unwired clone does not get it. Set
+  `user_wired` to `null` to switch it off.
+- opencode has no model flag, so its template sets `model_env` instead:
+  `agent-bus spawn --client opencode --model <model>` puts
+  `OPENCODE_CONFIG_CONTENT='{"model":"<model>"}'` in the launched command.
+  A client with neither `model` nor `model_env` still refuses `--model`.
+  Known limit: opencode 2.4.1 ignores every configured model, including
+  this one and your own default, when it starts with `--prompt`, which is
+  how spawn starts it; the session then runs on an OpenCode-provided
+  default. The override does apply when opencode starts without a prompt
+  and to `opencode run`.
+- `spawn.clients.agy.worktree_trust` (`enabled` false by default, `file`,
+  `key`) carries folder trust over to worktrees for Antigravity CLI. It acts
+  only when the clone is already listed under `key` in that JSON file; the
+  worktree path is then appended to the list and every other key is kept. It
+  writes the client's own settings file, and a running agy may rewrite that
+  file. Dry runs never write it.
 - `spawn.carry_over` lists untracked files or folders of the repo to
   symlink into a worktree, for example `[".tool-config", "local-notes"]`.
 - Each client has four fragments, lists of arguments, plus `worktree_links`:
@@ -1157,6 +1195,17 @@ stops `spawn` with an error naming it; `status` warns and carries on.
   except `{prompt}`, which becomes `"$(cat <prompt file>)"`, so the prompt
   never appears in the tmux command line. `worktree_links` is described
   under `--worktree` above (`[]` turns it off).
+- `resume_prompt` and `transcripts` make a client resumable by dispatch
+  follow-ups. `resume_prompt` is the command that reopens a session by its
+  id (`{session_id}`, plus `{label}`, `{address}`, `{dir}`); the prompt and
+  the optional `model` and `remote` fragments follow as for `command`.
+  `transcripts` is a glob (`{work_dir_key}`, `{work_dir}`) for the client's
+  transcript files; the session is found there by its name, and the file's
+  size is checked. Only Claude Code has both by default; the others are
+  `null`, so their follow-ups start a new session.
+- `model_env` (opencode by default) maps environment variables to a JSON
+  value with a `{model}` placeholder; it is used for `--model` when the
+  client has no `model` fragment.
 - A client's `resume` list is how `dispatch status` tells you to reopen a
   spawned session; it is printed after `cd` into the session's folder,
   because clients list and look up sessions by working directory.
@@ -1232,7 +1281,7 @@ One run does, in order:
 
 1. Takes a run lock. When another run holds it, the run exits 0 and does nothing.
 2. Checks `dispatch.working_hours`. Outside them it stops (`--ignore-hours` skips the check).
-3. Sends notifications for sessions it spawned earlier whose state changed (needs review, done, ended without done).
+3. Sends notifications for sessions it spawned earlier whose state changed (needs review, done, ended without done), and removes worktrees whose branch has been merged (see *Worktree cleanup*).
 4. Fetches the incomplete tasks assigned to the token's user that are due on or before today plus `lookahead_days`.
 5. Maps each task to a repo through `projects`: the repo comes from the first of the task's memberships whose project id is a key of `projects`. A task can sit in several projects at once, so map only the projects that belong to one repo and leave shared process projects (a board every repo uses, for example) unmapped; a rule's `project` scope is separate from this mapping and can name such a shared project. A task in no configured project is ignored and not stored.
 6. Classifies the task: rules are tried in order and the first match wins.
@@ -1241,13 +1290,14 @@ One run does, in order:
 ```bash
 agent-bus dispatch run [--dry-run] [--json] [--ignore-hours]
 agent-bus dispatch status [--json]
+agent-bus dispatch approve <task-id>
 agent-bus dispatch install-timer [--load] [--bin-path PATH]
 agent-bus dispatch uninstall-timer [--unload] [--bin-path PATH]
 ```
 
 `run --dry-run` prints one decision per mapped task (type, action, result,
-reason, label) and changes nothing. It applies `max_spawns_per_run` and the
-session cap as a real run would, counting each would-be spawn, so the
+reason, label) and changes nothing. It applies `max_spawns_per_run`, the
+soft limit and the session cap as a real run would, counting each would-be spawn, so the
 report matches what a run does: it makes read-only HTTP requests, but
 spawns nothing, sends no notification and creates no state file, prompt file
 or lock. Start there. `--json` prints the decisions as JSON.
@@ -1295,7 +1345,11 @@ An invalid value makes the config fail to load, naming the dotted key.
 | Key | Meaning (default) |
 | --- | --- |
 | `env_file` | Optional `KEY=VALUE` file read before each run, mode 600 (`null`) |
-| `max_spawns_per_run` | Spawn limit per run (`2`). The bus-wide `spawn.max_sessions` applies too |
+| `max_spawns_per_run` | New sessions (spawns and resumes) per run (`4`). The bus-wide `spawn.max_sessions` (`10`, the hard limit) applies too |
+| `soft_limit` | At or above this many running sessions (counting those started this run) a new one is held for approval (`6`); `null` turns the hold off |
+| `resume_max_transcript_mb` | A follow-up resumes an ended session only when its transcript is at most this many MB (`20`) |
+| `bus_sender` | Sender name of the bus messages dispatch sends to live sessions (`dispatch`) |
+| `worktree_cleanup.enabled` | Remove merged dispatched worktrees (`true`) |
 | `working_hours.days` / `start` / `end` | Days and local time window in which runs act (`mon`-`fri`, `09:00`-`19:00`) |
 | `label.template` | Session label template (`t{gid_suffix}-{slug}`) |
 | `label.gid_suffix_length` | Characters of the task id used for `{gid_suffix}` (`8`) |
@@ -1305,10 +1359,11 @@ An invalid value makes the config fail to load, naming the dotted key.
 | `title_max_chars` | Cap on task text copied into a prompt (`120`) |
 | `overlap_max_items` | Cap on the list of other in-flight or handled tasks of the same project (`10`) |
 | `fetch_timeout_seconds` | Timeout for `git fetch` before a spawn (`120`) |
-| `notify_on` | Which events notify: `waiting`, `done`, `ended`, `spawn_failed`, `notify` (all five) |
+| `notify_on` | Which events notify: `waiting`, `done`, `ended`, `spawn_failed`, `notify`, `needs_approval`, `worktree_removed` (all seven). A config that sets `notify_on` itself must list `needs_approval` and `worktree_removed` to get those alerts |
 | `defaults` | Per-project defaults: `client` (`claude`), `model`, `worktree`, `fetch`, `clone`, `remote` |
 | `types.<type>.action` | `spawn`, `notify` or `ignore` per type |
 | `types.<type>.playbook` | Playbook name for the type (same as the type) |
+| `types.<type>.resume_playbook` | Playbook sent to a live or resumed session instead of spawning (`follow-up-resume` for `follow-up`; none for the others) |
 | `rules` | Ordered classification rules, see below |
 | `sources.asana.enabled` | Turn the source on (`false`) |
 | `sources.asana.base_url` | API base URL (`https://app.asana.com/api/1.0`) |
@@ -1348,7 +1403,9 @@ sections matching `refine` to `refinement`, handled tasks with a new comment
 to `follow-up`, and `to do` / `ready` / `in progress` sections to
 `implementation`.
 
-Each type has an action: `spawn` starts a session, `notify` only notifies
+Each type has an action: `spawn` starts a session (a type with a
+`resume_playbook` first tries to reach the task's existing session, see
+*Follow-ups*), `notify` only notifies
 (once per task), `ignore` does nothing. `refinement` and `follow-up` spawn;
 `implementation` is notify-only by default, and
 `dispatch.types.implementation.action` set to `spawn` makes it spawn.
@@ -1380,8 +1437,12 @@ private file and passed to `spawn` as `--prompt-file`.
 - `macos` runs `osascript` with the text as an argument on macOS and does nothing elsewhere.
 - `email` needs `host`, `from`, `to` and `security`, and `username` and `password_env` together or not at all: `tls` (port 465, implicit TLS) or `starttls` (port 587). The certificate is verified and there is no plaintext fallback: when TLS cannot be established nothing is sent. The password is read from the variable named by `password_env`.
 
-Messages carry only the session name, the state, the task title and the
-link. Each transition (needs review, done, ended without done, spawn
+Messages carry only the session name, the state, the task title, the task
+link and the links the session attached with `set_session(links=[...])`
+(entries that are not `http` or `https`, or exceed the bounds, are dropped;
+at most 8). The email is multipart: a plain text part with one
+`label: url` line per link, and an HTML part with clickable, escaped
+anchors. The macOS and log notifications stay one line. Each transition (needs review, done, ended without done, spawn
 failed) and each notify-only task is notified once. A notification is
 recorded as sent only when at least one enabled notifier succeeded; when
 none did, it stays pending and the next run retries it (the failure is
@@ -1417,8 +1478,70 @@ client's `spawn.clients.<client>.resume`); `--json` gives the same as
 label, so Claude Code may show a picker filtered to that name.
 
 - A task is only seen while it is inside the due window, so follow-up only works on tasks still due today or overdue (or within `lookahead_days`).
-- A follow-up waits while the earlier session for the task is still open.
-- Runs stop spawning at `dispatch.max_spawns_per_run` or when `spawn.max_sessions` is reached.
+- Runs stop starting sessions at `dispatch.max_spawns_per_run` or when `spawn.max_sessions` is reached.
+
+#### Limits
+
+Three limits apply, all configurable: the soft limit `dispatch.soft_limit`
+(default 6 running sessions), the hard limit `spawn.max_sessions` (default
+10) and `dispatch.max_spawns_per_run` (default 4 new sessions per run). At or
+above the soft limit a spawn or resume is not started: the decision is
+`held` (`would_hold` in a dry run) and one `needs_approval` alert is sent.
+The task is retried on later runs and starts as soon as the count drops
+below the limit, or after you run `agent-bus dispatch approve <task-id>`,
+which lets the next run start it (the hard limit still applies).
+`dispatch status` lists held tasks. The hard and per-run limits skip the
+task until a later run. `soft_limit: null` turns the hold off.
+
+#### Follow-ups
+
+A new comment on a handled task triggers a follow-up. It reuses the task's
+existing session when it can:
+
+- A session that is still live gets the follow-up as a bus message from
+  `dispatch.bus_sender` (result `messaged`); nothing is spawned.
+- An ended session is resumed in a new tmux window in its own folder
+  (result `resumed`), with the follow-up prompt, when its transcript is at
+  most `dispatch.resume_max_transcript_mb` MB. A resume counts against the
+  limits like a spawn.
+- When the transcript is larger, no resumable session is found, the work
+  folder is gone, or the client has no `resume_prompt` and `transcripts`
+  templates, a new session starts and its prompt tells it to read the
+  handoff channel of the task first. The decision reason says why it was
+  not resumed.
+
+Only clients with `resume_prompt` and `transcripts` templates can be
+resumed; by default that is Claude Code. A follow-up still needs the task to
+be inside the due window.
+
+#### Worktree cleanup
+
+Each run removes a dispatched worktree when all of these hold: it is a
+linked worktree of the clone (not the clone itself), it has a branch checked
+out, that branch has moved from the commit the worktree started at (recorded
+at spawn), the branch is merged into the project's `worktree` base ref, the
+session is neither live nor active, `git status --porcelain` is empty, and
+every commit is on the remote (`git rev-list --count HEAD --not
+--remotes=<remote>` is 0). The removal is a plain `git worktree remove`,
+never forced, so git refuses on anything it does not like. It is recorded,
+and a `worktree_removed` alert is sent. The branch and the client's own
+session files are left alone. `dispatch.worktree_cleanup.enabled: false`
+turns the step off; `run --dry-run` reports `would_remove` and the reason
+for each worktree it keeps.
+
+- Detached worktrees (the read-only ones a refinement gets, with no branch)
+  are never removed automatically, because a follow-up resumes in that
+  folder. Remove them by hand with `git worktree remove <path>`.
+- A branch still at its starting commit is kept (`branch <name> has no
+  commits of its own`): a session that cut a branch but has not committed
+  yet keeps its folder. A task recorded without a start commit (dispatched
+  before start commits were recorded, or one whose base could not be
+  resolved) is kept too (`start commit unknown`).
+- A merge is detected by ancestry, or, when the branch is not an ancestor,
+  by every branch commit having a patch-equivalent commit in the base ref
+  (`git cherry`). That covers merge commits, rebase merges and squashes of a
+  single commit. A squash of several commits is not detected: the worktree is
+  kept and you remove it by hand.
 
 ---
 

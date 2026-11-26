@@ -126,6 +126,16 @@ class WiringState:
 
 
 @dataclass(frozen=True)
+class ResumableSession:
+    """A client session whose transcript was found on disk: `session_id` is
+    what the client's resume command takes, `size_bytes` the transcript size."""
+
+    session_id: str
+    path: Path
+    size_bytes: int
+
+
+@dataclass(frozen=True)
 class WorktreePrep:
     """What an optional `prepare_worktree` step did (or would do) in a fresh
     worktree. `written` are paths relative to the worktree that the step
@@ -157,7 +167,7 @@ class ClientWiring(Protocol):
 
     # Optional, found by `clients.prepare_worktree` / `clients.wired_for_user`
     # (a client without them is treated as having none):
-    #   prepare_worktree(clone, worktree, *, name, bin_path, dry_run) -> WorktreePrep
+    #   prepare_worktree(clone, worktree, *, name, bin_path, dry_run, options) -> WorktreePrep
     #   wired_for_user() -> bool   (the client is wired once per user account)
 
 

@@ -1,7 +1,11 @@
-"""Notifiers: thin messages (session, state, title, link) to log, macOS, email."""
+"""Notifiers: thin messages (session, state, title, link, session links) to
+log, macOS, email. The log line and the email carry the session links; the
+macOS banner stays one line. The email is multipart: plain text plus HTML with
+clickable, escaped anchors."""
 
 from __future__ import annotations
 
+import html
 import os
 import smtplib
 import ssl
@@ -14,7 +18,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Protocol
 
-from .. import commands
+from .. import commands, links
 from ..storage import TIMESTAMP_FORMAT
 from .model import clean_text
 
@@ -31,6 +35,7 @@ class Notification:
     state: str
     title: str
     url: str
+    links: tuple[tuple[str, str], ...] = ()
 
 
 class Notifier(Protocol):
@@ -53,8 +58,11 @@ class LogNotifier:
         stamp = self._now().strftime(TIMESTAMP_FORMAT)
         line = (
             f"{stamp} {notification.state} session={notification.session or '-'} "
-            f"title={notification.title} url={notification.url}\n"
+            f"title={notification.title} url={notification.url}"
         )
+        if notification.links:
+            line += " links=" + " ".join(url for _, url in notification.links)
+        line += "\n"
         # The log holds task titles and links, so it is owner-only like the prompts.
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(self._path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
@@ -141,11 +149,35 @@ class EmailNotifier:
         message["From"] = self._cfg["from"]
         message["To"] = ", ".join(self._cfg["to"])
         message["Subject"] = f"{self._cfg['subject_prefix']} {n.state}: {n.title}"
-        message.set_content(
+        plain = (
             f"Session: {n.session or '-'}\nState: {n.state}\n"
             f"Task: {n.title}\nLink: {n.url}\n"
         )
+        for label, url in n.links:
+            plain += f"{label or 'Link'}: {url}\n"
+        message.set_content(plain)
+        message.add_alternative(self._html(n), subtype="html")
         return message
+
+    @staticmethod
+    def _html(n: Notification) -> str:
+        esc = html.escape
+        if links.is_web_url(n.url):
+            task = f'<a href="{esc(n.url, quote=True)}">{esc(n.title)}</a>'
+        else:
+            task = f"{esc(n.title)} ({esc(n.url)})"
+        items = "".join(
+            # The anchor text is the URL itself, so a label cannot hide
+            # where the link goes.
+            f"<li>{esc(label or 'Link')}: "
+            f'<a href="{esc(url, quote=True)}">{esc(url)}</a></li>'
+            for label, url in n.links
+        )
+        listing = f"<ul>{items}</ul>" if items else ""
+        return (
+            f"<html><body><p>Session: {esc(n.session or '-')}<br>"
+            f"State: {esc(n.state)}<br>Task: {task}</p>{listing}</body></html>"
+        )
 
     def send(self, notification: Notification) -> None:
         cfg = self._cfg
@@ -206,6 +238,7 @@ def deliver(
         state=notification.state,
         title=clean_text(notification.title, max_chars),
         url=clean_text(notification.url, URL_MAX_CHARS),
+        links=_safe_links(notification.links),
     )
     errors: list[str] = []
     alerting = [n for n in notifiers if _alerts(n)]
@@ -218,6 +251,18 @@ def deliver(
             continue
         delivered = delivered or _alerts(notifier)
     return delivered, errors
+
+
+def _safe_links(pairs: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
+    """Keep only well-formed http(s) links, with a cleaned label, capped."""
+    kept: list[tuple[str, str]] = []
+    for label, url in pairs:
+        if not links.is_web_url(url) or len(url) > URL_MAX_CHARS:
+            continue
+        kept.append((clean_text(label, links.MAX_LABEL_LEN), url))
+        if len(kept) == links.MAX_LINKS:
+            break
+    return tuple(kept)
 
 
 def _alerts(notifier: Notifier) -> bool:

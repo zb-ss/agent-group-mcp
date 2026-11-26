@@ -103,7 +103,7 @@ def test_user_version_and_idempotent_init(bus_db):
     store.init_schema()
     store.init_schema()
     with sqlite3.connect(store.path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == MIGRATIONS[-1].step
     assert not bus_db.exists()
 
 
@@ -141,3 +141,57 @@ def test_db_files_are_owner_only_under_a_permissive_umask(tmp_path):
     for path in files:
         assert stat.S_IMODE(path.stat().st_mode) == 0o600, path.name
     assert stat.S_IMODE((tmp_path / "state").stat().st_mode) == 0o700
+
+
+NEW_FIELDS = ("work_dir", "clone_path", "worktree_removed_at", "held_at", "approved_at", "start_commit")
+
+
+def _version(path: Path) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_step_one_database_migrates_to_three(bus_db):
+    store = DispatchStore()
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(store.path)
+    MIGRATIONS[0].apply(conn)
+    conn.execute("PRAGMA user_version = 1")
+    conn.execute(
+        "INSERT INTO tasks (source, task_id, title, url, first_seen_at) "
+        "VALUES ('asana', '1', 'T', 'https://example.com/t', ?)",
+        (NOW,),
+    )
+    conn.commit()
+    conn.close()
+
+    store.init_schema()
+    assert _version(store.path) == 3
+    record = store.get("asana", "1")
+    assert record is not None
+    assert all(getattr(record, name) is None for name in NEW_FIELDS)
+
+
+def test_new_fields_round_trip_including_none(bus_db):
+    store = DispatchStore()
+    store.observe(_task(), project_id="p1", now=NOW)
+    values = {name: f"value-{name}" for name in NEW_FIELDS}
+    record = store.update("asana", "1000000000000001", **values)
+    assert all(getattr(record, name) == values[name] for name in NEW_FIELDS)
+    cleared = store.update("asana", "1000000000000001", **{n: None for n in NEW_FIELDS})
+    assert all(getattr(cleared, name) is None for name in NEW_FIELDS)
+
+
+def test_unknown_extra_column_still_loads(bus_db):
+    store = DispatchStore()
+    store.observe(_task(), project_id="p1", now=NOW)
+    conn = sqlite3.connect(store.path)
+    conn.execute("ALTER TABLE tasks ADD COLUMN from_a_later_build TEXT")
+    conn.execute("UPDATE tasks SET from_a_later_build = 'x'")
+    conn.commit()
+    conn.close()
+    record = store.get("asana", "1000000000000001")
+    assert record is not None and record.title == "Fix login"

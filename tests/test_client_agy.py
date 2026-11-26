@@ -133,3 +133,131 @@ def test_the_wired_hooks_answer_agy_in_its_own_json(
     injected = run(hook["PreInvocation"][0]["command"])
     assert "hello agy" in injected["injectSteps"][0]["ephemeralMessage"]
     assert run(hook["Stop"][0]["command"]) == {"decision": "stop"}
+
+
+# ---------------------------- folder trust carry-over -----------------------
+
+
+def _trust_opts(settings: Path, **extra) -> dict:
+    return {"worktree_trust": {
+        "enabled": True, "file": str(settings), "key": "trusted", **extra,
+    }}
+
+
+def _prep(agy, tmp_path, options, *, dry_run=False):
+    clone = tmp_path / "clone"
+    clone.mkdir(exist_ok=True)
+    return agy.prepare_worktree(
+        clone, tmp_path / "wt", name="repo-a/agy", bin_path=BIN, dry_run=dry_run,
+        options=options,
+    )
+
+
+def test_trusted_clone_passes_its_trust_to_the_worktree_once(tmp_path, agy):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"trusted": [str(tmp_path / "clone")], "other": {"a": 1}}))
+
+    prep = _prep(agy, tmp_path, _trust_opts(settings))
+    assert prep.notes and prep.notes[0].startswith(f"trusted {tmp_path / 'wt'} in agy")
+    data = json.loads(settings.read_text())
+    assert data["trusted"] == [str(tmp_path / "clone"), str(tmp_path / "wt")]
+    assert data["other"] == {"a": 1}
+
+    assert _prep(agy, tmp_path, _trust_opts(settings)).notes == []
+    assert json.loads(settings.read_text()) == data
+
+
+def test_disabled_option_writes_nothing(tmp_path, agy):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"trusted": [str(tmp_path / "clone")]}))
+    before = settings.read_text()
+    options = _trust_opts(settings)
+    options["worktree_trust"]["enabled"] = False
+    assert _prep(agy, tmp_path, options).notes == []
+    assert _prep(agy, tmp_path, None).notes == []
+    assert settings.read_text() == before
+
+
+def test_untrusted_clone_is_not_carried(tmp_path, agy):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"trusted": ["/elsewhere"]}))
+    before = settings.read_text()
+    prep = _prep(agy, tmp_path, _trust_opts(settings))
+    assert prep.notes == [
+        f"{tmp_path / 'clone'} is not trusted in agy, so the worktree is not trusted either"
+    ]
+    assert settings.read_text() == before
+
+
+def test_missing_list_asks_to_trust_the_clone_first(tmp_path, agy):
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    prep = _prep(agy, tmp_path, _trust_opts(settings))
+    assert prep.notes == [
+        f"agy has no trusted folders recorded in {settings}; trust the clone in agy first"
+    ]
+    assert settings.read_text() == "{}"
+
+
+def test_unreadable_settings_file_is_left_alone(tmp_path, agy):
+    settings = tmp_path / "settings.json"
+    settings.write_text("{not json")
+    prep = _prep(agy, tmp_path, _trust_opts(settings))
+    assert prep.notes[0].startswith("not carrying agy folder trust: ")
+    assert settings.read_text() == "{not json"
+
+
+def test_dry_run_reports_and_writes_nothing(tmp_path, agy):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"trusted": [str(tmp_path / "clone")]}))
+    before = settings.read_text()
+    prep = _prep(agy, tmp_path, _trust_opts(settings), dry_run=True)
+    assert prep.notes == [f"would trust {tmp_path / 'wt'} in agy ({settings})"]
+    assert settings.read_text() == before
+
+
+# ------------------------- trust cleanup after removal ----------------------
+
+
+def _release(agy, tmp_path, options):
+    return agy.release_worktree(tmp_path / "wt", options=options)
+
+
+def test_release_drops_only_the_worktree_entry(tmp_path, agy):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps(
+        {"trusted": [str(tmp_path / "clone"), str(tmp_path / "wt")], "other": {"a": 1}}
+    ))
+    notes = _release(agy, tmp_path, _trust_opts(settings))
+    assert notes == [f"dropped agy folder trust for {tmp_path / 'wt'}"]
+    assert json.loads(settings.read_text()) == {
+        "trusted": [str(tmp_path / "clone")], "other": {"a": 1},
+    }
+    assert _release(agy, tmp_path, _trust_opts(settings)) == []
+
+
+def test_release_is_off_unless_enabled(tmp_path, agy):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"trusted": [str(tmp_path / "wt")]}))
+    before = settings.read_text()
+    options = _trust_opts(settings)
+    options["worktree_trust"]["enabled"] = False
+    assert _release(agy, tmp_path, options) == []
+    assert _release(agy, tmp_path, None) == []
+    assert settings.read_text() == before
+
+
+def test_release_missing_or_unreadable_file_is_a_note(tmp_path, agy):
+    settings = tmp_path / "settings.json"
+    assert "not found" in _release(agy, tmp_path, _trust_opts(settings))[0]
+    settings.write_text("{not json")
+    notes = _release(agy, tmp_path, _trust_opts(settings))
+    assert notes[0].startswith("not dropping agy folder trust: ")
+    assert settings.read_text() == "{not json"
+
+
+def test_release_without_a_list_changes_nothing(tmp_path, agy):
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    assert _release(agy, tmp_path, _trust_opts(settings)) == []
+    assert settings.read_text() == "{}"
