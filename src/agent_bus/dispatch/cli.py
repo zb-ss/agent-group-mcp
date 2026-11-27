@@ -46,9 +46,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     from .. import commands, config
     from ..storage import Storage
-    from datetime import datetime
+    from datetime import datetime, timezone
 
-    from . import envfile, notify, runner, scan, settings
+    from . import envfile, notify, quota, runner, scan, settings
     from .store import DispatchStore
 
     try:
@@ -85,6 +85,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         ignore_hours=args.ignore_hours,
         message_sources=message_sources,
         env=env,
+        quota=quota.reader(
+            d["routing"], snapshot_dir=settings.quota_dir(d), now=datetime.now(timezone.utc)
+        ),
     )
     if args.json:
         _out(json.dumps(report.to_dict(), indent=2))
@@ -103,6 +106,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                 continue
             reason = f" ({entry['reason']})" if entry.get("reason") else ""
             _out(f"cleanup: {entry['result']} {entry['work_dir']}{reason}")
+        for entry in report.windows:
+            if entry["result"] == "kept" and not args.dry_run:
+                continue
+            reason = f" ({entry['reason']})" if entry.get("reason") else ""
+            _out(f"window: {entry['result']} {entry['session']}:{entry['window']}{reason}")
     for error in report.errors:
         _err(error)
     return report.exit_code
@@ -111,7 +119,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     from .. import config, status
     from ..storage import Storage
-    from .model import clean_text
+    from .model import UNTRUSTED_TITLE, clean_text, is_untrusted
     from .runner import find_row
     from .store import DispatchStore
 
@@ -126,6 +134,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     )
 
     clients = cfg["spawn"]["clients"]
+
+    def hidden(record) -> bool:
+        # the runner keeps the marker current with `trusted_authors`, so a
+        # marked item is untrusted now, even when it already has a session
+        return is_untrusted(record.handled_types)
 
     def session(record) -> tuple[str | None, str, str | None]:
         """(current name, state, resume command). A session may have renamed
@@ -142,7 +155,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         out = []
         for r in records:
             name, state, resume = session(r)
-            out.append({**r.to_dict(), "current_session": name, "session_state": state,
+            shown = r.to_dict()
+            if hidden(r):
+                shown["title"] = UNTRUSTED_TITLE
+            out.append({**shown, "current_session": name, "session_state": state,
                         "resume": resume})
         _out(json.dumps(out, indent=2))
         return 0
@@ -160,7 +176,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                     r.outcome or "-",
                     name or "-",
                     state,
-                    clean_text(r.title, max_chars),
+                    UNTRUSTED_TITLE if hidden(r) else clean_text(r.title, max_chars),
                     r.url,
                 ]
             )
@@ -558,19 +574,9 @@ def cmd_decisions(args: argparse.Namespace) -> int:
 
 def _resume_for(row, clients) -> str | None:
     """How to reopen a spawned session, from its client's `resume` template."""
-    from ..config import ConfigError
-    from ..spawn import resume_command
+    from .. import status
 
-    template = clients.get(row.client)
-    if not (row.spawned and row.work_dir and row.tmux_window and template):
-        return None
-    try:
-        return resume_command(
-            template, label=row.tmux_window, work_dir=row.work_dir, client=row.client
-        )
-    except ConfigError as exc:
-        sys.stderr.write(f"agent-bus: warning: {exc}\n")
-        return None
+    return status.resume_line(row, clients)
 
 
 def _timer_plan(args: argparse.Namespace, *, uninstall: bool = False):
@@ -601,6 +607,8 @@ def cmd_install_timer(args: argparse.Namespace) -> int:
         return 1
     for path in written:
         _out(f"wrote {path}")
+    for note in plan.notes:
+        _out(note)
     if args.load:
         _out("loaded")
     else:
@@ -819,6 +827,10 @@ def register(sub) -> None:
     s = isub.add_parser("close", help="Close an open incident and tell its session.")
     s.add_argument("incident_id", type=int, metavar="ID")
     s.set_defaults(func=cmd_incidents_close)
+
+    from . import github_cli
+
+    github_cli.register(dsub)
 
     p = dsub.add_parser("scanner", help="Check the message scanner.")
     ssub = p.add_subparsers(dest="scanner_command", required=True)

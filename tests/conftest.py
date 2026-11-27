@@ -8,6 +8,31 @@ from pathlib import Path
 
 import pytest
 
+# Always stripped, even if the packaged config cannot be read: the variable
+# Claude Code's Remote Control sets inside a session.
+SESSION_LINK_ENV_FALLBACK = ("CLAUDE_CODE_BRIDGE_SESSION_ID",)
+
+
+def _session_link_env_names() -> set[str]:
+    """Every env var a packaged client's `session_link.env` names: inside a
+    session that has one, `set_session` would attach its link to whatever
+    session a test registers."""
+    names = set(SESSION_LINK_ENV_FALLBACK)
+    try:
+        from agent_bus import config
+
+        clients = config.defaults()["spawn"]["clients"]
+    except (ImportError, OSError, ValueError, KeyError, TypeError):
+        return names
+    for client in clients.values():
+        link = client.get("session_link") if isinstance(client, dict) else None
+        if isinstance(link, dict) and isinstance(link.get("env"), str):
+            names.add(link["env"])
+    return names
+
+
+SESSION_LINK_ENV = frozenset(_session_link_env_names())
+
 
 @pytest.fixture(autouse=True)
 def _never_the_real_bus(
@@ -22,8 +47,12 @@ def _never_the_real_bus(
     session's identity either (AGENT_BUS_SESSION, AGENT_BUS_SPAWN_TOKEN,
     AGENT_BUS_REPO, AGENT_BUS_NAME, AGENT_BUS_AUTHORITY_TOKEN,
     AGENT_BUS_INSTANCE): CLI subprocess tests copy `os.environ`. So every
-    AGENT_BUS_* variable is removed first, then the two paths are set."""
+    AGENT_BUS_* variable is removed first, then the two paths are set. The
+    variables a client's session link reads (Remote Control's session id)
+    are removed too, so the suite gives the same result inside a session."""
     for name in [key for key in os.environ if key.startswith("AGENT_BUS_")]:
+        monkeypatch.delenv(name, raising=False)
+    for name in SESSION_LINK_ENV:
         monkeypatch.delenv(name, raising=False)
     root = tmp_path_factory.mktemp("bus")
     monkeypatch.setenv("AGENT_BUS_DB", str(root / "bus.db"))

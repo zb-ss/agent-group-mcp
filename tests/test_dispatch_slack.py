@@ -74,6 +74,31 @@ def test_missing_token_names_only_the_variable():
     assert str(info.value) == "environment variable FAKE_SLACK_TOKEN is not set"
 
 
+# A CR or LF in the token would make urllib raise a ValueError that quotes the
+# header value; the client must refuse such a token before any request.
+@pytest.mark.parametrize("bad", ["abc\r\nX-Injected: 1", "abc\ndef", "abc def", "abc\tdef",
+                                 "abc\x00", "abc\x7f", "caf\u00e9"])
+def test_malformed_token_names_only_the_variable_and_sends_nothing(bad):
+    send = FakeSend({})
+    with pytest.raises(SourceError) as info:
+        client(send, env={"FAKE_SLACK_TOKEN": bad}).call("auth.test", {})
+    assert str(info.value) == (
+        "environment variable FAKE_SLACK_TOKEN holds an invalid token "
+        "(whitespace or control characters)"
+    )
+    assert "abc" not in str(info.value) and send.calls == []
+
+
+def test_malformed_token_never_reaches_urllib(monkeypatch):
+    def opener():
+        raise AssertionError("no request may be built")
+
+    monkeypatch.setattr(source, "_build_opener", opener)
+    slack_client = SlackClient(CFG, env={"FAKE_SLACK_TOKEN": "abc\r\nX-Injected: 1"})
+    with pytest.raises(SourceError, match="FAKE_SLACK_TOKEN holds an invalid token"):
+        slack_client.call("auth.test", {})
+
+
 def test_invalid_json_and_error_code_sanitised_without_token():
     with pytest.raises(SourceError) as info:
         client(FakeSend({"m": [b"<html>" + TOKEN.encode()]})).call("m", {})
@@ -220,7 +245,7 @@ def make(send, **over):
     )
 
 
-def auth(scopes="search:read,channels:history"):
+def auth(scopes="search:read,channels:history,im:read"):
     return ({"ok": True, "user_id": OWNER, "url": WS}, {"x-oauth-scopes": scopes})
 
 
@@ -249,7 +274,7 @@ def test_search_path_with_scope_header():
 def test_member_scan_without_search_scope_and_cursor_round_trip():
     hist = {"ok": True, "messages": [msg(-5, f"yo <@{OWNER}>"), msg(-4, "no mention")]}
     send = FakeSend({
-        "auth.test": [auth("channels:history"), auth("channels:history")],
+        "auth.test": [auth("channels:history,im:read"), auth("channels:history,im:read")],
         "users.conversations": [{"ok": True, "channels": [{"id": CHAN}]}],
         "conversations.history": [hist, {"ok": True, "messages": []}],
     })
@@ -333,7 +358,7 @@ def test_budget_partial_batch_and_resume_least_recently_checked():
         return {"ok": True, "messages": [msg(offset, f"<@{OWNER}>")]}
 
     send = FakeSend({
-        "auth.test": [auth("x"), auth("x")],
+        "auth.test": [auth("x,im:read"), auth("x,im:read")],
         "users.conversations": [{"ok": True, "channels": [{"id": CHAN}, {"id": CHAN2}]}],
         "conversations.history": [hist(-5), hist(-4)],
     })
@@ -372,14 +397,14 @@ def dm_script(scopes):
     }
 
 
-@pytest.mark.parametrize("scopes", ["search:read", "channels:history"])
+@pytest.mark.parametrize("scopes", ["search:read,im:read", "channels:history,im:read"])
 def test_direct_messages_count_as_mentions_when_enabled(scopes):
     send = FakeSend(dm_script(scopes))
     (item,) = make(send, mentions={"include_direct_messages": True}).fetch(None, now=NOW).items
     assert item.container == DM and "direct" in item.mentions
 
 
-@pytest.mark.parametrize("scopes", ["search:read", "channels:history"])
+@pytest.mark.parametrize("scopes", ["search:read,im:read", "channels:history,im:read"])
 def test_direct_messages_ignored_by_default(scopes):
     send = FakeSend(dm_script(scopes))
     assert make(send).fetch(None, now=NOW).items == ()
@@ -417,7 +442,7 @@ def test_searched_reply_takes_its_thread_from_the_permalink():
 
 def test_one_failing_conversation_does_not_hide_the_rest():
     send = FakeSend({
-        "auth.test": [auth("x")],
+        "auth.test": [auth("x,im:read")],
         "users.conversations": [{"ok": True, "channels": [{"id": CHAN}, {"id": CHAN2}]}],
         "conversations.history": [
             {"ok": False, "error": "channel_not_found"},
@@ -431,7 +456,7 @@ def test_one_failing_conversation_does_not_hide_the_rest():
 
 def two_conv_script(history):
     return {
-        "auth.test": [auth("channels:history")],
+        "auth.test": [auth("channels:history,im:read")],
         "users.conversations": [{"ok": True, "channels": [{"id": CHAN}, {"id": CHAN2}]}],
         "conversations.history": history,
     }
@@ -452,7 +477,7 @@ def test_member_scan_drops_only_membership_errors_and_reports_them():
 
 def test_a_dropped_conversation_is_reported_once_per_conversations_refresh():
     send = FakeSend({
-        "auth.test": [auth("channels:history")] * 3,
+        "auth.test": [auth("channels:history,im:read")] * 3,
         "users.conversations": [{"ok": True, "channels": [{"id": CHAN}]}] * 2,
         "conversations.history": [{"ok": False, "error": "is_archived"}] * 2,
     })
@@ -487,7 +512,7 @@ def test_member_scan_stops_on_other_slack_errors_and_keeps_the_batch(code):
 def test_a_failing_member_conversation_keeps_the_ruled_channels_items():
     ruled = {"ok": True, "messages": [msg(-5, "deploy failed"), msg(-4, "deploy fixed")]}
     send = FakeSend({
-        "auth.test": [auth("channels:history")],
+        "auth.test": [auth("channels:history,im:read")],
         "users.conversations": [{"ok": True, "channels": [{"id": CHAN2}]}],
         "conversations.history": [ruled, {"ok": False, "error": "missing_scope", "detail": "secret text"}],
     })
@@ -519,7 +544,7 @@ def test_a_network_error_on_one_member_conversation_keeps_the_batch():
 def test_a_failing_conversation_sorts_last_next_run():
     good = {"ok": True, "messages": []}
     send = FakeSend({
-        "auth.test": [auth("channels:history")] * 2,
+        "auth.test": [auth("channels:history,im:read")] * 2,
         "users.conversations": [{"ok": True, "channels": [{"id": CHAN}, {"id": CHAN2}]}],
         "conversations.history": [{"ok": False, "error": "missing_scope"}, good, good],
     })
@@ -533,7 +558,7 @@ def test_a_failing_conversation_sorts_last_next_run():
 
 def test_listing_failures_still_raise():
     send = FakeSend({
-        "auth.test": [auth("channels:history")],
+        "auth.test": [auth("channels:history,im:read")],
         "users.conversations": [{"ok": False, "error": "missing_scope"}],
     })
     with pytest.raises(SourceError) as info:
@@ -545,7 +570,7 @@ def test_listing_failures_still_raise():
 def test_a_listing_failure_keeps_the_ruled_channels_alerts(code):
     ruled = {"ok": True, "messages": [msg(-5, "CRITICAL disk full")]}
     send = FakeSend({
-        "auth.test": [auth("channels:history")],
+        "auth.test": [auth("channels:history,im:read")],
         # twice: the client retries a ratelimited answer once
         "users.conversations": [{"ok": False, "error": code, "detail": "secret text"}] * 2,
         "conversations.history": [ruled],
@@ -597,7 +622,7 @@ def test_a_search_network_error_keeps_the_ruled_channels_alerts_and_scans_dms():
 def test_a_later_ruled_channel_failure_keeps_the_earlier_ones():
     ruled = {"ok": True, "messages": [msg(-5, "CRITICAL disk full")]}
     send = FakeSend({
-        "auth.test": [auth("channels:history")],
+        "auth.test": [auth("channels:history,im:read")],
         "conversations.history": [ruled, {"ok": False, "error": "not_in_channel"}],
     })
     cfg = {"channels": {CHAN: {"rules": []}, CHAN2: {"rules": []}}, "mentions": {"enabled": False}}
@@ -622,6 +647,118 @@ def test_dropped_conversations_sort_last_within_the_budget():
         "ids": [CHAN, CHAN2], "dms": [], "types": ["public_channel", "im"],
         "checked": {CHAN: "2030-01-01T00:00:00.000000Z"}, "listed_at": "2030-01-01T11:59:00.000000Z",
     }})
-    send = FakeSend({"auth.test": [auth("channels:history")], "conversations.history": [{"ok": True, "messages": []}]})
+    send = FakeSend({"auth.test": [auth("channels:history,im:read")], "conversations.history": [{"ok": True, "messages": []}]})
     make(send, max_calls_per_run=2).fetch(cursor, now=NOW)
     assert urllib.parse.parse_qs(send.calls[-1][1].decode())["channel"] == [CHAN2]
+
+
+# -- scope awareness and per-channel errors ---------------------------------
+
+
+def listing_types(send):
+    for call in send.calls:
+        if call[0].endswith("/users.conversations"):
+            return urllib.parse.parse_qs(call[1].decode())["types"][0].split(",")
+    return None
+
+
+def scoped_script(scopes, n_auth=1):
+    return {
+        "auth.test": [auth(scopes) for _ in range(n_auth)],
+        "users.conversations": [{"ok": True, "channels": [{"id": CHAN}]}],
+        "conversations.history": [{"ok": True, "messages": [msg(-5, f"yo <@{OWNER}>")]}],
+    }
+
+
+def test_missing_im_read_drops_im_from_the_conversation_types():
+    send = FakeSend(scoped_script("channels:history"))
+    batch = make(send).fetch(None, now=NOW)
+    assert listing_types(send) == ["public_channel"]
+    assert [i.container for i in batch.items] == [CHAN]
+
+
+def test_missing_im_read_ignores_include_direct_messages():
+    send = FakeSend(scoped_script("search:read"))
+    send.script["search.messages"] = [{"ok": True, "messages": {"matches": []}}]
+    batch = make(send, mentions={"include_direct_messages": True}).fetch(None, now=NOW)
+    assert methods(send) == ["auth.test", "search.messages"]
+    assert batch.items == ()
+
+
+def test_missing_im_read_skips_the_scan_when_only_im_was_asked():
+    send = FakeSend({"auth.test": [auth("channels:history")]})
+    make(send, mentions={"conversation_types": ["im"]}).fetch(None, now=NOW)
+    assert methods(send) == ["auth.test"]
+
+
+def test_the_im_read_warning_is_reported_once_per_cursor():
+    send = FakeSend(scoped_script("channels:history", n_auth=2))
+    send.script["users.conversations"].append({"ok": True, "channels": [{"id": CHAN}]})
+    send.script["conversations.history"].append({"ok": True, "messages": []})
+    src = make(send)
+    first = src.fetch(None, now=NOW)
+    warning = "slack: the token lacks im:read; direct messages are skipped"
+    assert warning in first.errors
+    later = datetime.fromtimestamp(NOW_TS + 60, timezone.utc)
+    second = src.fetch(first.cursor, now=later)
+    assert warning not in second.errors
+
+
+IM_WARNING = "slack: the token lacks im:read; direct messages are skipped"
+
+
+def test_no_im_read_warning_when_direct_messages_were_not_asked_for():
+    send = FakeSend(scoped_script("channels:history"))
+    batch = make(send, mentions={"conversation_types": ["public_channel"]}).fetch(None, now=NOW)
+    assert IM_WARNING not in batch.errors
+
+
+def test_no_im_read_warning_on_the_search_path_without_include_direct_messages():
+    # The default types name `im`, but the search path does not read them.
+    send = FakeSend(scoped_script("search:read"))
+    send.script["search.messages"] = [{"ok": True, "messages": {"matches": []}}]
+    batch = make(send).fetch(None, now=NOW)
+    assert IM_WARNING not in batch.errors
+
+
+def test_im_read_warning_when_include_direct_messages_is_set():
+    send = FakeSend(scoped_script("search:read"))
+    send.script["search.messages"] = [{"ok": True, "messages": {"matches": []}}]
+    batch = make(send, mentions={"include_direct_messages": True}).fetch(None, now=NOW)
+    assert IM_WARNING in batch.errors
+
+
+def test_im_read_warning_when_the_scan_types_name_im():
+    send = FakeSend({"auth.test": [auth("channels:history")]})
+    batch = make(send, mentions={"conversation_types": ["im"]}).fetch(None, now=NOW)
+    assert IM_WARNING in batch.errors
+
+
+@pytest.mark.parametrize("scopes", ["channels:history,im:read", None])
+def test_im_read_present_or_scopes_unknown_keeps_direct_messages(scopes):
+    script = dm_script("x")
+    script["auth.test"] = [({"ok": True, "user_id": OWNER, "url": WS}, {"x-oauth-scopes": scopes} if scopes else {})]
+    send = FakeSend(script)
+    batch = make(send, mentions={"include_direct_messages": True, "use_search": False}).fetch(None, now=NOW)
+    assert "im" in listing_types(send)
+    assert [i.container for i in batch.items] == [DM] and batch.errors == ()
+
+
+@pytest.mark.parametrize("code", ["channel_not_found", "not_in_channel", "is_archived"])
+def test_first_ruled_channel_membership_error_does_not_stop_the_others(code):
+    chans = [CHAN, CHAN2, "C0000000003"]
+    send = FakeSend({
+        "auth.test": [auth()],
+        "conversations.history": [
+            {"ok": False, "error": code},
+            {"ok": True, "messages": [msg(-5)]},
+            {"ok": True, "messages": [msg(-4)]},
+        ],
+    })
+    batch = make(
+        send, mentions={"enabled": False}, channels={c: {"rules": []} for c in chans}
+    ).fetch(None, now=NOW)
+    failing = sorted(chans)[0]
+    assert [e for e in batch.errors if failing in e and code in e]
+    assert methods(send).count("conversations.history") == 3
+    assert len(batch.items) == 2

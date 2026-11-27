@@ -85,13 +85,17 @@ def classify(
     rules: Sequence[Mapping],
     memberships: Sequence[Membership] | None = None,
 ) -> str:
-    """Return the type of the first matching rule, else ``ignore``.
+    """Return the type of the first matching rule, else the task's ``type_hint``
+    (a type a source chose, unless already handled), else ``ignore``.
 
     ``memberships`` defaults to the task's own project/section pairs."""
     pairs = task.memberships if memberships is None else memberships
     for rule in rules:
         if _matches(rule, task, record, pairs):
             return str(rule["type"])
+    hint = task.type_hint
+    if hint and (record is None or hint not in record.handled_types):
+        return hint
     return TYPE_IGNORE
 
 

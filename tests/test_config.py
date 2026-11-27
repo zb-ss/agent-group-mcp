@@ -11,6 +11,7 @@ STRIP_ENV = [
     "CLAUDE_PID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
     "CLAUDE_CODE_CHILD_NOTES_DIR", "CLAUDE_CODE_SESSION_ATTENDED",
     "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT", "CLAUDE_PLUGIN_DATA",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
 ]
 
 
@@ -222,12 +223,19 @@ def test_client_resume_must_be_a_list_of_strings_or_null(bus_paths):
     assert config.load()["spawn"]["clients"]["claude"]["resume"] is None
 
 
+PROCESS_NAME_WANTED = "a non-empty string of at most 15 characters without a slash, or null"
+
+
 @pytest.mark.parametrize(
     "key, value, wanted",
     [
         ("prompt_delivery", "typed", '"argv" or "paste"'),
         ("prompt_ready_seconds", "soon", "a non-negative number"),
         ("prompt_ready_seconds", -1, "a non-negative number"),
+        ("process_name", "", PROCESS_NAME_WANTED),
+        ("process_name", "a/b", PROCESS_NAME_WANTED),
+        ("process_name", "x" * 16, PROCESS_NAME_WANTED),
+        ("process_name", 5, PROCESS_NAME_WANTED),
     ],
 )
 def test_prompt_delivery_keys_are_validated(bus_paths, key, value, wanted):
@@ -241,3 +249,150 @@ def test_opencode_pastes_its_prompt_by_default():
     opencode = config.defaults()["spawn"]["clients"]["opencode"]
     assert opencode["prompt_delivery"] == "paste"
     assert opencode["prompt_ready_seconds"] > 0
+
+
+# ------------------------- session_link / idle_prompt ------------------------
+
+
+def _claude(**overrides):
+    return {"spawn": {"clients": {"claude": overrides}}}
+
+
+@pytest.mark.parametrize("override", [
+    {"session_link": "x"},
+    {"session_link": {"env": "1BAD", "url": "https://h.example/{id}", "label": "L"}},
+    {"session_link": {"env": "X_ID", "url": "http://h.example/{id}", "label": "L"}},
+    {"session_link": {"env": "X_ID", "url": "https://h.example/{other}", "label": "L"}},
+    {"session_link": {"env": "X_ID", "url": "https://h.example/{", "label": "L"}},
+    {"session_link": {"env": "X_ID", "url": "https://h.example/{id}", "label": ""}},
+    {"session_link": {"env": "X_ID", "url": "https://h.example/{id}", "label": "L" * 61}},
+    {"idle_prompt": "x"},
+    {"idle_prompt": {"pattern": "(", "tail_lines": 5, "escapes": False}},
+    {"idle_prompt": {"pattern": ">", "tail_lines": 0, "escapes": False}},
+    {"idle_prompt": {"pattern": ">", "tail_lines": 201, "escapes": False}},
+    {"idle_prompt": {"pattern": ">", "tail_lines": 5, "escapes": "no"}},
+])
+def test_bad_session_link_or_idle_prompt_is_rejected(override):
+    key = next(iter(override))
+    with pytest.raises(config.ConfigError, match=f"spawn.clients.claude.{key}"):
+        config.validate_user(_claude(**override))
+
+
+@pytest.mark.parametrize("url", [
+    "https://{id}/x",
+    "https://{id}.h.example/x",
+    "https://h{id}.example/x",
+    "https://h.example{id}",
+    "https://h.example/code/{id!r}",
+    "https://h.example/code/{id:>20}",
+    "https://h.example/code/{id!s:10}",
+    "https://h.example/{id}/{id}",
+    "https://h.example/{id}{other}",
+    "https://h.example/{0}",
+    "https://h.example/{}",
+    "https://h.example/{{x}}/{id}",
+    "https://h.example/x#{id}",
+    "https://h.example/x",
+    "https://user@h.example/{id}",
+    "https://h.example/{id.attr}",
+    "https://h.example/{id[0]}",
+])
+def test_session_link_template_needs_a_literal_host_and_one_bare_id(url):
+    link = {"env": "X_ID", "url": url, "label": "L"}
+    with pytest.raises(config.ConfigError, match="spawn.clients.claude.session_link"):
+        config.validate_user(_claude(session_link=link))
+
+
+@pytest.mark.parametrize("url", [
+    "https://h.example/code/{id}",
+    "https://h.example/{id}/view",
+    "https://h.example/open?session={id}",
+    "https://h.example:8443/s/{id}",
+])
+def test_session_link_template_with_id_in_path_or_query_is_accepted(url):
+    link = {"env": "X_ID", "url": url, "label": "L"}
+    merged = config.validate_user(_claude(session_link=link))
+    assert merged["spawn"]["clients"]["claude"]["session_link"]["url"] == url
+
+
+def test_good_session_link_and_idle_prompt_validate():
+    merged = config.validate_user(_claude(
+        session_link=None,
+        idle_prompt={"pattern": "^> $", "tail_lines": 5, "escapes": True},
+    ))
+    assert merged["spawn"]["clients"]["claude"]["session_link"] is None
+    assert config.defaults()["spawn"]["clients"]["claude"]["session_link"]["label"] == "Remote Control"
+
+
+# ------------------------------- load_user / save_user ----------------------
+
+
+def test_load_user_missing_and_blank(bus_paths):
+    assert config.load_user() == {}
+    config.config_path().write_text(" \n", encoding="utf-8")
+    assert config.load_user() == {}
+
+
+def test_load_user_returns_raw_object_without_defaults(bus_paths):
+    config.config_path().write_text('{"status": {"hide_done_after_seconds": 5}}', encoding="utf-8")
+    assert config.load_user() == {"status": {"hide_done_after_seconds": 5}}
+
+
+@pytest.mark.parametrize("text, message", [("{nope", "not valid JSON"), ("[1]", "JSON object")])
+def test_load_user_broken_file_raises(bus_paths, text, message):
+    config.config_path().write_text(text, encoding="utf-8")
+    with pytest.raises(config.ConfigError, match=message):
+        config.load_user()
+
+
+def test_save_user_round_trip_and_new_file_mode(bus_paths):
+    user = {"status": {"hide_done_after_seconds": 7}}
+    target = config.save_user(user)
+    assert target == config.config_path().resolve()
+    assert config.load_user() == user
+    assert config.load()["status"]["hide_done_after_seconds"] == 7
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert not list(target.parent.glob("*.tmp"))
+
+
+def test_save_user_keeps_existing_mode(bus_paths):
+    path = config.config_path()
+    path.write_text("{}", encoding="utf-8")
+    path.chmod(0o640)
+    config.save_user({"status": {"hide_done_after_seconds": 1}})
+    assert path.stat().st_mode & 0o777 == 0o640
+
+
+def test_save_user_writes_through_a_symlink(bus_paths, tmp_path):
+    real = tmp_path / "elsewhere" / "real.json"
+    real.parent.mkdir()
+    real.write_text("{}", encoding="utf-8")
+    link = config.config_path()
+    link.symlink_to(real)
+    config.save_user({"status": {"hide_done_after_seconds": 3}})
+    assert link.is_symlink()
+    assert json.loads(real.read_text(encoding="utf-8")) == {"status": {"hide_done_after_seconds": 3}}
+
+
+def test_save_user_invalid_candidate_leaves_file_untouched(bus_paths):
+    path = config.config_path()
+    path.write_text('{"status": {"hide_done_after_seconds": 9}}\n', encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(config.ConfigError):
+        config.save_user({"spawn": {"max_sessions": "many"}})
+    assert path.read_bytes() == before
+    assert not list(path.parent.glob("*.tmp"))
+
+
+def test_save_user_creates_missing_parent_private(tmp_path):
+    target = tmp_path / "new" / "config.json"
+    config.save_user({}, path=target)
+    assert target.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_process_name_accepts_a_short_name_and_null(bus_paths):
+    path = config.config_path()
+    path.write_text(json.dumps({"spawn": {"clients": {"opencode": {"process_name": "node"}}}}), encoding="utf-8")
+    assert config.load()["spawn"]["clients"]["opencode"]["process_name"] == "node"
+    path.write_text(json.dumps({"spawn": {"clients": {"opencode": {"process_name": None}}}}), encoding="utf-8")
+    assert config.load()["spawn"]["clients"]["opencode"]["process_name"] is None

@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from .. import repo_identity, resolution, status
 from . import runner, settings, store as store_mod
 from .actor import ACTOR_CLI, ACTOR_DISPATCHER, actor_for  # noqa: F401
-from .model import clean_text, clean_untrusted
+from .model import clean_text, clean_untrusted, is_untrusted
 from .store import DispatchStore, TaskRecord
 
 _SPAWNING = ("start", "resume")
@@ -52,6 +52,9 @@ def candidates(store: DispatchStore, rows: list, dispatch_cfg: Mapping) -> list[
     max_chars = dispatch_cfg["title_max_chars"]
     out = []
     for record in store.pending_candidates():
+        if is_untrusted(record.handled_types):
+            # The author was removed from trusted_authors: never show their text.
+            continue
         row = runner.find_row(rows, record) if record.session_name else None
         out.append(
             {
@@ -138,6 +141,10 @@ def decide(
     record = find(store, task_id, source)
     if not record.candidate_at or record.decision not in (None, "ask"):
         raise DecisionError(f"task {task_id} is not a pending candidate")
+    if is_untrusted(record.handled_types):
+        raise DecisionError(
+            f"task {task_id} is from an author outside trusted_authors; it takes no decision"
+        )
     if action == "start" and rows is not None and record.session_name:
         row = runner.find_row(rows, record)
         if row is not None and (row.live or row.state in status.ACTIVE_STATES):

@@ -28,6 +28,7 @@ GOLDEN = (
     "-u CLAUDE_PID -u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN "
     "-u CLAUDE_CODE_CHILD_NOTES_DIR -u CLAUDE_CODE_SESSION_ATTENDED "
     "-u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_EFFORT -u CLAUDE_PLUGIN_DATA "
+    "-u CLAUDE_CODE_BRIDGE_SESSION_ID "
     "AGENT_BUS_SESSION=fix-login claude -n fix-login --permission-mode auto "
     '--remote-control fix-login "$(cat /tmp/p.txt)"; exec $SHELL -l'
 )
@@ -1623,3 +1624,53 @@ def test_role_row_does_not_count_toward_the_cap(storage, cfg, prompt):
     _fill(storage, 4)
     _go(storage, cfg, prompt, name="chief", role="dispatcher")
     assert _go(storage, cfg, prompt, name="other-job")[0].launched
+
+
+# ----------------------- agy: real plugin files in a worktree -----------------
+
+
+AGY_PLUGIN = Path(".agents") / "plugins" / "agent-bus"
+
+
+def _wire_agy(repo):
+    clients.wiring("agy").apply(repo, name="repo-a/agy", bin_path="agent-bus")
+
+
+def test_agy_worktree_gets_real_plugin_files_not_links(storage, cfg, prompt, repo):
+    _wire_agy(repo)
+    result, fake = _go(storage, cfg, prompt, client="agy", worktree="main")
+    target = Path(result.work_dir)
+    for filename in ("plugin.json", "mcp_config.json", "hooks.json"):
+        mine = target / AGY_PLUGIN / filename
+        assert mine.is_file() and not mine.is_symlink()
+        assert mine.read_bytes() == (repo / AGY_PLUGIN / filename).read_bytes()
+    assert json.loads((target / AGY_PLUGIN / "mcp_config.json").read_text())[
+        "mcpServers"]["agent-bus"]["env"]["AGENT_BUS_REPO"] == str(repo)
+    # git is asked about each file it created, so it can keep them out of status
+    checked = [a[-1] for a in fake.argvs("git", "-C", str(target), "check-ignore")]
+    assert sorted(checked) == sorted(str(AGY_PLUGIN / f) for f in
+                                     ("plugin.json", "mcp_config.json", "hooks.json"))
+    assert not [n for n in result.notes if "tracks it" in n]
+
+
+def test_agy_worktree_replaces_an_existing_link_and_leaves_the_clone_alone(
+    storage, cfg, prompt, repo, tmp_path
+):
+    _wire_agy(repo)
+    target = tmp_path / "worktrees" / "repo-a" / "fix-login"
+    (target / AGY_PLUGIN).mkdir(parents=True)
+    (target / AGY_PLUGIN / "hooks.json").symlink_to(repo / AGY_PLUGIN / "hooks.json")
+    before = (repo / AGY_PLUGIN / "hooks.json").read_bytes()
+    fake = FakeRun()
+    fake.common_dirs[str(target)] = str(repo / ".git")
+    _go(storage, cfg, prompt, fake, client="agy", worktree="main")
+    assert not (target / AGY_PLUGIN / "hooks.json").is_symlink()
+    assert (repo / AGY_PLUGIN / "hooks.json").read_bytes() == before
+    assert not (repo / AGY_PLUGIN / "hooks.json").is_symlink()
+
+
+def test_agy_worktree_dry_run_writes_nothing(storage, cfg, prompt, repo, tmp_path):
+    _wire_agy(repo)
+    result, _ = _go(storage, cfg, prompt, client="agy", worktree="main", dry_run=True)
+    assert not (tmp_path / "worktrees").exists()
+    assert any("would create worktree" in n for n in result.notes)

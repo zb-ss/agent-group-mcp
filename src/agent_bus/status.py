@@ -6,11 +6,13 @@ stale `working`. Spawn reads the same list for its concurrency cap."""
 
 from __future__ import annotations
 
+import sys
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
 from . import formatting as fmt
-from . import identity, storage as storage_mod
+from . import identity, links as links_mod, storage as storage_mod
 from .sessions import SessionRegistry
 from .storage import KIND_SESSION, SpawnRecord, Storage
 
@@ -209,8 +211,49 @@ def _state_class(state: str) -> str:
     return "class:system" if state in (STATE_RUNNING, storage_mod.STATE_WORKING) else "class:ts"
 
 
-def fragments(rows: list[StatusRow]) -> list[list[fmt.Fragment]]:
-    """Styled lines: one header per repo group, one indented line per session."""
+def resume_line(row: StatusRow, clients: Mapping | None) -> str | None:
+    """How to reopen a spawned session, from its client's `resume` template."""
+    from .config import ConfigError
+    from .spawn import resume_command  # lazy: spawn imports this module
+
+    template = (clients or {}).get(row.client)
+    if not (row.spawned and row.work_dir and row.tmux_window and template):
+        return None
+    try:
+        return resume_command(
+            template, label=row.tmux_window, work_dir=row.work_dir, client=row.client
+        )
+    except ConfigError as exc:
+        sys.stderr.write(f"agent-bus: warning: {exc}\n")
+        return None
+
+
+LINK_INDENT = "        "
+
+
+def link_lines(row: StatusRow) -> list[list[fmt.Fragment]]:
+    """One indented `label: url` line per link the session attached (its
+    Remote Control URL among them). Links are session-supplied, so each is
+    re-checked and its label flattened to one bounded printable line."""
+    from .dispatch.model import clean_text  # lazy: keeps status imports light
+
+    lines: list[list[fmt.Fragment]] = []
+    for entry in row.links[: links_mod.MAX_LINKS]:
+        url = entry.get("url") if isinstance(entry, Mapping) else None
+        if not links_mod.is_web_url(url):
+            continue
+        raw_label = entry.get("label")
+        label = clean_text(raw_label if isinstance(raw_label, str) else "", links_mod.MAX_LABEL_LEN)
+        lines.append([("", LINK_INDENT), ("class:system", f"{label or 'link'}: {url}")])
+    return lines
+
+
+def fragments(
+    rows: list[StatusRow], clients: Mapping | None = None
+) -> list[list[fmt.Fragment]]:
+    """Styled lines: one header per repo group, one indented line per session,
+    under it one line per session link, and under a spawned session that is
+    gone the line that reopens it."""
     by_group: dict[str, list[StatusRow]] = {}
     for row in rows:
         by_group.setdefault(row.group, []).append(row)
@@ -254,4 +297,8 @@ def fragments(rows: list[StatusRow]) -> list[list[fmt.Fragment]]:
             if r.topic:
                 line += [("", "  "), ("class:system", r.topic)]
             lines.append(line)
+            lines.extend(link_lines(r))
+            resume = None if r.live else resume_line(r, clients)
+            if resume:
+                lines.append([("", LINK_INDENT), ("class:ts", f"resume: {resume}")])
     return lines

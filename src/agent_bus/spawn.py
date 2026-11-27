@@ -1049,6 +1049,7 @@ def _paste_prompt(
             client=command[0] if isinstance(command, list) and command else "",
             tmux_bin=spawn_cfg["tmux_bin"], timeout=spawn_cfg["tmux_timeout_seconds"],
             run=run, env=env,
+            process_name=checked.template.get("process_name") or None,
         )
     except tmux.TmuxError as exc:
         result.notes.append(

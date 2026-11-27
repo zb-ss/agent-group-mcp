@@ -246,3 +246,96 @@ def test_spawn_role_shows_on_its_row_and_ordinary_rows_have_none(storage):
     assert by_name["shared/claude-boss"].role == "dispatcher"
     assert by_name["shared/claude-boss"].to_dict()["role"] == "dispatcher"
     assert by_name["shared/claude-plain"].role is None
+
+
+# ------------------------------- resume line --------------------------------
+
+
+def _row_of(**kw):
+    base = dict(
+        name="shared/claude-fix", group="shared", client="claude", label="fix",
+        state="done", reported_state="done", state_at=None, live=False, spawned=True,
+        last_seen=None, topic=None, pending_count=0, repo_path="/repo/shared",
+        repo_id=None, work_dir="/repo/shared", tmux_session="agents", tmux_window="fix",
+        model=None, remote=None,
+    )
+    base.update(kw)
+    return status.StatusRow(**base)
+
+
+CLIENTS = {"claude": {"resume": ["claude", "--resume", "{label}"]}}
+
+
+def _text(rows, clients=CLIENTS):
+    return "\n".join(fmt.render_plain(line) for line in status.fragments(rows, clients))
+
+
+def test_resume_line_is_shown_for_a_spawned_row_that_is_gone():
+    assert "resume: cd /repo/shared && claude --resume fix" in _text([_row_of()])
+
+
+def test_resume_line_is_absent_for_a_live_row():
+    assert "resume:" not in _text([_row_of(live=True)])
+
+
+def test_resume_line_is_absent_without_clients_or_spawn():
+    assert "resume:" not in "\n".join(
+        fmt.render_plain(line) for line in status.fragments([_row_of()])
+    )
+    assert "resume:" not in _text([_row_of(spawned=False)])
+
+
+def test_status_json_carries_the_resume_key(storage, capsys, monkeypatch):
+    import json
+
+    from agent_bus import cli
+
+    storage.record_spawn(_record(spawned_at=_ts(1)))
+    monkeypatch.setattr(
+        status, "collect", lambda *a, **k: [_row_of(), _row_of(name="x/claude-y", live=True)]
+    )
+    assert cli.main(["status", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["resume"] == "cd /repo/shared && claude --resume fix"
+    assert rows[1]["resume"] is None
+
+
+# ------------------------------- link lines ---------------------------------
+
+
+def test_text_view_prints_one_line_per_session_link():
+    row = _row_of(live=True, links=(
+        {"label": "Remote Control", "url": "https://example.com/session/abc"},
+        {"label": "PR", "url": "https://example.com/pull/1"},
+    ))
+    lines = _text([row]).splitlines()
+    assert lines[-2:] == [
+        "        Remote Control: https://example.com/session/abc",
+        "        PR: https://example.com/pull/1",
+    ]
+
+
+def test_link_lines_flatten_labels_and_drop_unsafe_urls():
+    row = _row_of(live=True, links=(
+        {"label": "bad\x1b[31m\nlabel", "url": "https://example.com/a"},
+        {"label": "", "url": "https://example.com/b"},
+        {"label": "js", "url": "javascript:alert(1)"},
+        {"label": "ws", "url": "https://example.com/x y"},
+    ))
+    text = _text([row])
+    assert "\x1b" not in text
+    assert "bad [31m label: https://example.com/a" in text
+    assert "link: https://example.com/b" in text
+    assert "javascript" not in text
+    assert "x y" not in text
+
+
+def test_no_link_lines_without_links():
+    assert len(_text([_row_of(live=True)]).splitlines()) == 2
+
+
+def test_links_come_before_the_resume_line():
+    row = _row_of(links=({"label": "Remote", "url": "https://example.com/r"},))
+    lines = _text([row]).splitlines()
+    assert lines[2] == "        Remote: https://example.com/r"
+    assert lines[3].lstrip().startswith("resume:")

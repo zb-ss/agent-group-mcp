@@ -87,10 +87,7 @@ class SlackClient:
         )
 
     def call(self, method: str, params: Mapping[str, str]) -> tuple[dict, Mapping[str, str]]:
-        token_env = self._cfg["token_env"]
-        token = self._env.get(token_env)
-        if not token:
-            raise SourceError(f"environment variable {token_env} is not set")
+        token = source.read_token(self._cfg, self._env)
         url = f"{str(self._cfg['base_url']).rstrip('/')}/{method}"
         body = urllib.parse.urlencode(params).encode()
         headers = {
@@ -295,15 +292,39 @@ class _Run:
             self._step(lambda c=channel: self._read_channel(c, keep_all=True), "conversations.history", channel)
         if not self.mentions["enabled"]:
             return
-        if self.mentions["use_search"] and "search:read" in scopes:
+        # Known scopes without im:read: direct messages cannot be listed, and
+        # asking for them would fail the whole users.conversations call.
+        dm_ok = not scopes or "im:read" in scopes
+        include_dm = self.include_dm and dm_ok
+        searching = bool(self.mentions["use_search"]) and "search:read" in scopes
+        # Direct messages are read when asked for explicitly, or through the
+        # member scan when its conversation types name `im`; the search path
+        # ignores the types. Warn only when they were going to be read.
+        wants_dm = self.include_dm or (
+            not searching and "im" in self.mentions["conversation_types"]
+        )
+        if not dm_ok and wants_dm:
+            self._warn_once("im_read", f"{self.name}: the token lacks im:read; direct messages are skipped")
+        if searching:
             self._step(self._search, "search.messages")
-            if self.include_dm:
+            if include_dm:
                 self._member_scan(["im"])
         else:
             types = list(self.mentions["conversation_types"])
-            if self.include_dm and "im" not in types:
+            if not dm_ok:
+                types = [t for t in types if t != "im"]
+            elif include_dm and "im" not in types:
                 types.append("im")
-            self._member_scan(types)
+            if types:
+                self._member_scan(types)
+
+    def _warn_once(self, key: str, line: str) -> None:
+        warned = self.state.get("warned")
+        if not isinstance(warned, list):
+            warned = self.state["warned"] = []
+        if key not in warned:
+            warned.append(key)
+            self.failed.append(line)
 
     def _step(
         self, action: Callable[[], None], method: str, channel: str | None = None, *, reads: bool = True
@@ -312,12 +333,18 @@ class _Run:
         has nothing to lose); after that it is reported with Slack's error
         code only and the run keeps what it read and the cursors it advanced,
         so an alert already read in a ruled channel is never dropped by a
-        later failing call. Returns whether the read succeeded."""
+        later failing call. A membership error (MEMBERSHIP_CODES) on a named
+        channel is the exception: it is always reported by channel id and the
+        run continues, even before anything was read. Returns whether the read
+        succeeded."""
         try:
             action()
         except SlackBudget:
             raise  # a SourceError too, but it ends the run without an error
         except SourceError as exc:
+            if channel is not None and isinstance(exc, SlackError) and exc.code in MEMBERSHIP_CODES:
+                self._fail(channel, method, exc.code)
+                return False
             if not self.read_any:
                 raise
             code = exc.code if isinstance(exc, SlackError) else "request_failed"

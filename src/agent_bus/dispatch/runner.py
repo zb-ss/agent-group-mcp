@@ -15,12 +15,12 @@ import sqlite3
 import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
-from .. import authority, commands, identity, repo_identity, spawn, status
+from .. import authority, commands, identity, repo_identity, spawn, status, tmux
 from ..config import ConfigError
 from ..spawn import SpawnError, SpawnRequest
 from ..clients import agy as agy_client
@@ -28,18 +28,23 @@ from ..clients.base import ResumableSession
 from ..storage import TIMESTAMP_FORMAT, Storage, UnknownRecipientError
 from . import (
     classify, cleanup, decision_model, messages, playbook, routing, scan, settings, triage,
+    windows,
 )
 from .asana import AsanaSource
+from .github import GithubSource
 from .model import (
     OUTCOME_DONE,
     OUTCOME_ENDED,
     OUTCOME_NOTIFIED,
     OUTCOME_SPAWN_FAILED,
     OUTCOME_SPAWNED,
+    UNTRUSTED_MARKER,
+    UNTRUSTED_TITLE,
     Task,
     clean_text,
     clean_untrusted,
     format_now,
+    is_untrusted,
 )
 from .messages import MessageSource
 from .notify import Notification, Notifier, deliver
@@ -50,12 +55,13 @@ from .store import (
     EVENT_CANDIDATE,
     EVENT_EXECUTED,
     EVENT_ROUTING,
+    EVENT_WINDOW_CLOSED,
     TRIAGE_FIELDS,
     DispatchStore,
     TaskRecord,
 )
 
-SOURCES: dict[str, Callable[..., TaskSource]] = {"asana": AsanaSource}
+SOURCES: dict[str, Callable[..., TaskSource]] = {"asana": AsanaSource, "github": GithubSource}
 
 RESULTS = (
     "spawned", "would_spawn", "held", "would_hold", "notified", "would_notify",
@@ -101,6 +107,7 @@ class RunReport:
     decisions: list[TaskDecision] = field(default_factory=list)
     transitions: list[dict] = field(default_factory=list)
     cleanups: list[dict] = field(default_factory=list)
+    windows: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     messages: list[dict] = field(default_factory=list)
 
@@ -140,6 +147,9 @@ class _Ctx:
     fetched: set[str] = field(default_factory=set)
     force: bool = False
     local: datetime | None = None
+    # per source: untrusted-author alerts sent / held back in this run
+    untrusted_alerts: dict[str, int] = field(default_factory=dict)
+    untrusted_held: dict[str, int] = field(default_factory=dict)
 
     @property
     def stamp(self) -> str:
@@ -158,10 +168,19 @@ def build_sources(
             continue
         if settings.source_type(name, source_cfg) in settings.MESSAGE_SOURCE_TYPES:
             continue
-        factory = SOURCES.get(settings.source_type(name, source_cfg))
+        type_ = settings.source_type(name, source_cfg)
+        factory = SOURCES.get(type_)
         if factory is None:
             raise ConfigError(f"dispatch.sources.{name} is enabled but there is no such source")
-        built.append(factory(source_cfg, env=env, http_get=http_get))
+        if type_ == "asana":
+            built.append(factory(source_cfg, env=env, http_get=http_get))
+        else:
+            built.append(
+                factory(
+                    name, settings.source_settings(dispatch_cfg, name),
+                    env=env, http_get=http_get,
+                )
+            )
     return built
 
 
@@ -225,8 +244,9 @@ def _not_yet_answered(record: TaskRecord, row: Any | None) -> bool:
     """After a follow-up was messaged, the session's state is only news once it
     was reported after that message; an unchanged row is the state notified
     before the follow-up."""
-    if row is None or row.state == "ended":
-        # A dead session can no longer answer; its end is news.
+    if row is None or row.state == "ended" or not getattr(row, "live", True):
+        # A dead session can no longer answer (even when its last report was
+        # `done`); its end is news.
         return False
     return not _answered(record, row)
 
@@ -234,6 +254,11 @@ def _not_yet_answered(record: TaskRecord, row: Any | None) -> bool:
 def _transition(ctx: _Ctx, record: TaskRecord, rows: Sequence[Any]) -> None:
     row = find_row(rows, record)
     state = row.state if row is not None else "ended"
+    if (record.last_notified_state == "messaged" and row is not None
+            and not getattr(row, "live", True) and not _answered(record, row)):
+        # A messaged session that died unanswered ended; its last report
+        # (often an old `done`, alerted before the follow-up) is not news.
+        state = "ended"
     if row is not None and row.name != record.session_name and not ctx.dry_run:
         record = ctx.store.update(record.source, record.task_id, session_name=row.name)
     if state == record.last_notified_state:
@@ -255,8 +280,8 @@ def _transition(ctx: _Ctx, record: TaskRecord, rows: Sequence[Any]) -> None:
         fields: dict[str, Any] = {"outcome": _OUTCOME_FOR_STATE.get(state, OUTCOME_SPAWNED)}
         if delivered or not notified:
             fields["last_notified_state"] = state
-        if (record.last_notified_state == "messaged" and state == "ended"
-                and not _answered(record, row)):
+        gone = state == "ended" or (row is not None and not getattr(row, "live", True))
+        if record.last_notified_state == "messaged" and gone and not _answered(record, row):
             # The messaged session died unanswered: reopen the follow-up so
             # the next run resumes or re-spawns for that comment. A session
             # that answered and then ended keeps the comment handled.
@@ -327,6 +352,49 @@ def _cleanup(ctx: _Ctx) -> None:
             _remove_worktree(ctx, record, entry, Path(work_dir), Path(clone), timeout)
 
 
+def _close_windows(ctx: _Ctx, collect) -> None:
+    """Close idle `done` windows of sessions dispatch started. Never stops the run."""
+    rows: list = []
+    busy: list = []
+    touched = {
+        d.session for d in ctx.report.decisions
+        if d.session and d.result in ("messaged", "resumed", "spawned")
+    }
+    for record in ctx.store.list_tasks():
+        row = find_row(ctx.rows, record) if record.session_name else None
+        if row is None:
+            continue
+        # Fail closed: a session messaged, resumed or spawned in this run (or
+        # still holding a follow-up it has not answered) has work in flight
+        # even while its report still reads `done`.
+        if record.last_notified_state == "messaged" or row.name in touched:
+            busy.append(row)
+        if all(row is not r for r in rows):
+            rows.append(row)
+    rows = [r for r in rows if all(r is not b for b in busy)]
+
+    def recheck(name: str) -> Any | None:
+        fresh = collect(
+            ctx.storage, grace_seconds=ctx.cfg["spawn"]["startup_grace_seconds"],
+            now=ctx.now, include_ended=True,
+        )
+        return next((r for r in fresh if r.name == name), None)
+
+    try:
+        results = windows.sweep(
+            rows, cfg=ctx.cfg, now=ctx.now, run=ctx.run, dry_run=ctx.dry_run, recheck=recheck,
+        )
+        ctx.report.windows.extend(results)
+        for entry in results:
+            if entry["result"] == "closed":
+                ctx.store.log_event(
+                    at=ctx.stamp, event=EVENT_WINDOW_CLOSED, actor="runner",
+                    detail={"session": entry["session"], "window": entry["window"]},
+                )
+    except (tmux.TmuxError, OSError, sqlite3.Error) as exc:
+        ctx.report.errors.append(f"window cleanup failed ({type(exc).__name__})")
+
+
 def _drop_agy_trust(ctx: _Ctx, record: TaskRecord, work_dir: Path) -> dict:
     project = _cleanup_project(ctx, record) or {}
     if (record.client or project.get("client")) != agy_client.CLIENT_ID:
@@ -358,7 +426,12 @@ def _decision(
     ctx: _Ctx, task: Task, type_: str, action: str, result: str,
     *, reason: str | None = None, label: str | None = None, session: str | None = None,
 ) -> TaskDecision:
-    title = clean_text(task.title, ctx.dispatch["title_max_chars"])
+    # A stranger's title never reaches the dispatcher or an agent through the
+    # decision lines of `dispatch run` / `dispatch status`.
+    title = (
+        clean_text(task.title, ctx.dispatch["title_max_chars"])
+        if task.spawn_allowed else UNTRUSTED_TITLE
+    )
     return TaskDecision(task.source, task.task_id, title, task.url, type_, action,
                         result, reason, label, session)
 
@@ -375,6 +448,45 @@ def _with_type(record: TaskRecord, type_: str) -> tuple[str, ...]:
     return record.handled_types + ((type_,) if type_ not in record.handled_types else ())
 
 
+def _author_gate_fields(task: Task, record: TaskRecord) -> dict[str, Any]:
+    """The record changes that make its untrusted-author marker match the
+    author gate of this run (the current trusted_authors). Persisted so the
+    gate outlives the item's fetch window, and re-evaluated every run so a
+    change of the allowlist applies in both directions."""
+    marked = is_untrusted(record.handled_types)
+    if not task.spawn_allowed:
+        fields: dict[str, Any] = {}
+        if not marked:
+            fields["handled_types"] = record.handled_types + (UNTRUSTED_MARKER,)
+        if record.candidate_at or record.decision:
+            # A candidate already with the dispatcher, or a stored decision, is
+            # withdrawn: the dispatcher must not see or act on the author's
+            # (editable) text. After re-trust it goes through triage anew.
+            fields.update(_CLEAR_TRIAGE)
+        return fields
+    if not marked:
+        return {}
+    kept = tuple(t for t in record.handled_types if t != UNTRUSTED_MARKER)
+    if record.session_name:
+        # It had a session before the author was de-trusted: keep its history.
+        return {"handled_types": kept}
+    # The author is trusted now: the item follows its rule like a new one.
+    # While untrusted it was only ever notified, so nothing else is lost.
+    return {"handled_types": (), "handled_at": None, "last_comment_handled_at": None,
+            "outcome": None, "last_notified_state": None}
+
+
+def _apply_author_gate(ctx: _Ctx, task: Task, record: TaskRecord | None) -> TaskRecord | None:
+    if record is None:
+        return None
+    fields = _author_gate_fields(task, record)
+    if not fields:
+        return record
+    if ctx.dry_run:
+        return replace(record, **fields)
+    return ctx.store.update(task.source, task.task_id, **fields)
+
+
 def _handle_task(ctx: _Ctx, task: Task) -> None:
     mapped = _mapped_project(ctx, task)
     if mapped is None:
@@ -384,6 +496,7 @@ def _handle_task(ctx: _Ctx, task: Task) -> None:
     record = ctx.store.get(task.source, task.task_id)
     if not ctx.dry_run:
         record = ctx.store.observe(task, project_id=project_id, now=ctx.stamp)
+    record = _apply_author_gate(ctx, task, record)
     type_ = classify.classify(task, record, rules=ctx.dispatch["rules"])
     action = settings.type_action(ctx.dispatch, type_)
     if action == "spawn":
@@ -392,6 +505,11 @@ def _handle_task(ctx: _Ctx, task: Task) -> None:
             patterns, _repo_id(ctx, project["repo"])
         ):
             action = "notify"
+    # The author gate sits before _triage on purpose: an item from an author
+    # outside the allowlist must never reach the dispatcher, a spawn, a resume
+    # or a bus message, whatever decision its record holds.
+    if action == "spawn" and not task.spawn_allowed:
+        action = "notify"
     if type_ == classify.TYPE_IGNORE or action == settings.TYPE_IGNORE:
         ctx.report.decisions.append(_decision(ctx, task, type_, "ignore", "ignored"))
     elif action == "notify":
@@ -511,7 +629,7 @@ def _send_candidate(
 def _handle_unmapped(ctx: _Ctx, task: Task) -> None:
     """A task of a project without a mapping: only an offered candidate, and only
     for sources that list repo patterns. Otherwise it is dropped, as before."""
-    if not settings.unmapped_repos(ctx.dispatch, task.source):
+    if not task.spawn_allowed or not settings.unmapped_repos(ctx.dispatch, task.source):
         return
     record = ctx.store.get(task.source, task.task_id)
     type_ = classify.classify(task, record, rules=ctx.dispatch["rules"])
@@ -571,12 +689,20 @@ def _notify_only(
     if ctx.dry_run:
         return _decision(ctx, task, type_, "notify", "would_notify")
     wanted = "notify" in ctx.dispatch["notify_on"]
+    reason = None
+    if wanted and _untrusted_capped(ctx, task):
+        # Recorded without an alert; one summary per source says how many.
+        ctx.untrusted_held[task.source] = ctx.untrusted_held.get(task.source, 0) + 1
+        wanted = False
+        reason = "alert held back: untrusted-author alert cap reached"
     if wanted and not _notify(
         ctx, Notification(None, f"{type_} (notify-only)", task.title, task.url)
     ):
         # Nothing recorded: the task stays unhandled and the next run retries.
         return _decision(ctx, task, type_, "notify", "failed",
                          reason="no notifier delivered; will retry")
+    if wanted and not task.spawn_allowed:
+        ctx.untrusted_alerts[task.source] = ctx.untrusted_alerts.get(task.source, 0) + 1
     fields: dict[str, Any] = {}
     if not (record and record.session_name and record.outcome in _WATCHED_OUTCOMES):
         # A tracked session keeps its outcome so its later transitions still notify.
@@ -584,9 +710,51 @@ def _notify_only(
     ctx.store.update(
         task.source, task.task_id, type=type_, handled_types=_with_type(record, type_),
         repo=project["repo"], handled_at=ctx.stamp,
-        last_comment_handled_at=task.newest_comment_at, **fields,
+        last_comment_handled_at=_comment_mark(task, record), **fields,
     )
-    return _decision(ctx, task, type_, "notify", "notified")
+    return _decision(ctx, task, type_, "notify", "notified", reason=reason)
+
+
+def _comment_mark(task: Task, record: TaskRecord | None) -> str | None:
+    """The comment stamp to store after a notice. An untrusted item's source
+    gives no comment stamp, so the record keeps the one a trusted run handled;
+    otherwise a re-trust would replay an already handled comment."""
+    if task.spawn_allowed:
+        return task.newest_comment_at
+    return record.last_comment_handled_at if record else None
+
+
+def _untrusted_cap(ctx: _Ctx, source: str) -> int | None:
+    if source not in ctx.dispatch["sources"]:
+        return None
+    cap = settings.source_settings(ctx.dispatch, source).get("max_untrusted_alerts_per_run")
+    return cap if isinstance(cap, int) and not isinstance(cap, bool) else None
+
+
+def _untrusted_capped(ctx: _Ctx, task: Task) -> bool:
+    """True when this untrusted item's alert would pass the source's per-run
+    cap, so strangers opening items cannot flood the owner."""
+    if task.spawn_allowed:
+        return False
+    cap = _untrusted_cap(ctx, task.source)
+    return cap is not None and ctx.untrusted_alerts.get(task.source, 0) >= cap
+
+
+def _report_held_alerts(ctx: _Ctx, source: str) -> None:
+    """One summary alert for the untrusted items recorded without an alert.
+    A count only: no title, since the titles are the strangers' text."""
+    held = ctx.untrusted_held.pop(source, 0)
+    if not held or ctx.dry_run:
+        return
+    summary = Notification(
+        None, "untrusted-author alerts held back",
+        f"{held} more item(s) from untrusted authors on source {source}; "
+        "see dispatch status", "-",
+    )
+    if not _notify(ctx, summary):
+        ctx.report.errors.append(
+            f"{source}: summary of {held} held-back untrusted-author alert(s) not delivered"
+        )
 
 
 def _running(ctx: _Ctx) -> int:
@@ -714,6 +882,13 @@ def _overlap(ctx: _Ctx, task: Task, project_id: str) -> str:
         r for r in ctx.store.list_tasks()
         if r.source == task.source and r.project_id == project_id
         and r.task_id != task.task_id and (r.handled_at or r.outcome == OUTCOME_SPAWNED)
+        and not (is_untrusted(r.handled_types) and not r.session_name)
+    ]
+    # A session of an item whose author is untrusted now (de-trusted after the
+    # spawn) is listed, but its title, which the author can still edit, is not.
+    others = [
+        replace(r, title=UNTRUSTED_TITLE) if is_untrusted(r.handled_types) else r
+        for r in others
     ]
     others.sort(
         key=lambda r: (r.last_spawned_at or r.handled_at or "", r.task_id), reverse=True
@@ -1085,8 +1260,10 @@ def _fetch_all(ctx: _Ctx, sources: Sequence[TaskSource], today) -> None:
             continue
         if schedule is not None and not ctx.dry_run:
             ctx.store.save_source_state(source.name, now=ctx.stamp, last_run_at=ctx.stamp)
+        ctx.report.errors.extend(str(line) for line in getattr(source, "errors", ()))
         for task in tasks:
             _handle_task(ctx, task)
+        _report_held_alerts(ctx, source.name)
 
 
 def _client_available(cfg: Mapping) -> Callable[[str], bool]:
@@ -1215,4 +1392,6 @@ def _execute(
         _transitions(ctx)
         _cleanup(ctx)
         _fetch_all(ctx, sources, ctx.local.date())
+    if ctx.dispatch["window_cleanup"]["enabled"]:
+        _close_windows(ctx, collect)
     return queued

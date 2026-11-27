@@ -307,3 +307,39 @@ def test_server_without_any_identity_exits(bus_paths, storage, monkeypatch, tmp_
     with pytest.raises(SystemExit) as exc_info:
         build_server(storage=storage)
     assert exc_info.value.code == 2
+
+
+def _claude_session(storage, fake_procs, monkeypatch, bridge_id):
+    from agent_bus.server import build_server
+
+    monkeypatch.setenv("AGENT_BUS_NAME", "shared/claude")
+    monkeypatch.setenv("AGENT_BUS_REPO", SHARED_REPO)
+    if bridge_id is None:
+        monkeypatch.delenv("CLAUDE_CODE_BRIDGE_SESSION_ID", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CODE_BRIDGE_SESSION_ID", bridge_id)
+    return build_server(storage=storage, **_session(fake_procs))
+
+
+def test_session_with_a_bridge_id_carries_its_remote_link(
+    bus_paths, storage, fake_procs, monkeypatch
+):
+    mcp = _claude_session(storage, fake_procs, monkeypatch, "example-bridge-id")
+    own = {"label": "Remote Control", "url": "https://claude.ai/code/example-bridge-id"}
+    assert storage.get_agent("shared/claude-1").link_list == [own]
+
+    one = {"label": "PR", "url": "https://example.com/pr/1"}
+    out = _call(mcp, "set_session", {"links": [one]})
+    assert out["links"] == [own, one]
+    assert _call(mcp, "set_session", {"links": []})["links"] == [own]
+    assert _call(mcp, "set_session", {"topic": "x"})["links"] == [own]
+
+
+def test_session_without_a_bridge_id_behaves_as_before(
+    bus_paths, storage, fake_procs, monkeypatch
+):
+    mcp = _claude_session(storage, fake_procs, monkeypatch, None)
+    assert storage.get_agent("shared/claude-1").link_list == []
+    one = {"label": "PR", "url": "https://example.com/pr/1"}
+    assert _call(mcp, "set_session", {"links": [one]})["links"] == [one]
+    assert _call(mcp, "set_session", {"links": []})["links"] == []

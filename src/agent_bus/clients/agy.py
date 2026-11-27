@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Mapping
 
@@ -132,7 +133,8 @@ class AgyWiring:
         "agy loads a repo's .agents/ plugins only for a workspace it trusts; "
         "a spawned worktree is a new folder, so it is trusted only with the "
         "opt-in spawn.clients.agy.worktree_trust option, which copies the "
-        "clone's trust over.",
+        "clone's trust over. agy also ignores plugin files that are "
+        "symlinks, so spawn gives a worktree real copies of them.",
         "An idle agy session can be woken by mail once its agent has run "
         "`agent-bus wake-register`, which it is asked to do when the session "
         "starts. agy asks you to allow that command: allow it always, and it "
@@ -185,10 +187,56 @@ class AgyWiring:
         self, clone: Path, worktree: Path, *, name: str, bin_path: str,
         dry_run: bool = False, options: Mapping | None = None,
     ) -> WorktreePrep:
-        """Opt-in: trust a worktree in agy when its clone is trusted there.
+        """Make the plugin load in a worktree, and (opt-in) trust the worktree.
+
+        agy ignores a workspace plugin whose files are symlinks (checked with
+        agy 1.5.18: the same files as real files load, as links they do not,
+        and `agy plugin validate` accepts both), so the links spawn made to
+        the clone's files are replaced by copies. The copy names the clone,
+        as the clone's file does: the session's repo stays the clone.
 
         `options["worktree_trust"]` names agy's settings file and the key
         holding its list of trusted folders; only that list is appended to."""
+        prep = self._copy_plugin_files(clone, worktree, dry_run=dry_run)
+        trusted = self._trust_worktree(clone, worktree, dry_run=dry_run, options=options)
+        return WorktreePrep(
+            [*prep.notes, *trusted.notes], [*prep.written, *trusted.written],
+            [*prep.covered, *trusted.covered],
+        )
+
+    def _copy_plugin_files(self, clone: Path, worktree: Path, *, dry_run: bool) -> WorktreePrep:
+        notes: list[str] = []
+        written: list[Path] = []
+        covered: list[Path] = []
+        for source in self.files(clone):
+            rel = source.relative_to(clone)
+            dest = worktree / rel
+            if not source.is_file():
+                continue
+            if not dest.is_symlink() and dest.exists():
+                # a file the repo tracks: left alone, and only called covered when
+                # it is the same wiring
+                if dest.is_file() and dest.read_bytes() == source.read_bytes():
+                    covered.append(rel)
+                continue
+            if dry_run:
+                notes.append(f"would copy {rel} into {worktree} as a real file (agy ignores links)")
+                covered.append(rel)
+                continue
+            if not dest.parent.resolve().is_relative_to(worktree.resolve()):
+                notes.append(f"not writing {dest}: its folder resolves outside the worktree")
+                continue
+            if dest.is_symlink():
+                dest.unlink()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, dest)
+            written.append(rel)
+            covered.append(rel)
+        return WorktreePrep(notes, written, covered)
+
+    def _trust_worktree(
+        self, clone: Path, worktree: Path, *, dry_run: bool, options: Mapping | None,
+    ) -> WorktreePrep:
         trust = (options or {}).get("worktree_trust") or {}
         if not trust.get("enabled"):
             return WorktreePrep()

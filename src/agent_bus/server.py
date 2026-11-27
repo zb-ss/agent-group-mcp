@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import os
 import signal
+import sqlite3
 import sys
 from dataclasses import dataclass, field
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import audit, clients, identity, links as links_mod, procs, resolution, settings
+from . import audit, clients, identity, links as links_mod, procs, resolution, session_link, settings
 from .procs import Proc
 from .sessions import SessionError, SessionRegistry
 from .storage import KIND_SESSION, REPORTED_STATES, Storage
@@ -44,6 +45,8 @@ class Me:
     warnings: list[str] = field(default_factory=list)
     # Secret of a bus role (see authority.py); only ever passed to the store.
     authority_token: str | None = field(default=None, repr=False)
+    # This session's own remote URL (see session_link.py), kept on its links.
+    session_link: dict[str, str] | None = None
 
     @property
     def holds_session(self) -> bool:
@@ -157,11 +160,24 @@ def _start(store, name, repo_path, client, process, lineage, env, token) -> Me:
         pinned=parsed.handle,
         spawn_token=env.get(SPAWN_TOKEN_ENV) or None,
     )
-    return Me(
+    me = Me(
         claim.name, who.repo_path, registry=registry, process=process,
         client_address=address, session_key=key, pinned=parsed.handle is not None,
         warnings=warnings + claim.warnings,
     )
+    me.session_link = session_link.for_client(parsed.client, env)
+    _keep_session_link(store, me)
+    return me
+
+
+def _keep_session_link(store: Storage, me: Me) -> None:
+    """Best-effort, like the hooks: a failure must not stop the server."""
+    if me.session_link is None:
+        return
+    try:
+        session_link.ensure(store, me.name, me.session_link)
+    except sqlite3.Error as e:
+        sys.stderr.write(f"agent-bus: could not record this session's remote link: {e}\n")
 
 
 def _bind_thread(me: Me, ctx: Context) -> None:
@@ -403,7 +419,7 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
         the session is: `working`, `waiting` (it needs a human) or `done`
         (the task it was given is finished). The hooks report `working` and
         `waiting` on their own, so an agent normally only reports `done`.
-        `links` is a list of objects {"label": "...", "url": "https://..."} (http or https only, at most 8): things the owner should be able to open from an alert, such as a pull request, an artifact, a handoff or this session's remote URL. It replaces the previous list; an empty list clears it.
+        `links` is a list of objects {"label": "...", "url": "https://..."} (http or https only, at most 8): things the owner should be able to open from an alert, such as a pull request, an artifact, a handoff or this session's remote URL. It replaces the previous list; an empty list clears it. The session's own remote link, when its client exposes one, is kept automatically.
         Returns {"name", "client_address", "topic", "state", "links"}.
         """
         touch(ctx)
@@ -433,6 +449,7 @@ def build_mcp(me: Me, store: Storage) -> FastMCP:
             store.set_topic(me.name, topic.strip()[:MAX_TOPIC_LEN] or None)
         if links is not None:
             store.set_links(me.name, normalized or None)
+            _keep_session_link(store, me)
         if wanted is not None:
             store.set_state(me.name, wanted)
         store.touch_agent(me.name)

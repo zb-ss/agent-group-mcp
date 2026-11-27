@@ -693,12 +693,17 @@ def cmd_status(args: argparse.Namespace) -> int:
         hide_done_after_seconds=cfg["status"]["hide_done_after_seconds"],
     )
     if args.json:
-        sys.stdout.write(json.dumps([r.to_dict() for r in rows], indent=2) + "\n")
+        clients = cfg["spawn"]["clients"]
+        out = [
+            {**r.to_dict(), "resume": None if r.live else status.resume_line(r, clients)}
+            for r in rows
+        ]
+        sys.stdout.write(json.dumps(out, indent=2) + "\n")
         return 0
     if not rows:
         sys.stdout.write("(no sessions running)\n")
         return 0
-    for line in status.fragments(rows):
+    for line in status.fragments(rows, cfg["spawn"]["clients"]):
         _emit(line)
     return 0
 
@@ -1012,6 +1017,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     from .dispatch import cli as dispatch_cli
     dispatch_cli.register(sub)
+    from .dispatch import quota_cli
+    quota_cli.register(sub)
 
     # optional serve helper (so `agent-bus serve` works besides python -m)
     s = sub.add_parser(

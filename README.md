@@ -29,7 +29,8 @@ each with an inbox of its own.
   Codex, Antigravity CLI or opencode session in a repo (its clone, a fresh
   worktree, or a new clone) in a tmux window, with a model, a first prompt
   and Remote Control where the client has it. `agent-bus status` shows every
-  session's state (working, waiting for you, done) and how to reopen it.
+  session's state (working, waiting for you, done), its links (Remote
+  Control first) and how to reopen it.
   See [Spawning sessions](#spawning-sessions-agent-bus-spawn) and
   [Session status](#session-status-agent-bus-status).
 - **Optional dispatch, off until you enable it.** `agent-bus dispatch` runs
@@ -451,8 +452,9 @@ agent-bus tail --json | jq '.[] | select(.op=="send")'
 Task dispatch has its own commands, described in
 [Dispatching tasks](#dispatching-tasks-agent-bus-dispatch):
 `dispatch run`, `dispatch status`, `dispatch approve`, `dispatch candidates`,
-`dispatch decide`, `dispatch drafts`, `dispatch decisions`, `dispatch install-timer` and
-`dispatch uninstall-timer`. The always-on dispatcher session has
+`dispatch decide`, `dispatch drafts`, `dispatch decisions`, `dispatch github`,
+`dispatch install-timer` and `dispatch uninstall-timer`. `agent-bus quota
+record|show` feeds and shows quota-aware routing. The always-on dispatcher session has
 `dispatcher start|stop|status`, and `agent-bus resume` reopens an ended
 spawned session.
 
@@ -1094,23 +1096,25 @@ stops `spawn` with an error naming it; `status` warns and carries on.
     "tmux_session": "agents",
     "tmux_timeout_seconds": 10,
     "after_exit": "exec $SHELL -l",
-    "strip_env": ["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_CHILD_NOTES_DIR", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT", "CLAUDE_PLUGIN_DATA"],
+    "strip_env": ["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_CHILD_NOTES_DIR", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT", "CLAUDE_PLUGIN_DATA", "CLAUDE_CODE_BRIDGE_SESSION_ID"],
     "worktree_root": null,
     "carry_over": [],
     "clients": {
       "claude": {"command": ["claude", "-n", "{name}", "--permission-mode", "auto"], "model": ["--model", "{model}"], "remote": ["--remote-control", "{name}"], "prompt": ["{prompt}"],
         "resume": ["claude", "--resume", "{label}"],
         "resume_prompt": ["claude", "--resume", "{session_id}", "--permission-mode", "auto"],
+        "session_link": {"env": "CLAUDE_CODE_BRIDGE_SESSION_ID", "url": "https://claude.ai/code/{id}", "label": "Remote Control"},
+        "idle_prompt": {"pattern": "^(\\x1b\\[[0-9;]*m)*\u276f\\s*(\\x1b\\[2m[^\\n]*)?$", "tail_lines": 8, "escapes": true},
         "transcripts": "~/.claude/projects/{work_dir_key}/*.jsonl",
         "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
       "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "resume": ["codex", "resume"], "worktree_links": [],
-        "resume_prompt": null, "transcripts": null,
+        "resume_prompt": null, "transcripts": null, "session_link": null, "idle_prompt": null,
         "user_wired": ["-c", "mcp_servers.agent-bus.env_vars=[\"AGENT_BUS_SESSION\", \"AGENT_BUS_SPAWN_TOKEN\", \"AGENT_BUS_AUTHORITY_TOKEN\", \"AGENT_BUS_REPO\", \"AGENT_BUS_DB\", \"AGENT_BUS_AUDIT_LOG\"]"]},
       "agy": {"command": ["agy", "--mode", "auto", "--add-dir", "{dir}"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": [],
-        "resume_prompt": null, "transcripts": null,
+        "resume_prompt": null, "transcripts": null, "session_link": null, "idle_prompt": null,
         "worktree_trust": {"enabled": false, "file": "~/.gemini/antigravity-cli/settings.json", "key": "trustedWorkspaces"}},
-      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "prompt_delivery": "paste", "prompt_ready_seconds": 6, "resume": null, "worktree_links": [],
-        "resume_prompt": null, "transcripts": null,
+      "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "prompt_delivery": "paste", "prompt_ready_seconds": 6, "process_name": null, "resume": null, "worktree_links": [],
+        "resume_prompt": null, "transcripts": null, "session_link": null, "idle_prompt": null,
         "model_env": {"OPENCODE_CONFIG_CONTENT": {"model": "{model}"}}}
     }
   },
@@ -1121,6 +1125,7 @@ stops `spawn` with an error naming it; `status` warns and carries on.
     "resume_max_transcript_mb": 20,
     "bus_sender": "dispatch",
     "worktree_cleanup": {"enabled": true},
+    "window_cleanup": {"enabled": false, "idle_minutes": 240, "max_per_run": 5},
     "working_hours": {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "19:00"},
     "label": {"template": "t{gid_suffix}-{slug}", "gid_suffix_length": 8},
     "handoff_channel": "{label}",
@@ -1135,10 +1140,13 @@ stops `spawn` with an error naming it; `status` warns and carries on.
     "notify_on": ["waiting", "done", "ended", "spawn_failed", "notify", "needs_approval", "worktree_removed", "message", "draft_ready", "needs_owner", "incident_opened", "incident_closed", "incident_report"],
     "dispatcher": {"client": "claude", "model": null, "label": "dispatcher", "group": "dispatcher", "dir": null, "playbook": "dispatcher", "remote": true, "keep_alive": false},
     "triage": {"enabled": true, "fallback_after_minutes": 60},
-    "routing": {"enabled": false, "clients": {"claude": {"weight": 3, "types": {}, "per_complexity": 1, "models": []}, "codex": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}, "agy": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}}, "complexity": {"max": 5, "signals": []}, "overrides": []},
+    "routing": {"enabled": false, "clients": {"claude": {"weight": 3, "types": {}, "per_complexity": 1, "models": []}, "codex": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}, "agy": {"weight": 2, "types": {}, "per_complexity": 0, "models": []}}, "complexity": {"max": 5, "signals": []}, "overrides": [],
+      "quota": {"enabled": false, "max_age_minutes": 30, "snapshot_dir": null, "record_min_interval_seconds": 20, "weight": 0.5, "min_remaining_percent": 5, "exhausted_factor": 0.0, "reset_soon_minutes": 30, "reset_soon_factor": 0.5,
+        "clients": {"claude": {"reader": "snapshot"}, "codex": {"reader": "codex_sessions", "sessions_dir": "~/.codex/sessions", "max_days": 2, "max_files": 5, "max_tail_bytes": 262144}}}},
     "decision_model": {"enabled": false, "mode": "shadow", "endpoint": "http://localhost:11434/v1/systemone", "allow_remote": false, "model": null, "timeout_seconds": 20, "max_state_chars": 2000},
     "defaults": {"client": "claude", "model": null, "worktree": null, "fetch": false, "clone": false, "remote": true},
     "types": {
+      "notice": {"action": "notify"},
       "refinement": {"action": "spawn", "playbook": "refinement"},
       "follow-up": {"action": "spawn", "playbook": "follow-up", "resume_playbook": "follow-up-resume"},
       "implementation": {"action": "spawn", "playbook": "implementation", "repos": []}
@@ -1154,12 +1162,15 @@ stops `spawn` with an error naming it; `status` warns and carries on.
         "schedule": {"interval_minutes": 15, "hours": "working"},
         "mentions": {"enabled": true, "action": "draft", "use_search": true, "search_query": "<@{owner_id}>", "include_direct_messages": false, "conversation_types": ["public_channel", "private_channel", "mpim", "im"], "exclude_channels": [], "conversations_refresh_minutes": 720},
         "channels": {}},
+      "github": {"type": "github", "enabled": false, "base_url": "https://api.github.com", "web_base_url": "https://github.com", "api_version": "2022-11-28", "accept": "application/vnd.github+json", "user_agent": "agent-bus-dispatch", "token_env": "AGENT_BUS_GITHUB_TOKEN", "timeout_seconds": 30, "max_retry_wait_seconds": 30, "page_size": 100, "max_pages": 3, "max_calls_per_run": 60, "max_untrusted_alerts_per_run": 3, "state": "open", "updated_within_days": 30, "comment_lookback_days": 14, "owner_login": null, "ignore_own_comments": true, "trusted_authors": [], "failing_conclusions": ["failure", "timed_out"],
+        "schedule": {"interval_minutes": 15, "hours": "working"}, "projects": {}, "rules": []},
       "maildir": {"type": "maildir", "enabled": false, "root": null, "folders": ["INBOX"], "drafts_folder": "Drafts", "address": null, "skip_bulk": true, "initial_lookback_minutes": 0, "max_items_per_run": 50, "max_body_chars": 4000, "link_template": null,
         "schedule": {"interval_minutes": 15, "hours": "working"}, "default_action": "draft", "rules": []}
     },
     "notifiers": {
       "log": {"file": null},
       "macos": {"enabled": true, "osascript_bin": "osascript", "title": "agent-bus", "timeout_seconds": 10},
+      "linux": {"enabled": true, "notify_send_bin": "notify-send", "title": "agent-bus", "timeout_seconds": 10},
       "email": {"enabled": false, "host": null, "port": 465, "security": "tls", "username": null, "password_env": null, "from": null, "to": [], "subject_prefix": "[agent-bus]", "timeout_seconds": 30}
     },
     "timer": {"name": "agent-bus-dispatch", "interval_minutes": 15, "command": ["{agent_bus_bin}", "dispatch", "run"], "environment": {}, "output_file": null, "launchctl_bin": "launchctl", "systemctl_bin": "systemctl", "timeout_seconds": 30, "always": false},
@@ -1207,7 +1218,20 @@ stops `spawn` with an error naming it; `status` warns and carries on.
 - `spawn.strip_env` lists variables removed from the launched client and
   from the tmux session, so a spawned client does not think it is a child
   of the session that started it (the tmux server keeps the environment of
-  whoever started it).
+  whoever started it). The list includes `CLAUDE_CODE_BRIDGE_SESSION_ID`, so
+  a spawned session never inherits its parent's Remote Control id.
+- `spawn.clients.<client>.session_link` (`{env, url, label}`) gives a session
+  its own Remote Control URL as a link. Claude Code sets the variable named
+  by `env` (`CLAUDE_CODE_BRIDGE_SESSION_ID`) in the environment of a session
+  with Remote Control; the session's agent-bus server builds the link from
+  `url` (`https://claude.ai/code/{id}`: `https` only, a literal host, and
+  exactly one bare `{id}` placeholder in the path or query) and `label` (`Remote Control`) and keeps it first among the
+  session's links, so `agent-bus status` (a `label: url` line under the
+  session, and the `links` key of `--json`), `dispatch status` and the alerts link straight to it from a phone. It survives a later
+  `set_session(links=[...])`. Nothing is added when the variable is unset or
+  empty, when `session_link` is `null` (the default of every other client;
+  set one for a client that exposes a similar id), or when the value holds
+  anything but letters, digits, dashes and underscores.
 - `spawn.worktree_root` is `null` by default: worktrees go to
   `<clone>/.worktrees/<label>` (see `--worktree`). A path puts them under
   `<root>/<group>/<label>` instead.
@@ -1244,7 +1268,10 @@ stops `spawn` with an error naming it; `status` warns and carries on.
   opencode starts without a prompt, spawn waits `prompt_ready_seconds`
   (6 by default) and pastes the prompt file into the window (`tmux
   load-buffer`, `paste-buffer`, Enter), so the prompt still never travels in
-  an argument and the model applies. If the paste fails the session stays
+  an argument and the model applies. A client that runs under another
+  process name than its command's basename (a launcher script) sets
+  `process_name` (at most 15 characters, no slash) for the check that the
+  paste reaches the client and not a shell; the check cannot be skipped. If the paste fails the session stays
   open and the result carries a note. `"prompt_delivery": "argv"` (the
   default for every other client) passes the `prompt` fragment on the
   command line.
@@ -1252,10 +1279,18 @@ stops `spawn` with an error naming it; `status` warns and carries on.
   folder as a workspace; without it agy loaded no workspace plugin, so the
   agent-bus tools were missing and the session stayed `starting`
   (agy 1.5.17).
-  Checked with agy 1.5.17: a session started in the clone itself joins the
-  bus; agy asks once per conversation before it calls an agent-bus tool
-  unless you allow those tools in its settings. A session started in a
-  worktree still does not load the agent-bus server, so it stays `starting`.
+  Checked with agy 1.5.17 and 1.5.18: a session started in the clone itself
+  joins the bus; agy asks once per conversation before it calls an agent-bus
+  tool unless you allow those tools in its settings. A worktree session used
+  to stay `starting`. The cause: agy does not load a workspace plugin whose
+  files are symlinks (`agy plugin validate` accepts both forms, and the same
+  files as real files load; tried and ruled out as the cause: folder trust,
+  `--add-dir`, the repo path in `mcp_config.json`). Spawn links the plugin
+  files into a worktree like every other wiring file, so for agy it then
+  replaces those links with real copies of the clone's files (byte for byte,
+  still naming the clone, kept out of `git status` through
+  `.git/info/exclude`); the worktree session now joins the bus. A plugin file
+  the repo itself tracks is left as it is. Dry runs copy nothing.
 - `spawn.clients.agy.worktree_trust` (`enabled` false by default, `file`,
   `key`) carries folder trust over to worktrees for Antigravity CLI. It acts
   only when the clone is already listed under `key` in that JSON file; the
@@ -1318,6 +1353,10 @@ running server, state `done`) once their last report is older than
 `--all` shows both; nothing is deleted from the database. With nothing to
 show it prints `(no sessions running)`.
 
+Under each session, one indented `label: url` line per link the session
+attached (the Remote Control link first). Labels are flattened to one line
+and only `http` and `https` links are shown.
+
 Sessions report their state over the bus; nothing is read from terminal
 panes.
 
@@ -1343,15 +1382,24 @@ process or session id) keeps the state it reported, `done` included; the
 `agent-bus status --json` emits one object per session with the keys
 `name`, `group`, `client`, `label`, `state`, `reported_state`, `state_at`,
 `live`, `spawned`, `last_seen`, `topic`, `pending_count`, `repo_path`,
-`repo_id`, `work_dir`, `tmux_session`, `tmux_window`, `model` and
-`remote`.
+`repo_id`, `work_dir`, `tmux_session`, `tmux_window`, `model`, `remote`,
+`links` and `resume`.
+
+Under a spawned session that is no longer live, `agent-bus status` prints
+the line that reopens it (`resume: cd <folder> && claude --resume <label>`,
+from the client's `spawn.clients.<client>.resume`), the same one `dispatch
+status` prints; `--json` carries it as `resume` (`null` for a live session or
+a client without a `resume` template). It stays there after a window was
+closed by the cleanup below.
 
 ---
 
 ## Dispatching tasks (`agent-bus dispatch`)
 
-`agent-bus dispatch run` reads your tasks from a task source (first source:
-Asana), classifies each task with fixed rules from `config.json`, and
+`agent-bus dispatch run` reads your tasks from a task source (Asana, or the
+issues and pull requests of GitHub repositories, see
+[GitHub issues and pull requests](#github-issues-and-pull-requests)),
+classifies each task with fixed rules from `config.json`, and
 either starts a session for it with `agent-bus spawn` or only notifies you.
 It is meant to run from a timer, and it is off until you enable a source.
 Beside task sources it can read message sources (Slack, a local Maildir),
@@ -1398,8 +1446,13 @@ agent-bus dispatch drafts edit <id> --file FILE
 agent-bus dispatch drafts approve <id> [--yes]
 agent-bus dispatch drafts discard <id>
 agent-bus dispatch decisions [--json] [--event EVENT] [--limit N]
+agent-bus dispatch github add OWNER/REPO [--source NAME] [--repo REPO]
+agent-bus dispatch github remove OWNER/REPO [--source NAME]
+agent-bus dispatch github list [--source NAME] [--json]
 agent-bus dispatch install-timer [--load] [--bin-path PATH]
 agent-bus dispatch uninstall-timer [--unload] [--bin-path PATH]
+agent-bus quota show [--json]
+agent-bus quota record [--client C]
 ```
 
 `run --dry-run` prints one decision per mapped task (type, action, result,
@@ -1445,7 +1498,7 @@ over the file.
 
 ### Configuration reference
 
-All keys sit under `dispatch` and deep-merge over the shipped defaults.
+All keys sit under `dispatch` (unless written with another prefix, such as `spawn.`) and deep-merge over the shipped defaults.
 Lists replace on merge, so a custom `rules` replaces the shipped list.
 An invalid value makes the config fail to load, naming the dotted key.
 
@@ -1457,6 +1510,8 @@ An invalid value makes the config fail to load, naming the dotted key.
 | `resume_max_transcript_mb` | A follow-up resumes an ended session only when its transcript is at most this many MB (`20`) |
 | `bus_sender` | Sender name of the bus messages dispatch sends to live sessions (`dispatch`) |
 | `worktree_cleanup.enabled` | Remove merged dispatched worktrees (`true`) |
+| `window_cleanup.enabled` | Close the tmux window of a long-finished dispatched session (`false`); see *Closing finished windows* |
+| `window_cleanup.idle_minutes` / `max_per_run` | Minutes a session must have been `done` before its window may close, and windows closed per run (`240`, `5`) |
 | `working_hours.days` / `start` / `end` | Days and local time window in which runs act (`mon`-`fri`, `09:00`-`19:00`) |
 | `label.template` | Session label template (`t{gid_suffix}-{slug}`) |
 | `label.gid_suffix_length` | Characters of the task id used for `{gid_suffix}` (`8`) |
@@ -1483,6 +1538,15 @@ An invalid value makes the config fail to load, naming the dotted key.
 | `routing.clients.<client>.weight` / `types` / `per_complexity` / `models` | Score parts of a client (`claude` 3/`{}`/1/`[]`, `codex` 2/`{}`/0/`[]`, `agy` 2/`{}`/0/`[]`); see *Routing* |
 | `routing.complexity.max` / `signals` | Highest complexity level and the signals that add to it (`5`, `[]`) |
 | `routing.overrides` | Ordered owner overrides by repo and type (`[]`) |
+| `routing.quota.enabled` | Weigh each client's score by its remaining subscription quota (`false`); see *Quota* |
+| `routing.quota.max_age_minutes` | A reading older than this counts as no data, except an exhausted window with a known reset time, which counts until it resets (`30`) |
+| `routing.quota.snapshot_dir` | Folder of the recorded Claude Code snapshot (`null`: `quota` beside the database) |
+| `routing.quota.record_min_interval_seconds` | `quota record` rewrites a snapshot at most this often (`20`) |
+| `routing.quota.weight` | How strongly used quota lowers the factor, 0 to 1 (`0.5`) |
+| `routing.quota.min_remaining_percent` | Below this remaining percentage a window counts as exhausted (`5`) |
+| `routing.quota.exhausted_factor` / `reset_soon_factor` | Factor of an exhausted window, and of one that resets within `reset_soon_minutes` (`0.0`, `0.5`) |
+| `routing.quota.reset_soon_minutes` | What counts as a near reset (`30`) |
+| `routing.quota.clients.<client>` | Where a client's reading comes from: `reader` `snapshot` (Claude Code) or `codex_sessions` with `sessions_dir` (`~/.codex/sessions`), `max_days` (`2`), `max_files` (`5`), `max_tail_bytes` (`262144`) |
 | `decision_model.enabled` | Ask a local decision model (`false`) |
 | `decision_model.mode` | `shadow` records only, `active` may decide (`shadow`) |
 | `decision_model.endpoint` | Decision model URL (`http://localhost:11434/v1/systemone`) |
@@ -1491,9 +1555,9 @@ An invalid value makes the config fail to load, naming the dotted key.
 | `decision_model.timeout_seconds` | Request timeout (`20`) |
 | `decision_model.max_state_chars` | Cap on the task description sent (`2000`) |
 | `defaults` | Per-project defaults: `client` (`claude`), `model`, `worktree`, `fetch`, `clone`, `remote` |
-| `types.<type>.action` | `spawn`, `notify` or `ignore` per type (`implementation` spawns, but only for repos in its `repos` list) |
+| `types.<type>.action` | `spawn`, `notify` or `ignore` per type (`implementation` spawns, but only for repos in its `repos` list; `notice` only notifies) |
 | `types.<type>.repos` | Repo patterns the type may spawn for, matched against the repo id such as `github.com/example-org/*`; absent or `null`: every mapped repo, `[]`: none (`implementation`: `[]`, the others: absent) |
-| `types.<type>.playbook` | Playbook name for the type (same as the type) |
+| `types.<type>.playbook` | Playbook name for the type (same as the type); only a type whose action is `spawn` needs one |
 | `types.<type>.resume_playbook` | Playbook sent to a live or resumed session instead of spawning (`follow-up-resume` for `follow-up`; none for the others) |
 | `rules` | Ordered classification rules, see below |
 | `sources.asana.enabled` | Turn the source on (`false`) |
@@ -1509,8 +1573,12 @@ An invalid value makes the config fail to load, naming the dotted key.
 | `sources.asana.unmapped_repos` | Repo patterns for tasks of projects not in `projects`; non-empty and a running dispatcher make such tasks candidates (`[]`: they are dropped) |
 | `sources.asana.schedule` | `null` (every run, inside `working_hours`) or `{interval_minutes, hours}`, see *Schedules* (`null`) |
 | `sources.asana.projects` | Project id to repo: a string, or an object with `repo` and optional `client`, `model`, `worktree`, `fetch`, `clone`, `remote`, `playbooks` |
+| `sources.github.*` | The GitHub source: one table in *GitHub issues and pull requests* (`enabled`, `token_env`, `trusted_authors`, `projects`, `rules`, limits and endpoints) |
+| `spawn.clients.<client>.session_link` | `{env, url, label}`: the environment variable that holds a session's own Remote Control id, the `https://` URL template (a literal host and exactly one bare `{id}` in its path or query) and the link label; `null` adds no link (`claude` only) |
+| `spawn.clients.<client>.idle_prompt` | `{pattern, tail_lines, escapes}`: how window cleanup recognises an empty prompt; `null` never closes that client's windows (`claude` only) |
 | `notifiers.log.file` | Log file (`dispatch.log` beside the database) |
 | `notifiers.macos.*` | `enabled`, `osascript_bin`, `title`, `timeout_seconds` |
+| `notifiers.linux.*` | `enabled` (`true`), `notify_send_bin` (`notify-send`), `title`, `timeout_seconds` |
 | `notifiers.email.*` | `enabled` (`false`), `host`, `port` (`465`), `security`, `username`, `password_env`, `from`, `to`, `subject_prefix`, `timeout_seconds` |
 | `timer.name` | Name of the launchd job or systemd unit (`agent-bus-dispatch`) |
 | `timer.interval_minutes` | Minutes between runs (`15`) |
@@ -1543,7 +1611,9 @@ Each type has an action: `spawn` starts a session (a type with a
 *Follow-ups*), `notify` only notifies
 (once per task), `ignore` does nothing. `refinement` and `follow-up` spawn. `implementation` has the action
 `spawn` but its `repos` list is empty by default, so it only notifies until
-you list repos (see *Implementation tasks*).
+you list repos (see *Implementation tasks*). `notice` is a type that only
+notifies; the GitHub source uses it for items you want an alert for and
+nothing more. Only a type whose action is `spawn` needs a playbook.
 A task whose session is live or in an active state is skipped.
 
 The label is built from `label.template` with `{gid}`, `{gid_suffix}`,
@@ -1570,6 +1640,7 @@ private file and passed to `spawn` as `--prompt-file`.
 
 - `log` always writes, to `dispatch.log` beside the database.
 - `macos` runs `osascript` with the text as an argument on macOS and does nothing elsewhere.
+- `linux` runs `notify-send` (`notifiers.linux.notify_send_bin`) on Linux and does nothing elsewhere. It is on by default, and quiet when the binary is not on `PATH` or no desktop session is present (`DISPLAY` and `WAYLAND_DISPLAY` both unset; no error, no alert lost: the log and email notifiers still run), so a headless machine needs no change; set `notifiers.linux.enabled` to `false` to be explicit. A session bus address (`DBUS_SESSION_BUS_ADDRESS`) alone does not count: SSH logins and lingering user services have one without a notification daemon. The desktop check and `notify-send` both use the process environment merged with `dispatch.env_file`. The command is started without a shell, and the task title sits only in the summary argument, after a `--` separator.
 - `email` needs `host`, `from`, `to` and `security`, and `username` and `password_env` together or not at all: `tls` (port 465, implicit TLS) or `starttls` (port 587). The certificate is verified and there is no plaintext fallback: when TLS cannot be established nothing is sent. The password is read from the variable named by `password_env`.
 
 Messages carry only the session name, the state, the task title, the task
@@ -1577,11 +1648,18 @@ link and the links the session attached with `set_session(links=[...])`
 (entries that are not `http` or `https`, or exceed the bounds, are dropped;
 at most 8). The email is multipart: a plain text part with one
 `label: url` line per link, and an HTML part with clickable, escaped
-anchors. The macOS and log notifications stay one line. Each transition (needs review, done, ended without done, spawn
-failed) and each notify-only task is notified once. A notification is
-recorded as sent only when at least one enabled notifier succeeded; when
-none did, it stays pending and the next run retries it (the failure is
-reported on stderr and the run exits 1, without secrets).
+anchors. The macOS, Linux and log notifications stay one line. Each
+transition (needs review, done, ended without done, spawn failed) and each
+notify-only task is notified once. A messaged session that ends without
+answering is reported as ended without done, even when it reported `done`
+on an earlier task.
+
+Desktop notifiers (macOS and Linux) are best-effort. A banner that fails
+prints one `agent-bus: warning:` line on stderr, does not make the run exit
+1 and does not hold the alert back. An alert stays pending, and the next run
+retries it, only when the email notifier is enabled and failed (the failure
+is reported on stderr and the run exits 1, without secrets). With no email
+notifier enabled, the alert counts as sent.
 
 The state database, the log and the prompt files hold task titles and links,
 so dispatch creates them owner-only (files `0600`, directories it creates
@@ -1591,14 +1669,31 @@ keep it in a private directory.
 ### Timer
 
 `install-timer` writes a launchd plist (macOS, in `~/Library/LaunchAgents`)
-or a systemd user service and timer (Linux, in `~/.config/systemd/user`)
-that run `agent-bus dispatch run`, and prints each path it wrote. The
+or a systemd user service and timer (Linux, in `$XDG_CONFIG_HOME/systemd/user`
+when that variable is an absolute path, else `~/.config/systemd/user`;
+`uninstall-timer` looks in the same place) that run
+`agent-bus dispatch run`, and prints each path it wrote. The
 schedule comes from `working_hours` and `timer.interval_minutes` (default:
 Monday to Friday, every 15 minutes, 09:00 to 19:00). Nothing is loaded or
 enabled without `--load`. The `PATH` of the shell that runs `install-timer`
 is written into the unit, so run it from a shell where `tmux` and your
 clients resolve. `uninstall-timer` removes the files and unloads them only
 with `--unload`.
+
+On Linux:
+
+- A systemd user timer runs only while you are logged in. For a machine that
+  must keep dispatching after logout, run `loginctl enable-linger` once;
+  `install-timer` prints that hint.
+- Secrets: the unit holds no `EnvironmentFile=` line. `dispatch run` reads
+  the `chmod 600` file named by `dispatch.env_file` itself and refuses one
+  that others can read. The alternative is a login-shell command, for
+  example `"timer": {"command": ["/bin/bash", "-lc", "exec {agent_bus_bin} dispatch run"]}`,
+  which renders as one quoted argument and reads your shell profile.
+- `$` and `%` in the command are escaped for systemd, so a path that holds
+  them runs as written.
+- With `timer.always` true the unit uses `OnActiveSec` and `OnUnitActiveSec`
+  (every `interval_minutes`, all week) instead of calendar slots.
 
 ### State and limits
 
@@ -1648,6 +1743,29 @@ existing session when it can:
 Only clients with `resume_prompt` and `transcripts` templates can be
 resumed; by default that is Claude Code. A follow-up still needs the task to
 be inside the due window.
+
+#### Closing finished windows
+
+A session that reported `done` leaves its tmux window open (with a login
+shell after the client exits). `dispatch.window_cleanup` can close such
+windows. It is off by default (`enabled: false`); `idle_minutes` (default
+`240`) is how long the session must have been `done`, and `max_per_run`
+(default `5`) caps the windows closed in one run. A run closes a window only
+when every one of these holds, and otherwise keeps it:
+
+- dispatch started the session, it is still live and reports `done`, and it has reported `done` for at least `idle_minutes`;
+- the window is the only one of its name, has a single pane and is not the active window of an attached tmux session;
+- the client has an `idle_prompt` and the last `tail_lines` lines of the pane, above its blank padding (blank rows and rows with only colour codes are skipped first), match its `pattern`, so the client sits at an empty prompt: a prompt that holds unsent input does not match, and neither does a pane that cannot be read;
+- the session did not change state while the check ran.
+
+A session that is waiting, working, starting or running is never touched.
+Only Claude Code ships an `idle_prompt` (`spawn.clients.claude.idle_prompt`);
+Codex, agy and opencode have `null`, so their windows stay until you close
+them (set a pattern of your own, with `escapes` telling whether the capture
+keeps colour codes, to include them). Pane text is only matched, never
+stored or logged. `run --dry-run` closes nothing and reports `would_close`.
+A closed window is logged (`dispatch decisions --event window_closed`); the
+session keeps its row, and both status commands still print its resume line.
 
 #### Worktree cleanup
 
@@ -1821,8 +1939,49 @@ default; the project's static `client` and `model` apply then. With
 4. The static client and model when no client is available.
 
 A resumed or messaged session keeps the client it was started with, even
-when routing would now choose another. `opencode` is not routed to. Quota-
-aware routing is not built yet; the policy has a place for it.
+when routing would now choose another. `opencode` is not routed to.
+
+#### Quota
+
+`routing.quota` weighs the scores of step 3 by how much subscription quota a
+client has left. It is off by default (`routing.quota.enabled`); nothing is
+read and routing is unchanged until you turn it on. It reads only usage
+numbers a client already keeps on this machine, uses no credential and opens
+no connection:
+
+- **Claude Code.** Its status line receives the subscription usage on stdin.
+  Put `agent-bus quota record` in front of your status line command:
+  `agent-bus quota record | <your status line command>`. It writes its input
+  to its output unchanged, then stores a snapshot of the window names, used
+  percentages and reset times (nothing else) in `claude.json` under
+  `routing.quota.snapshot_dir` (default `quota` beside the database; folder
+  `0700`, file `0600`, rewritten at most every
+  `record_min_interval_seconds`). It always exits 0, also on malformed input
+  or an unwritable folder, so it cannot break a status line. If you would
+  rather not have the extra process in the pipe, record in the background
+  from the status line script, for example
+  `printf '%s' "$input" | agent-bus quota record >/dev/null 2>&1 &`, where
+  `$input` is the payload your script already read.
+- **Codex.** The newest `rate_limits` event in its session logs under
+  `routing.quota.clients.codex.sessions_dir` (the newest `max_days` day
+  folders and `max_files` files, the last `max_tail_bytes` of each).
+- **agy and OpenCode** expose no usage locally, so they always count as full
+  quota (factor 1.0).
+
+Each client's score is multiplied by a factor from 0 to 1. A missing or
+malformed file and a window that has already reset give no reduction. A
+reading older than `max_age_minutes` gives no reduction either, except for
+an exhausted window with a known reset time: it still counts until it
+resets. A reading dated more than `max_age_minutes` in the future is
+ignored. For every other window: with at least
+`min_remaining_percent` left the factor is `1 - weight * used/100`; below
+that the window counts as exhausted and the factor is `exhausted_factor`,
+or `reset_soon_factor` when it resets within `reset_soon_minutes`. The
+lowest factor of a client's windows applies. A dispatcher decision and a
+routing override still win over the weighted scores, and the soft limit
+(`dispatch.soft_limit`) holds as before. `agent-bus quota show [--json]`
+prints each client's reader, the age of its reading, its windows and the
+factor.
 
 ### Decision model
 
@@ -1843,6 +2002,175 @@ the model (for example `example-decision-model`).
   The endpoint must be on the local machine unless `allow_remote` is true,
   and a remote endpoint must use `https://`.
 - Review with `agent-bus dispatch decisions --event routing`.
+
+### GitHub issues and pull requests
+
+The `github` source reads the open issues and pull requests of repositories
+you list and turns each into a task, so everything a task can do applies:
+an alert only, a spawned session with a playbook, triage through the
+dispatcher, and a follow-up when someone comments. It uses only the standard
+library and the REST API, with GET requests over `https` and no other
+method. It is off by default (`sources.github.enabled`), and a run with the
+packaged defaults makes no GitHub request.
+
+The token is read from the environment variable named by `token_env`
+(default `AGENT_BUS_GITHUB_TOKEN`), for timer runs from the file named by
+`dispatch.env_file`. It needs read-only access to the watched repositories:
+a fine-grained token with read permission for issues, pull requests and
+checks (and the repository metadata that comes with them). The value goes
+only into the `Authorization` header; it is never written to the config,
+store, log, a prompt, an error line or an alert. Redirects are never
+followed.
+
+Repositories are the keys of `sources.github.projects`, each mapped to a
+local repo the way Asana projects are. Add, remove and list them without
+editing `config.json` by hand:
+
+```bash
+agent-bus dispatch github add example-owner/example-project
+agent-bus dispatch github remove example-owner/example-project
+agent-bus dispatch github list [--json]
+```
+
+`add` writes `projects.<slug>` with `repo` set to `<host>/<slug>` (the host
+of `web_base_url`, so `github.com/example-owner/example-project`), or to
+`--repo`. It changes only your `config.json` (a new file is `0600`, an
+existing one keeps its mode, a symlinked file is written through), validates
+the merged result before it writes, and leaves the file untouched with exit
+1 on an invalid slug or an invalid result. It never enables the source and
+writes no rules. `--source NAME` picks another GitHub source instance (see
+*Message sources* for instances). A watched repository must be mapped, and
+the project entry takes the same options as an Asana project (`client`,
+`model`, `worktree`, `fetch`, `clone`, `remote`, `playbooks`).
+
+```json
+{
+  "dispatch": {
+    "env_file": "~/.claude-agent-bus/dispatch.env",
+    "sources": {
+      "github": {
+        "enabled": true,
+        "trusted_authors": ["example-owner"],
+        "projects": {
+          "example-owner/example-project": {"repo": "github.com/example-owner/example-project", "worktree": "origin/HEAD", "fetch": true}
+        },
+        "rules": [
+          {"name": "review-wanted", "repos": ["example-owner/example-project"], "kind": "pull_request", "review_requested": ["example-owner"], "type": "notice"},
+          {"name": "refine", "repos": ["example-owner/example-project"], "kind": "issue", "labels": ["needs-refinement"], "type": "refinement"},
+          {"name": "new-issue", "repos": ["example-owner/example-project"], "kind": "issue", "type": "notice"}
+        ]
+      }
+    }
+  }
+}
+```
+
+**Rules.** `sources.github.rules` is an ordered list; the first rule that
+matches an item wins, and an item that matches none, or whose rule has the
+type `ignore`, produces no task. All conditions of a rule must hold:
+
+| Rule key | Meaning |
+| --- | --- |
+| `name` | Required, unique in the list; lowercase letters, digits, dashes |
+| `type` | Required: a key of `dispatch.types` (`notice`, `refinement`, `follow-up`, `implementation` or your own) or `ignore` |
+| `repos` | Slugs (`owner/name`) the rule applies to; without it the rule applies to every watched repository |
+| `kind` | `issue` or `pull_request` |
+| `state` | `open` or `closed`: the item's state. The source lists the state set by `sources.github.state` (`open`); a `closed` rule needs `state` `closed` or `all` there |
+| `labels` | Every listed label is on the item (case-insensitive) |
+| `assignee` | Any listed login is among the assignees |
+| `author` | The item's author is one of these logins |
+| `draft` | `true` or `false`: the pull request is a draft or ready (pull requests only) |
+| `review_requested` | A listed login is among the requested reviewers (pull requests only) |
+| `failing_checks` | `true`: a check run of the head commit has a conclusion listed in `failing_conclusions` (`failure`, `timed_out`); `false`: none has (pull requests only; one extra read per head commit) |
+
+Logins compare case-insensitively. The pull request keys are refused together
+with `kind: issue`.
+
+**What a type does.** The rule's type reaches the normal task pipeline:
+
+- `notice` (action `notify`) sends one alert for the item and does nothing else.
+- A spawn type (`refinement`, `implementation`, your own) starts a session with that type's playbook, or with the one named in `projects.<slug>.playbooks` for this repository, under the usual limits and the type's `repos` list. With triage on and a running dispatcher, spawn types go to the dispatcher first, as candidates.
+- A new comment by a trusted author on an item already handled becomes a follow-up through the `dispatch.rules` entry with `new_comment: true` (the shipped `follow-up` rule): it messages the live session, resumes an ended one or starts a new one, as in *Follow-ups*.
+- `dispatch.rules` are tried before the source's rule, so a `title` rule there applies to GitHub items; `section` rules do not, as an item has no section.
+
+**The author gate.** `sources.github.trusted_authors` (empty by default)
+lists the logins whose items may start work. An item whose author is not in
+it only notifies: it never starts, resumes or messages a session, never
+reaches the dispatcher and is never offered as a candidate, even when an
+earlier record holds a start decision. With the default empty list every
+item only notifies until you set it, because on a public repository anyone
+can open an issue. Comments by authors outside the list do not count as new
+comments, and neither do the token owner's own (`ignore_own_comments`, true
+by default; `owner_login` names the owner, otherwise `GET /user` is asked
+once per run).
+
+An item from an untrusted author costs no extra requests: the source reads
+no pull request details, check runs or comments for it, so the conditions
+`draft`, `review_requested` and `failing_checks` never match it (it falls
+through to the next rule) and its new comments are not tracked. The
+comments of a repository are only read when it has at least one item from
+a trusted author.
+
+`max_untrusted_alerts_per_run` (`3`) caps the alerts for items from
+untrusted authors, per source and run, so strangers opening issues cannot
+flood you. Items past the cap are recorded without an alert, and one summary
+alert per source gives how many were held back, without their titles. `0`
+sends only the summary.
+
+A change to `trusted_authors` takes effect on the next run, in both
+directions. When you add an author, their open items without a session are
+handled like new ones, which can mean one more alert per item. When you
+remove one, their items show as `(untrusted author)` in prompts, alerts and
+`dispatch status`, also when a session exists, and they never resume or
+message a session again.
+
+**Untrusted text.** The source reads structured fields only: the title, the
+author, labels, assignees, state, draft and review flags and timestamps. It
+never reads an issue body, comment text or review text. The title is the one
+untrusted string that reaches an alert or a prompt, cleaned like every other
+title (one line, truncated to `title_max_chars`, with the untrusted-data
+markers neutralised). The task link is built from `web_base_url`, the
+validated slug and the issue number, never from text of the API. The spawned
+session reads the item itself and must treat it as data.
+
+**Limits and schedule.** One alert per item and type. `updated_within_days`
+(`30`) and `comment_lookback_days` (`14`) bound what is listed (`0` lifts the
+first). `page_size` and `max_pages` page the lists, `max_calls_per_run`
+(`60`) caps all requests of a run, and a `429` waits `Retry-After` up to
+`max_retry_wait_seconds` and retries once. The call cap is shared evenly
+across the watched repositories, and calls one leaves unused carry over to
+the next. A repository that runs out is reported as `github: owner/name:
+call budget reached`, and the other repositories are still read. A repository that answers an HTTP
+error is reported in the run errors by its slug, and the other repositories
+are still read. `schedule` is as for the other sources (every 15 minutes
+inside working hours by default).
+
+| Key | Meaning (default) |
+| --- | --- |
+| `enabled` | Turn the source on (`false`) |
+| `base_url` / `web_base_url` | API and web base, `https` only (`https://api.github.com`, `https://github.com`) |
+| `api_version` / `accept` / `user_agent` | Request headers (`2022-11-28`, `application/vnd.github+json`, `agent-bus-dispatch`) |
+| `token_env` | Name of the environment variable holding the token (`AGENT_BUS_GITHUB_TOKEN`) |
+| `timeout_seconds` / `max_retry_wait_seconds` | HTTP timeout and longest `Retry-After` wait (`30`, `30`) |
+| `page_size` / `max_pages` / `max_calls_per_run` | Paging (`100`, `3`) and the per-run call cap, shared across repositories (`60`) |
+| `max_untrusted_alerts_per_run` | Alerts for untrusted authors' items per run before the rest are held back in one summary (`3`) |
+| `state` | Which items are listed: `open`, `closed` or `all` (`open`) |
+| `updated_within_days` / `comment_lookback_days` | Age bounds for items and for comments that count (`30`, `14`) |
+| `owner_login` / `ignore_own_comments` | The token owner's login (`null`: asked once per run) and whether their comments are ignored (`true`) |
+| `trusted_authors` | Logins whose items may start work and whose comments count (`[]`) |
+| `failing_conclusions` | Check-run conclusions that count as failing (`["failure", "timed_out"]`) |
+| `schedule` | See *Schedules* (`{"interval_minutes": 15, "hours": "working"}`) |
+| `projects` / `rules` | Watched repositories and the ordered rules (`{}`, `[]`) |
+
+**Working with a task-queue driver.** The source is read-only and agent-bus
+holds no queue of its own. It does not file, read or change the items of a
+separate task-queue driver, such as the autonomous driver of the workflow
+plugin, and it needs no write access to GitHub. To hand an issue over, point
+`projects.<slug>.playbooks` at a private template in `dispatch.templates_dir`
+whose instructions tell the spawned session to run its own workflow command,
+or to file the task in its queue. Such a template must pass the issue text on
+as quoted data, never as raw headings or instructions, and the author gate
+above decides which issues get that far.
 
 ### Message sources
 
@@ -1957,6 +2285,7 @@ messages that mention `owner_id`:
 - Otherwise the source scans the conversations you are a member of (`users.conversations`, filtered by `mentions.conversation_types` and `mentions.exclude_channels`, refreshed every `mentions.conversations_refresh_minutes`) with `conversations.history` since the cursor, and looks at thread replies of messages up to `thread_lookback_hours` old. Threads older than that are not scanned.
 - `mentions.include_direct_messages` (default `false`): when true, a message from someone else in a direct-message conversation with you counts as a mention even without `<@id>`.
 - `mentions.action` is `ignore`, `notify` or `draft` (default `draft`).
+- Scope awareness: when the token's scopes are known (the `x-oauth-scopes` header of `auth.test`) and lack `im:read`, the source drops `im` from `mentions.conversation_types` and ignores `include_direct_messages`, instead of letting `users.conversations` fail with `missing_scope` and stop the mentions source. It reports one warning per source (remembered in the cursor, so not on every run), and only when direct messages would have been read: `include_direct_messages` is true, or the member scan runs (no `search:read`, or `use_search` false) with `im` in `conversation_types`. Without the header nothing changes.
 
 When one member conversation fails during the scan for a reason other than
 membership (a missing scope, `access_denied`, a rate limit after the retry, a
@@ -1965,7 +2294,10 @@ advances those cursors. The failing conversation is checked last on the next
 run, and the run reports `<source>: conversations.history failed for <id>:
 <code>` with no message text. A conversation you left, lost or that was
 archived is dropped until the next conversations refresh and reported once
-per refresh. A failure before any conversation is read (`auth.test`,
+per refresh. The same holds for a ruled channel (one with
+`channels.<id>.rules`): when it answers `channel_not_found`,
+`not_in_channel` or `is_archived`, even the first one read, the run reports
+it by channel id and code and still reads the other ruled channels. A failure before any conversation is read (`auth.test`,
 `users.conversations`) fails the source for that run.
 
 **Rate limits.** Calls are paced by `min_interval_seconds` and capped per run
@@ -2445,6 +2777,7 @@ holding turns open.
   an incident report is posted, see below) or a local Maildir; with the
   scanner on, a local client process (by default OpenCode) reads batches of
   message text, which goes to whatever model that client is configured to use.
+  The GitHub source makes GET requests to the configured API base only.
 - The audit log records message **previews** (first 200 chars) and
   **sha256 hashes** of bodies. Treat both the DB and the audit log as
   containing message content, and back them up / protect them
@@ -2490,6 +2823,19 @@ holding turns open.
   capped. Slack tokens and mail passwords are read only from environment
   variables named in the config and appear in no argument list, log, error,
   prompt, database row or scanner environment.
+- GitHub items are untrusted data and anyone can open an issue on a public
+  repository. The GitHub source is read-only, reads no body or comment text
+  (only the cleaned title, labels, authors and flags) and sends its token
+  only in the `Authorization` header. Nothing starts a session, resumes one,
+  messages one or reaches the dispatcher unless the item's author is in
+  `sources.github.trusted_authors` (empty by default); every other item only
+  notifies. Add a spawn-capable rule or an author to that list only for
+  repositories and people you would run unattended.
+- Window cleanup (off by default) closes only a window of a session that
+  reported `done` long ago and whose pane shows an empty prompt, so it cannot
+  discard a running session or unsent input. Quota routing reads only usage
+  numbers kept locally (a 0600 snapshot written from a status line payload,
+  and Codex's own session logs): no credential file, no network.
 - Alerts about messages are thin (source, state, rule, link), never the text.
   Email is never a command channel: no mail starts a session or approves
   anything, email rules cannot use `respond`, and agent-bus never sends mail;

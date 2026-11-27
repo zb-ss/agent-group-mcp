@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
+import string
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -68,6 +70,10 @@ def _is_str(value: Any) -> bool:
     return isinstance(value, str)
 
 
+def _is_process_name(value: Any) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= 15 and "/" not in value
+
+
 def _is_str_list(value: Any) -> bool:
     return isinstance(value, list) and all(isinstance(v, str) for v in value)
 
@@ -116,6 +122,7 @@ _TEMPLATE_SCHEMA = {
     "transcripts": (_is_str, "a string or null", True),
     "prompt_delivery": (lambda v: v in ("argv", "paste"), '"argv" or "paste"', False),
     "prompt_ready_seconds": (_is_non_negative_number, "a non-negative number", False),
+    "process_name": (_is_process_name, "a non-empty string of at most 15 characters without a slash, or null", True),
 }
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -147,6 +154,78 @@ def _check_worktree_trust(client: str, value: Any) -> None:
             f"spawn.clients.{client}.worktree_trust must be an object with a boolean "
             f"enabled and non-empty string file and key"
         )
+
+
+def _check_session_link(client: str, value: Any) -> None:
+    if value is None:
+        return
+    key = f"spawn.clients.{client}.session_link"
+    wanted = (
+        f"{key} must be null or an object with an env variable name, an https:// url "
+        f"with a literal host and exactly one {{id}} placeholder in its path or query, "
+        f"and a label of 1 to 60 characters"
+    )
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("env"), str)
+        or _ENV_NAME.fullmatch(value["env"]) is None
+        or not isinstance(value.get("url"), str)
+        or not value["url"].startswith("https://")
+        or not isinstance(value.get("label"), str)
+        or not 1 <= len(value["label"]) <= 60
+    ):
+        raise ConfigError(wanted)
+    _check_link_template(value["url"], wanted)
+
+
+# The part of a session link template before its {id}: the scheme and a
+# literal host (no user info), then a path or query. The id can never become
+# part of the host.
+_LINK_PREFIX = re.compile(r"https://[^/?#{}@\s]+[/?][^#{}]*")
+
+
+def _check_link_template(url: str, wanted: str) -> None:
+    from .links import is_web_url  # lazy: keep module import order simple
+
+    try:
+        fields = [
+            (name, spec, conv)
+            for _, name, spec, conv in string.Formatter().parse(url)
+            if name is not None
+        ]
+    except ValueError as exc:
+        raise ConfigError(f"{wanted} ({type(exc).__name__}: {exc})") from exc
+    # Exactly one bare {id}: no other field, no conversion (!r), no format
+    # spec, and no other brace (an escaped {{ or }} included).
+    prefix, _, rest = url.partition("{id}")
+    if fields != [("id", "", None)] or any(c in prefix + rest for c in "{}"):
+        raise ConfigError(wanted)
+    if _LINK_PREFIX.fullmatch(prefix) is None:
+        raise ConfigError(wanted)
+    if not is_web_url(url.replace("{id}", "sample-id_1")):
+        raise ConfigError(wanted)
+
+
+def _check_idle_prompt(client: str, value: Any) -> None:
+    if value is None:
+        return
+    key = f"spawn.clients.{client}.idle_prompt"
+    wanted = (
+        f"{key} must be null or an object with a regular expression pattern, an "
+        f"integer tail_lines from 1 to 200 and a boolean escapes"
+    )
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("pattern"), str)
+        or not _is_int(value.get("tail_lines"))
+        or not 1 <= value["tail_lines"] <= 200
+        or not isinstance(value.get("escapes"), bool)
+    ):
+        raise ConfigError(wanted)
+    try:
+        re.compile(value["pattern"])
+    except re.error as exc:
+        raise ConfigError(f"{key}.pattern is not a valid regular expression ({exc})") from exc
 
 
 def _check_section(section: Any, schema: dict, prefix: str) -> None:
@@ -186,6 +265,8 @@ def _validate(cfg: dict[str, Any]) -> None:
         _check_section(template, _TEMPLATE_SCHEMA, f"spawn.clients.{client}")
         _check_model_env(client, template.get("model_env"))
         _check_worktree_trust(client, template.get("worktree_trust"))
+        _check_session_link(client, template.get("session_link"))
+        _check_idle_prompt(client, template.get("idle_prompt"))
         if template.get("worktree_links") is None:
             continue
         links = template["worktree_links"]
@@ -204,29 +285,66 @@ def _validate(cfg: dict[str, Any]) -> None:
     dispatch_settings.validate(cfg.get("dispatch"))
 
 
-def load(*, path: Path | None = None) -> dict[str, Any]:
-    """Defaults merged with the user file. Missing or blank file gives the
-    defaults. Unlike wake.json, a broken file raises: spawn must not run
-    with a config the user believes is in effect but is not."""
+def load_user(path: Path | None = None) -> dict[str, Any]:
+    """The raw user config object, without defaults. A missing or blank file
+    gives {}; an unreadable, broken or non-object file raises."""
     p = path or config_path()
-    cfg = defaults()
     if not p.exists():
-        return cfg
+        return {}
     try:
         raw = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConfigError(f"cannot read config file {p}: {exc}") from exc
     if not raw.strip():
-        return cfg
+        return {}
     try:
         user = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"config file {p} is not valid JSON: {exc}") from exc
     if not isinstance(user, dict):
         raise ConfigError(f"config file {p} must contain a JSON object")
-    merged = _merge(cfg, user)
+    return user
+
+
+def validate_user(user: dict[str, Any]) -> dict[str, Any]:
+    """Defaults merged with `user`, validated. Raises ConfigError."""
+    merged = _merge(defaults(), user)
+    _validate(merged)
+    return merged
+
+
+def load(*, path: Path | None = None) -> dict[str, Any]:
+    """Defaults merged with the user file. Missing or blank file gives the
+    defaults. Unlike wake.json, a broken file raises: spawn must not run
+    with a config the user believes is in effect but is not."""
+    p = path or config_path()
+    user = load_user(p)
     try:
-        _validate(merged)
+        return validate_user(user)
     except ConfigError as exc:
         raise ConfigError(f"{exc} (config file {p})") from exc
-    return merged
+
+
+def save_user(user: dict[str, Any], path: Path | None = None) -> Path:
+    """Validate `user` merged over the defaults, then write it atomically.
+    Nothing is written when validation fails. A symlinked config file is
+    written through to its target; a new file is 0600, an existing one keeps
+    its permission bits."""
+    validate_user(user)
+    target = Path(os.path.realpath(path or config_path()))
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        mode = target.stat().st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(user, indent=2) + "\n")
+        os.chmod(tmp, mode)  # the umask may have narrowed the creation mode
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return target
