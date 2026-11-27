@@ -193,3 +193,68 @@ def test_the_packaged_claude_idle_pattern_tells_typed_text_apart(pane, idle):
     import re
 
     assert bool(re.search(prompt["pattern"], "output\n" + pane, re.MULTILINE)) is idle
+
+
+def _matches(client: str, pane: str) -> bool:
+    import re
+
+    prompt = config.defaults()["spawn"]["clients"][client]["idle_prompt"]
+    return bool(re.search(prompt["pattern"], "output\n" + pane, re.MULTILINE))
+
+
+# Synthetic reproductions of the Codex composer (neutral text).
+_CODEX_FOOTER = "\n  example-model · Context 100% left · ~/work · main\n  ? for shortcuts\n"
+_CODEX_EMPTY = "\x1b[1m›\x1b[0m \x1b[2mAsk for anything\x1b[0m\n" + _CODEX_FOOTER
+_CODEX_BARE = "\x1b[1m›\x1b[0m \n" + _CODEX_FOOTER
+_CODEX_TYPED = "\x1b[1m›\x1b[0m some unsent words\n" + _CODEX_FOOTER
+_CODEX_MENU = "\x1b[1;7m› 1. Trust and continue\n\x1b[0m  2. Go back\n"
+
+
+@pytest.mark.parametrize("pane, idle", [(_CODEX_EMPTY, True), (_CODEX_BARE, True),
+                                        (_CODEX_TYPED, False), (_CODEX_MENU, False)])
+def test_the_packaged_codex_idle_pattern_tells_typed_text_apart(pane, idle):
+    assert config.defaults()["spawn"]["clients"]["codex"]["idle_prompt"]["escapes"] is True
+    assert _matches("codex", pane) is idle
+
+
+# Synthetic reproductions of the agy input box: a prompt line between two rules.
+_RULE = "\x1b[38;5;23m" + "─" * 40 + "\x1b[39m\n"
+_AGY_FOOTER = "\x1b[38;5;246m? for shortcuts\x1b[39m    auto · example-model\n"
+_AGY_EMPTY = (_RULE + "\x1b[38;5;32m>\x1b[39m \x1b[38;5;246mAuto mode: example hint\x1b[39m\n"
+              + _RULE + _AGY_FOOTER)
+_AGY_BARE = _RULE + "\x1b[38;5;32m>\x1b[39m\n" + _RULE + _AGY_FOOTER
+_AGY_TYPED = _RULE + "\x1b[38;5;32m>\x1b[39m some unsent words\n" + _RULE + _AGY_FOOTER
+_AGY_SECOND_LINE = (_RULE + "\x1b[38;5;32m>\x1b[39m\n  a second input line\n" + _RULE
+                    + _AGY_FOOTER)
+_AGY_LOOSE = "  answer\n\x1b[38;5;32m>\x1b[39m\n  more answer\n" + _AGY_FOOTER
+
+
+@pytest.mark.parametrize("pane, idle", [(_AGY_EMPTY, True), (_AGY_BARE, True),
+                                        (_AGY_TYPED, False), (_AGY_SECOND_LINE, False),
+                                        (_AGY_LOOSE, False)])
+def test_the_packaged_agy_idle_pattern_needs_an_empty_boxed_prompt(pane, idle):
+    assert config.defaults()["spawn"]["clients"]["agy"]["idle_prompt"]["escapes"] is True
+    assert _matches("agy", pane) is idle
+
+
+# Synthetic reproductions of the opencode input box (plain text, no colour codes).
+_OC_TAIL = "  ┃  Build auto · example-model\n  ╹" + "▀" * 30 + "\n  ~/work:main\n"
+_OC_EMPTY = "     answer\n\n  ┃\n  ┃\n  ┃\n" + _OC_TAIL
+_OC_TYPED = "     answer\n\n  ┃  some unsent words\n  ┃\n  ┃\n" + _OC_TAIL
+_OC_TYPED_LOWER = "     answer\n\n  ┃\n  ┃  some unsent words\n  ┃\n" + _OC_TAIL
+_OC_PLACEHOLDER = '\n  ┃  Ask anything "example"\n  ┃\n' + _OC_TAIL
+_OC_SIDEBAR = "     answer\n\n  ┃                     Context\n  ┃\n" + _OC_TAIL
+_OC_MESSAGE = "\n  ┃\n  ┃  an earlier message\n  ┃\n\n     answer\n"
+
+
+@pytest.mark.parametrize("pane, idle", [(_OC_EMPTY, True), (_OC_TYPED, False),
+                                        (_OC_TYPED_LOWER, False), (_OC_PLACEHOLDER, False),
+                                        (_OC_SIDEBAR, False), (_OC_MESSAGE, False)])
+def test_the_packaged_opencode_idle_pattern_needs_a_blank_input_box(pane, idle):
+    assert config.defaults()["spawn"]["clients"]["opencode"]["idle_prompt"]["escapes"] is False
+    assert _matches("opencode", pane) is idle
+
+
+def test_every_packaged_client_has_an_idle_prompt():
+    clients = config.defaults()["spawn"]["clients"]
+    assert all(clients[c]["idle_prompt"] for c in ("claude", "codex", "agy", "opencode"))

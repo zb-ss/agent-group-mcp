@@ -1108,13 +1108,16 @@ stops `spawn` with an error naming it; `status` warns and carries on.
         "transcripts": "~/.claude/projects/{work_dir_key}/*.jsonl",
         "worktree_links": [{"source": "~/.claude/projects/{clone_key}/memory", "target": "~/.claude/projects/{work_dir_key}/memory"}]},
       "codex": {"command": ["codex"], "model": ["-m", "{model}"], "remote": null, "prompt": ["{prompt}"], "resume": ["codex", "resume"], "worktree_links": [],
-        "resume_prompt": null, "transcripts": null, "session_link": null, "idle_prompt": null,
+        "resume_prompt": null, "transcripts": null, "session_link": null,
+        "idle_prompt": {"pattern": "^(\\x1b\\[[0-9;]*m)*\u203a(\\x1b\\[[0-9;]*m)*[ \\t]*(\\x1b\\[2m[^\\n]*)?$", "tail_lines": 8, "escapes": true},
         "user_wired": ["-c", "mcp_servers.agent-bus.env_vars=[\"AGENT_BUS_SESSION\", \"AGENT_BUS_SPAWN_TOKEN\", \"AGENT_BUS_AUTHORITY_TOKEN\", \"AGENT_BUS_REPO\", \"AGENT_BUS_DB\", \"AGENT_BUS_AUDIT_LOG\"]"]},
       "agy": {"command": ["agy", "--mode", "auto", "--add-dir", "{dir}"], "model": ["--model", "{model}"], "remote": ["--remote-control"], "prompt": ["-i", "{prompt}"], "resume": null, "worktree_links": [],
-        "resume_prompt": null, "transcripts": null, "session_link": null, "idle_prompt": null,
+        "resume_prompt": null, "transcripts": null, "session_link": null,
+        "idle_prompt": {"pattern": "^(\\x1b\\[[0-9;]*m)*\u2500{10,}[^\\n]*\\n(\\x1b\\[[0-9;]*m)*>(\\x1b\\[[0-9;]*m)*[ \\t]*(\\x1b\\[38;5;246m[^\\n]*)?\\n(\\x1b\\[[0-9;]*m)*\u2500{10,}", "tail_lines": 8, "escapes": true},
         "worktree_trust": {"enabled": false, "file": "~/.gemini/antigravity-cli/settings.json", "key": "trustedWorkspaces"}},
       "opencode": {"command": ["opencode", "--standalone", "--auto"], "model": null, "remote": null, "prompt": ["--prompt", "{prompt}"], "prompt_delivery": "paste", "prompt_ready_seconds": 6, "process_name": null, "resume": null, "worktree_links": [],
-        "resume_prompt": null, "transcripts": null, "session_link": null, "idle_prompt": null,
+        "resume_prompt": null, "transcripts": null, "session_link": null,
+        "idle_prompt": {"pattern": "^[^\u2503\\n]*\\n([ \\t]*\u2503[ \\t]*\\n)+[ \\t]*\u2503[^\\n]*\\n[ \\t]*\u2579", "tail_lines": 12, "escapes": false},
         "model_env": {"OPENCODE_CONFIG_CONTENT": {"model": "{model}"}}}
     }
   },
@@ -1575,7 +1578,7 @@ An invalid value makes the config fail to load, naming the dotted key.
 | `sources.asana.projects` | Project id to repo: a string, or an object with `repo` and optional `client`, `model`, `worktree`, `fetch`, `clone`, `remote`, `playbooks` |
 | `sources.github.*` | The GitHub source: one table in *GitHub issues and pull requests* (`enabled`, `token_env`, `trusted_authors`, `projects`, `rules`, limits and endpoints) |
 | `spawn.clients.<client>.session_link` | `{env, url, label}`: the environment variable that holds a session's own Remote Control id, the `https://` URL template (a literal host and exactly one bare `{id}` in its path or query) and the link label; `null` adds no link (`claude` only) |
-| `spawn.clients.<client>.idle_prompt` | `{pattern, tail_lines, escapes}`: how window cleanup recognises an empty prompt; `null` never closes that client's windows (`claude` only) |
+| `spawn.clients.<client>.idle_prompt` | `{pattern, tail_lines, escapes}`: how window cleanup recognises an empty prompt; `null` never closes that client's windows (every client ships one) |
 | `notifiers.log.file` | Log file (`dispatch.log` beside the database) |
 | `notifiers.macos.*` | `enabled`, `osascript_bin`, `title`, `timeout_seconds` |
 | `notifiers.linux.*` | `enabled` (`true`), `notify_send_bin` (`notify-send`), `title`, `timeout_seconds` |
@@ -1759,10 +1762,21 @@ when every one of these holds, and otherwise keeps it:
 - the session did not change state while the check ran.
 
 A session that is waiting, working, starting or running is never touched.
-Only Claude Code ships an `idle_prompt` (`spawn.clients.claude.idle_prompt`);
-Codex, agy and opencode have `null`, so their windows stay until you close
-them (set a pattern of your own, with `escapes` telling whether the capture
-keeps colour codes, to include them). Pane text is only matched, never
+Every client ships an `idle_prompt`, taken from its own prompt in the
+default theme (Claude Code, Codex 0.172, agy 1.5.18, opencode 2.4.2):
+
+- Claude Code and Codex: the prompt sign (`❯`, `›`) alone or followed by
+  the dimmed suggestion it shows while empty;
+- agy: the `>` line between the two rules of the input box, empty or with
+  its grey mode hint;
+- opencode: an input box whose rows are all blank (`escapes` is `false`
+  here, so the pattern reads plain text).
+
+A prompt that looks different (another theme or version, a dialog, stale
+rows after the window shrank) does not match, so the window is kept. Set
+`spawn.clients.<client>.idle_prompt` to a pattern of your own, with
+`escapes` telling whether the capture keeps colour codes, or to `null` to
+never close that client's windows. Pane text is only matched, never
 stored or logged. `run --dry-run` closes nothing and reports `would_close`.
 A closed window is logged (`dispatch decisions --event window_closed`); the
 session keeps its row, and both status commands still print its resume line.
