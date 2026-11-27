@@ -51,6 +51,9 @@ def _enable_asana() -> None:
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    # The systemd timer folder follows XDG_CONFIG_HOME, which CI runners set to
+    # the real home: point it into the fake home too, so nothing is written there.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     return tmp_path
 
