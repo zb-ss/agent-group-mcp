@@ -10,7 +10,9 @@ live in different repos, and several different MCP clients (Claude Code,
 Codex, Antigravity CLI, opencode) can work in the **same** repo at once,
 each with an inbox of its own.
 
-- **Zero external services.** Local-only. Filesystem + SQLite (WAL mode).
+- **Zero external services for the bus.** Local-only. Filesystem + SQLite
+  (WAL mode). The optional dispatch features below talk only to the services
+  you enable.
 - **One MCP server process per client session**, all sharing one DB.
 - **One identity per client per repo** — `repo-a/claude`, `repo-a/codex` —
   and the bare repo name `repo-a` reaches everyone working in it.
@@ -23,8 +25,30 @@ each with an inbox of its own.
   Codex's, Antigravity CLI's and opencode's own mechanisms, with no
   terminal multiplexer involved — or through a command of your own
   (`wake.json`).
-- **Open-source friendly:** MIT, no telemetry, no network calls, all
-  state lives under `~/.claude-agent-bus/` (gitignored by default).
+- **Starts and tracks sessions.** `agent-bus spawn` opens a Claude Code,
+  Codex, Antigravity CLI or opencode session in a repo (its clone, a fresh
+  worktree, or a new clone) in a tmux window, with a model, a first prompt
+  and Remote Control where the client has it. `agent-bus status` shows every
+  session's state (working, waiting for you, done) and how to reopen it.
+  See [Spawning sessions](#spawning-sessions-agent-bus-spawn) and
+  [Session status](#session-status-agent-bus-status).
+- **Optional dispatch, off until you enable it.** `agent-bus dispatch` runs
+  on a timer:
+  - It reads task sources (Asana) and starts or resumes a session for each
+    due task.
+  - It reads message sources (Slack, a local Maildir) and triages new
+    messages with a read-only scanner into reply drafts that wait for your
+    approval.
+  - It opens an incident session for a critical monitoring alert.
+  - With an always-on dispatcher session, which you can talk to from your
+    phone, it hands each decision to that session.
+
+  Alerts reach you by email. See
+  [Dispatching tasks](#dispatching-tasks-agent-bus-dispatch).
+- **Open-source friendly:** MIT, no telemetry, all state lives under
+  `~/.claude-agent-bus/` (gitignored by default). Nothing leaves your
+  machine unless you enable dispatch; see
+  [Privacy & security](#privacy--security).
 
 > **Setting this up?** [`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md) is a
 > step-by-step install and configuration runbook, written so you can hand it
