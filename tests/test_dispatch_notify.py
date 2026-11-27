@@ -8,6 +8,7 @@ import pytest
 from agent_bus.dispatch import notify
 from agent_bus.dispatch.notify import (
     EmailNotifier,
+    LinuxNotifier,
     LogNotifier,
     MacosNotifier,
     Notification,
@@ -23,6 +24,22 @@ MACOS_CFG = {
     "timeout_seconds": 5,
     "title": "Agent Bus",
 }
+
+
+LINUX_CFG = {
+    "enabled": True,
+    "notify_send_bin": "notify-send",
+    "title": "agent-bus",
+    "timeout_seconds": 7,
+}
+
+
+def _have(_name):
+    return "/usr/bin/notify-send"
+
+
+def _missing(_name):
+    return None
 
 
 def email_cfg(**over):
@@ -129,6 +146,215 @@ def test_macos_noop_on_linux_and_disabled():
 def test_macos_failures_raise(run):
     with pytest.raises(NotifyError):
         MacosNotifier(MACOS_CFG, run=run, platform="darwin").send(NOTE)
+
+
+_DESKTOP = {"DISPLAY": ":0"}
+
+
+def test_linux_argv_puts_title_only_in_summary():
+    run = FakeRun()
+    title = "--urgency=critical <b>x</b>"
+    LinuxNotifier(LINUX_CFG, run=run, platform="linux", which=_have, env=_DESKTOP).send(
+        Notification("s1", "done", title, "u")
+    )
+    assert run.calls == [
+        (["notify-send", "--app-name", "agent-bus", "--", f"done: {title}", "s1"], 7)
+    ]
+
+
+def test_linux_noop_on_darwin():
+    run = FakeRun()
+    n = LinuxNotifier(LINUX_CFG, run=run, platform="darwin", which=_have)
+    n.send(NOTE)
+    assert n.enabled is False
+    assert run.calls == []
+
+
+def test_linux_missing_binary_is_quiet():
+    run = FakeRun()
+    n = LinuxNotifier(LINUX_CFG, run=run, platform="linux", which=_missing)
+    n.send(NOTE)
+    assert n.enabled is False
+    assert run.calls == []
+
+
+def test_linux_without_a_session_bus_or_display_is_quiet():
+    run = FakeRun(returncode=1)
+    n = LinuxNotifier(LINUX_CFG, run=run, platform="linux", which=_have, env={})
+    n.send(NOTE)
+    assert n.enabled is False
+    assert run.calls == []
+    assert notify.deliver([n], NOTE, max_chars=50) == (True, [])
+
+
+def test_linux_disabled_in_config_is_noop():
+    run = FakeRun()
+    n = LinuxNotifier({**LINUX_CFG, "enabled": False}, run=run, platform="linux", which=_have, env=_DESKTOP)
+    n.send(NOTE)
+    assert n.enabled is False
+    assert run.calls == []
+
+
+@pytest.mark.parametrize(
+    "run", [FakeRun(returncode=2), FakeRun(exc=OSError("Fix the thing"))]
+)
+def test_linux_failures_raise_without_the_title(run):
+    with pytest.raises(NotifyError) as info:
+        LinuxNotifier(LINUX_CFG, run=run, platform="linux", which=_have, env=_DESKTOP).send(NOTE)
+    assert "Fix the thing" not in str(info.value)
+
+
+def test_deliver_with_only_a_disabled_linux_notifier_counts_as_delivered():
+    n = LinuxNotifier(LINUX_CFG, run=FakeRun(), platform="darwin", which=_have)
+    assert notify.deliver([n], NOTE, max_chars=50) == (True, [])
+
+
+def test_linux_session_bus_alone_is_not_a_desktop():
+    run = FakeRun()
+    n = LinuxNotifier(
+        LINUX_CFG, run=run, platform="linux", which=_have,
+        env={"DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"},
+    )
+    assert not n.enabled
+    n.send(NOTE)
+    assert run.calls == []
+
+
+@pytest.mark.parametrize("name", ["DISPLAY", "WAYLAND_DISPLAY"])
+def test_linux_display_enables(name):
+    n = LinuxNotifier(LINUX_CFG, run=FakeRun(), platform="linux", which=_have, env={name: ":0"})
+    assert n.enabled
+
+
+def test_linux_runs_notify_send_with_the_checked_environment():
+    seen = []
+
+    def run(argv, *, timeout, env=None):
+        seen.append(env)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    base = {"PATH": "/usr/bin", "DISPLAY": ":9"}
+    env = {"DISPLAY": ":1", "FROM_ENV_FILE": "x", "PATH": "/usr/bin"}
+    LinuxNotifier(LINUX_CFG, run=run, platform="linux", which=_have, env=env,
+                  base_env=base).send(NOTE)
+    assert seen == [{"PATH": "/usr/bin", "DISPLAY": ":1"}]
+
+
+def test_linux_env_file_values_never_reach_notify_send():
+    seen = []
+
+    def run(argv, *, timeout, env=None):
+        seen.append(env)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    base = {"PATH": "/usr/bin", "HOME": "/home/example"}
+    merged = {
+        **base,
+        "WAYLAND_DISPLAY": "wayland-0",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+        "EXAMPLE_API_TOKEN": "not-a-real-value",
+        "FAKE_SMTP_PASSWORD": "not-a-real-value",
+    }
+    n = LinuxNotifier(LINUX_CFG, run=run, platform="linux", which=_have, env=merged,
+                      base_env=base)
+    assert n.enabled
+    n.send(NOTE)
+    [used] = seen
+    assert "EXAMPLE_API_TOKEN" not in used and "FAKE_SMTP_PASSWORD" not in used
+    assert used == {
+        "PATH": "/usr/bin", "HOME": "/home/example", "WAYLAND_DISPLAY": "wayland-0",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+
+
+def test_linux_display_only_in_the_process_env_is_not_used_when_unchecked():
+    # enabled reads the merged mapping; send must not use a display it did not see
+    n = LinuxNotifier(LINUX_CFG, run=FakeRun(), platform="linux", which=_have, env={},
+                      base_env={"DISPLAY": ":0"})
+    assert not n.enabled
+
+
+def test_macos_notifier_passes_no_env_file_mapping():
+    seen = []
+
+    def run(argv, *, timeout, env=None):
+        seen.append(env)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    MacosNotifier(MACOS_CFG, run=run, platform="darwin").send(NOTE)
+    assert seen == [None]
+
+
+class _Failing:
+    alerts = True
+    enabled = True
+
+    def __init__(self, name, *, desktop=False):
+        self.name = name
+        self.desktop = desktop
+        self.sent = 0
+
+    def send(self, notification):
+        self.sent += 1
+        raise NotifyError("exited with 1")
+
+
+class _Ok:
+    alerts = True
+    enabled = True
+
+    def __init__(self, name, *, desktop=False):
+        self.name = name
+        self.desktop = desktop
+
+    def send(self, notification):
+        pass
+
+
+def test_failing_desktop_notifier_alone_still_delivers_with_one_warning():
+    warnings = []
+    linux = LinuxNotifier(
+        LINUX_CFG, run=FakeRun(returncode=1), platform="linux", which=_have, env=_DESKTOP
+    )
+    delivered, errors = notify.deliver([linux], NOTE, max_chars=50, warn=warnings.append)
+    assert (delivered, errors) == (True, [])
+    assert warnings == ["linux: notify-send exited with 1"]
+    assert "Fix the thing" not in warnings[0]
+
+
+def test_failing_macos_notifier_is_best_effort():
+    warnings = []
+    macos = MacosNotifier(MACOS_CFG, run=FakeRun(returncode=1), platform="darwin")
+    assert notify.deliver([macos], NOTE, max_chars=50, warn=warnings.append) == (True, [])
+    assert warnings == ["macos: osascript exited with 1"]
+
+
+def test_email_failure_still_retries_even_when_the_desktop_banner_worked():
+    warnings = []
+    delivered, errors = notify.deliver(
+        [_Ok("linux", desktop=True), _Failing("email")],
+        NOTE, max_chars=50, warn=warnings.append,
+    )
+    assert delivered is False
+    assert errors == ["email: exited with 1"]
+    assert warnings == []
+
+
+def test_email_success_delivers_despite_a_failing_desktop_banner():
+    warnings = []
+    delivered, errors = notify.deliver(
+        [_Failing("linux", desktop=True), _Ok("email")],
+        NOTE, max_chars=50, warn=warnings.append,
+    )
+    assert (delivered, errors) == (True, [])
+    assert warnings == ["linux: exited with 1"]
+
+
+def test_default_warning_goes_to_stderr(capsys):
+    notify.deliver([_Failing("linux", desktop=True)], NOTE, max_chars=50)
+    assert capsys.readouterr().err == "agent-bus: warning: linux: exited with 1\n"
 
 
 def test_email_tls_order_and_body():
@@ -376,12 +602,12 @@ def test_send_all_continues_after_failure(tmp_path):
 
 def test_build_order(tmp_path):
     items = notify.build(
-        {"macos": MACOS_CFG, "email": email_cfg(enabled=False)},
+        {"macos": MACOS_CFG, "linux": LINUX_CFG, "email": email_cfg(enabled=False)},
         env={},
         run=FakeRun(),
         log_path=tmp_path / "l.log",
     )
-    assert [i.name for i in items] == ["log", "macos", "email"]
+    assert [i.name for i in items] == ["log", "macos", "linux", "email"]
 
 
 def test_log_notifier_is_owner_only(tmp_path):

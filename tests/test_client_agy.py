@@ -261,3 +261,63 @@ def test_release_without_a_list_changes_nothing(tmp_path, agy):
     settings.write_text("{}")
     assert _release(agy, tmp_path, _trust_opts(settings)) == []
     assert settings.read_text() == "{}"
+
+
+# ------------------------- plugin files in a worktree -----------------------
+
+
+def _wired_clone(tmp_path, agy):
+    clone = _repo(tmp_path, "clone")
+    agy.apply(clone, name="repo-a/agy", bin_path=BIN)
+    return clone
+
+
+def test_worktree_gets_real_copies_in_place_of_links(tmp_path, agy):
+    clone = _wired_clone(tmp_path, agy)
+    wt = tmp_path / "wt"
+    (wt / PLUGIN).mkdir(parents=True)
+    (wt / PLUGIN / "plugin.json").symlink_to(clone / PLUGIN / "plugin.json")
+    prep = agy.prepare_worktree(clone, wt, name="repo-a/agy", bin_path=BIN)
+    names = ["plugin.json", "mcp_config.json", "hooks.json"]
+    assert sorted(prep.written) == sorted(PLUGIN / n for n in names)
+    assert sorted(prep.covered) == sorted(PLUGIN / n for n in names)
+    for n in names:
+        assert not (wt / PLUGIN / n).is_symlink()
+        assert (wt / PLUGIN / n).read_bytes() == (clone / PLUGIN / n).read_bytes()
+    env = json.loads((wt / PLUGIN / "mcp_config.json").read_text())["mcpServers"]["agent-bus"]["env"]
+    assert env == {"AGENT_BUS_NAME": "repo-a/agy", "AGENT_BUS_REPO": str(clone)}
+    # a second run has nothing left to write
+    assert agy.prepare_worktree(clone, wt, name="repo-a/agy", bin_path=BIN).written == []
+
+
+def test_worktree_dry_run_writes_nothing(tmp_path, agy):
+    clone = _wired_clone(tmp_path, agy)
+    wt = tmp_path / "wt"
+    prep = agy.prepare_worktree(clone, wt, name="repo-a/agy", bin_path=BIN, dry_run=True)
+    assert prep.written == [] and prep.notes and not wt.exists()
+
+
+def test_tracked_plugin_file_is_kept_and_only_same_wiring_is_covered(tmp_path, agy):
+    clone = _wired_clone(tmp_path, agy)
+    wt = tmp_path / "wt"
+    (wt / PLUGIN).mkdir(parents=True)
+    (wt / PLUGIN / "hooks.json").write_text("{}")
+    prep = agy.prepare_worktree(clone, wt, name="repo-a/agy", bin_path=BIN)
+    assert (wt / PLUGIN / "hooks.json").read_text() == "{}"
+    assert PLUGIN / "hooks.json" not in prep.written
+    assert PLUGIN / "hooks.json" not in prep.covered
+
+
+def test_trust_and_files_are_both_done_and_release_still_drops_trust(tmp_path, agy):
+    clone = _wired_clone(tmp_path, agy)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"trusted": [str(clone)]}))
+    wt = tmp_path / "wt"
+    prep = agy.prepare_worktree(
+        clone, wt, name="repo-a/agy", bin_path=BIN, options=_trust_opts(settings),
+    )
+    assert (wt / PLUGIN / "plugin.json").is_file()
+    assert any(n.startswith(f"trusted {wt} in agy") for n in prep.notes)
+    notes = agy.release_worktree(wt, options=_trust_opts(settings))
+    assert notes == [f"dropped agy folder trust for {wt}"]
+    assert json.loads(settings.read_text())["trusted"] == [str(clone)]

@@ -51,6 +51,9 @@ def _enable_asana() -> None:
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    # The systemd timer folder follows XDG_CONFIG_HOME, which CI runners set to
+    # the real home: point it into the fake home too, so nothing is written there.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     return tmp_path
 
@@ -173,6 +176,22 @@ def test_install_and_uninstall_timer(home, capsys, monkeypatch):
     assert not any(p.exists() for p in paths)
 
 
+def test_install_timer_on_linux_prints_the_linger_note(home, capsys, monkeypatch):
+    import functools
+
+    from agent_bus.dispatch import timer
+
+    monkeypatch.setattr(commands, "run_command", _fail_if_called)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(timer, "plan", functools.partial(timer.plan, platform="linux", home=home))
+    assert cli.main(["dispatch", "install-timer", "--bin-path", "/usr/local/bin/agent-bus"]) == 0
+    out = capsys.readouterr().out
+    assert "loginctl enable-linger" in out
+    assert out.index("wrote ") < out.index("loginctl enable-linger")
+    assert cli.main(["dispatch", "uninstall-timer", "--bin-path", "/usr/local/bin/agent-bus"]) == 0
+    assert "linger" not in capsys.readouterr().out
+
+
 def test_install_timer_load_uses_the_runner(home, capsys, monkeypatch):
     import subprocess
 
@@ -239,6 +258,25 @@ def test_status_prints_the_held_line_until_approved(capsys):
     capsys.readouterr()
     assert cli.main(["dispatch", "status"]) == 0
     assert "held:" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("session_name", [None, "repo-a/claude-x"])
+def test_status_masks_an_untrusted_title_even_with_a_session(capsys, session_name):
+    # an author removed from trusted_authors after the spawn: the item keeps
+    # its session but its (possibly edited) title must not be shown
+    from agent_bus.dispatch.model import UNTRUSTED_MARKER, UNTRUSTED_TITLE
+
+    store = DispatchStore()
+    store.observe(_task(), project_id=PROJECT, now="2030-01-07T10:00:00.000000Z")
+    store.update("asana", GID, type="refinement", session_name=session_name,
+                 handled_types=("refinement", UNTRUSTED_MARKER))
+    assert cli.main(["dispatch", "status", "--json"]) == 0
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["title"] == UNTRUSTED_TITLE
+    assert row["current_session"] == session_name
+    assert cli.main(["dispatch", "status"]) == 0
+    out = capsys.readouterr().out
+    assert UNTRUSTED_TITLE in out and "Fix the login form" not in out
 
 
 def test_status_prints_the_worktree_removed_line(capsys):
@@ -766,3 +804,59 @@ def test_scanner_check_gets_the_env_file_like_a_real_run(capsys, monkeypatch):
     )
     assert cli.main(["dispatch", "scanner", "check"]) == 0
     assert seen == [loaded]
+
+
+def _capture_run(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(runner, "build_sources", lambda d, env, **k: [FakeSource()])
+
+    def fake_run(**kwargs):
+        seen.update(kwargs)
+        return runner.RunReport()
+
+    monkeypatch.setattr(runner, "run", fake_run)
+    return seen
+
+
+def test_run_passes_no_quota_when_quota_is_disabled(monkeypatch):
+    from agent_bus.dispatch import routing
+
+    _enable_asana()
+    seen = _capture_run(monkeypatch)
+    assert cli.main(["dispatch", "run"]) == 0
+    assert seen["quota"] is routing.no_quota
+
+
+def test_run_passes_a_reader_when_quota_is_enabled(monkeypatch):
+    from agent_bus.dispatch import routing
+
+    _write_config({"dispatch": {
+        "routing": {"quota": {"enabled": True}},
+        "sources": {"asana": {
+            "enabled": True, "projects": {PROJECT: {"repo": "example-org/repo-a"}},
+        }},
+    }})
+    seen = _capture_run(monkeypatch)
+    assert cli.main(["dispatch", "run"]) == 0
+    assert seen["quota"] is not routing.no_quota
+    assert seen["quota"]("unknown-client") == 1.0
+
+
+def test_status_still_prints_the_resume_line_after_the_window_is_closed(capsys, monkeypatch):
+    from agent_bus import status
+
+    store = DispatchStore()
+    store.observe(_task(), project_id=PROJECT, now="2030-01-07T10:00:00.000000Z")
+    store.update("asana", GID, type="refinement", label="t0000101-fix-the-login",
+                 session_name="repo-a/claude-t0000101-fix-the-login")
+    # the window is gone and the session ended; only the spawn record is left
+    gone = status.StatusRow(
+        name="repo-a/claude-t0000101-fix-the-login", group="repo-a", client="claude",
+        label="t0000101-fix-the-login", state="done", reported_state="done",
+        state_at=None, live=False, spawned=True, last_seen=None, topic=None,
+        pending_count=0, repo_path="/x", repo_id=None, work_dir="/x",
+        tmux_session="agents", tmux_window="t0000101-fix-the-login", model=None, remote=None,
+    )
+    monkeypatch.setattr(status, "collect", lambda *a, **k: [gone])
+    assert cli.main(["dispatch", "status"]) == 0
+    assert "    resume: cd /x && claude --resume t0000101-fix-the-login" in capsys.readouterr().out

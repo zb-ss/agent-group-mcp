@@ -15,6 +15,16 @@ OUTCOME_NOTIFIED = "notified"
 OUTCOME_DONE = "done"
 OUTCOME_ENDED = "ended"
 
+# Stored in handled_types of an item whose author the source does not trust.
+# Agent-facing surfaces (overlap lists, status output) show a placeholder
+# instead of its title; no schema change, and not a task type.
+UNTRUSTED_MARKER = "untrusted_author"
+UNTRUSTED_TITLE = "(untrusted author)"
+
+
+def is_untrusted(handled_types) -> bool:
+    return UNTRUSTED_MARKER in handled_types
+
 
 @dataclass(frozen=True)
 class Membership:
@@ -36,6 +46,8 @@ class Task:
     modified_at: str | None
     newest_comment_at: str | None
     memberships: tuple[Membership, ...] = ()
+    type_hint: str | None = None  # a dispatch type the source chose for the item
+    spawn_allowed: bool = True  # False when the source's author gate forbids a session
 
 
 def to_timestamp(value: str | None) -> str | None:

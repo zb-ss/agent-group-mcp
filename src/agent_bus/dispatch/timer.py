@@ -30,6 +30,10 @@ from . import settings
 KIND_LAUNCHD = "launchd"
 KIND_SYSTEMD = "systemd"
 _LAUNCHD_WEEKDAYS = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+_LINGER_NOTE = (
+    "user timers run only while you are logged in; run `loginctl enable-linger` "
+    "once to keep them running after logout"
+)
 _PASSED_ENV = ("PATH", "AGENT_BUS_DB", "AGENT_BUS_AUDIT_LOG")
 
 
@@ -49,6 +53,7 @@ class TimerPlan:
     files: tuple[TimerFile, ...]
     load_commands: tuple[tuple[str, ...], ...]
     unload_commands: tuple[tuple[str, ...], ...]
+    notes: tuple[str, ...] = ()
 
 
 def slots(working_hours: Mapping, interval_minutes: int) -> list[tuple[int, int]]:
@@ -97,7 +102,9 @@ def plan(
     if platform == "darwin":
         return _launchd(name, argv, environment, output, hours["days"], day_slots, home, uid, timer)
     if platform.startswith("linux"):
-        return _systemd(name, argv, environment, output, hours["days"], day_slots, home, timer)
+        return _systemd(
+            name, argv, environment, output, hours["days"], day_slots, home, timer, env, uninstall
+        )
     raise TimerError(f"timers are supported on macOS and Linux only, not {platform!r}")
 
 
@@ -142,9 +149,23 @@ def _unit_quote(key: str, value: str) -> str:
     return f'Environment="{key}={escaped}"'
 
 
-def _systemd(name, argv, environment, output, days, day_slots, home, timer) -> TimerPlan:
-    directory = home / ".config" / "systemd" / "user"
-    exec_start = shlex.join(argv).replace("%", "%%")
+def _systemd_directory(home: Path, env: Mapping[str, str]) -> Path:
+    base = env.get("XDG_CONFIG_HOME") or ""
+    if base and Path(base).is_absolute():
+        return Path(base) / "systemd" / "user"
+    return home / ".config" / "systemd" / "user"
+
+
+def _systemd(
+    name, argv, environment, output, days, day_slots, home, timer, env, uninstall=False
+) -> TimerPlan:
+    directory = _systemd_directory(home, env)
+    # systemd expands `$VAR`, `${VAR}` and `%x` specifiers in ExecStart. `$` is
+    # doubled first so the `%` pass never touches its output (and vice versa).
+    exec_start = shlex.join(argv).replace("$", "$$").replace("%", "%%")
+    # No EnvironmentFile= line: `dispatch run` loads the 0600 dispatch.env_file
+    # itself and refuses a group- or world-readable one, so secrets stay out of
+    # the unit.
     service = [
         "[Unit]",
         f"Description={name}: run agent-bus dispatch",
@@ -186,6 +207,7 @@ def _systemd(name, argv, environment, output, days, day_slots, home, timer) -> T
             (ctl, "--user", "enable", "--now", f"{name}.timer"),
         ),
         unload_commands=((ctl, "--user", "disable", "--now", f"{name}.timer"),),
+        notes=() if uninstall else (_LINGER_NOTE,),
     )
 
 

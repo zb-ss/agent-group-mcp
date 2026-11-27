@@ -43,6 +43,7 @@ SCHEDULE_HOURS = ("working", "always")
 SOURCE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
 SLACK_CHANNEL_ID = re.compile(r"[A-Z0-9]{2,}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+GITHUB_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 _SAMPLE_GID = "1000000012345678"
 _SAMPLE_SUFFIX = "12345678"
@@ -114,6 +115,12 @@ _PROJECT_SCHEMA = {
     "remote": (_is_bool, "a boolean", False),
 }
 _LOG_SCHEMA = {"file": (_is_str, "a string or null", True)}
+_LINUX_SCHEMA = {
+    "enabled": (_is_bool, "a boolean", False),
+    "notify_send_bin": (lambda v: _is_str(v) and bool(v), "a non-empty string", False),
+    "title": (_is_str, "a string", False),
+    "timeout_seconds": (_is_number, "a number", False),
+}
 _MACOS_SCHEMA = {
     "enabled": (_is_bool, "a boolean", False),
     "osascript_bin": (_is_str, "a string", False),
@@ -205,6 +212,42 @@ _INCIDENT_SCHEMA = {
     "tools_hint": (_is_nonempty_str, "a non-empty string", False),
     "dir": (_is_str, "a string or null", True),
 }
+_GITHUB_SCHEMA = {
+    "enabled": (_is_bool, "a boolean", False),
+    "base_url": (lambda v: _is_str(v) and v.startswith("https://"), "a string starting with https://", False),
+    "web_base_url": (lambda v: _is_str(v) and v.startswith("https://"), "a string starting with https://", False),
+    "api_version": (_is_nonempty_str, "a non-empty string", False),
+    "accept": (_is_nonempty_str, "a non-empty string", False),
+    "user_agent": (_is_nonempty_str, "a non-empty string", False),
+    "token_env": (lambda v: _is_str(v) and ENV_NAME.fullmatch(v) is not None, "an environment variable name", False),
+    "timeout_seconds": (_is_non_negative_number, "a number >= 0", False),
+    "max_retry_wait_seconds": (_is_non_negative_number, "a number >= 0", False),
+    "page_size": (lambda v: _is_int(v) and 1 <= v <= 100, "an integer from 1 to 100", False),
+    "max_pages": (lambda v: _is_int(v) and v >= 1, "an integer >= 1", False),
+    "max_calls_per_run": (lambda v: _is_int(v) and v >= 1, "an integer >= 1", False),
+    "max_untrusted_alerts_per_run": (_is_nonneg_int, "an integer >= 0", False),
+    "state": (lambda v: v in ("open", "closed", "all"), "one of open, closed, all", False),
+    "updated_within_days": (_is_nonneg_int, "an integer >= 0", False),
+    "comment_lookback_days": (_is_nonneg_int, "an integer >= 0", False),
+    "owner_login": (_is_str, "a string or null", True),
+    "ignore_own_comments": (_is_bool, "a boolean", False),
+    "trusted_authors": (
+        lambda v: _is_str_list(v) and all(a and not any(c.isspace() for c in a) for a in v),
+        "a list of non-empty strings without whitespace",
+        False,
+    ),
+    "failing_conclusions": (
+        lambda v: _is_str_list(v) and all(a and not any(c.isspace() for c in a) for a in v),
+        "a list of non-empty strings without whitespace",
+        False,
+    ),
+}
+_GITHUB_RULE_KEYS = frozenset(
+    {"name", "type", "repos", "kind", "state", "labels", "assignee", "author", "draft",
+     "review_requested", "failing_checks"}
+)
+_GITHUB_KINDS = ("issue", "pull_request")
+_QUOTA_READERS = ("snapshot", "codex_sessions")
 _SLACK_RULE_KEYS = frozenset(
     {"name", "action", "bot_ids", "user_ids", "text", "mention", "thread", "playbook", "lifecycle",
      "auto_post_report"}
@@ -323,9 +366,10 @@ def _check_types(section: Any) -> None:
         _require(entry.get("action") in ACTIONS, f"{key}.action", f"one of {', '.join(ACTIONS)}")
         playbook = entry.get("playbook")
         _require(
-            _is_str(playbook) and PLAYBOOK_NAME.fullmatch(playbook) is not None,
+            (playbook is None and entry["action"] != "spawn")
+            or (_is_str(playbook) and PLAYBOOK_NAME.fullmatch(playbook) is not None),
             f"{key}.playbook",
-            "a playbook name (lowercase letters, digits and dashes)",
+            "a playbook name (lowercase letters, digits and dashes), required for action spawn",
         )
         resume = entry.get("resume_playbook")
         _require(
@@ -397,8 +441,8 @@ def _check_rules(rules: Any, types: Mapping) -> None:
             _require(_is_bool(rule["new_comment"]), f"{key}.new_comment", "a boolean")
 
 
-def _check_project(project_id: str, entry: Any) -> None:
-    key = f"sources.asana.projects.{project_id}"
+def _check_project(project_id: str, entry: Any, source: str = "asana") -> None:
+    key = f"sources.{source}.projects.{project_id}"
     if isinstance(entry, str):
         _require(bool(entry), key, "a non-empty repo string or an object")
         return
@@ -621,7 +665,82 @@ def _check_maildir(name: str, section: Any) -> None:
     _check_message_rules(section.get("rules"), f"{prefix}.rules", "maildir")
 
 
-def _check_sources(section: Any) -> None:
+def _is_slug(value: Any) -> bool:
+    return (
+        _is_str(value)
+        and GITHUB_SLUG.fullmatch(value) is not None
+        and all(part not in (".", "..") for part in value.split("/"))
+    )
+
+
+def _check_github_rules(rules: Any, prefix: str, types: Mapping) -> None:
+    key = f"{prefix}.rules"
+    _require(isinstance(rules, list), key, "a list")
+    seen: set[str] = set()
+    for index, rule in enumerate(rules):
+        rkey = f"{key}[{index}]"
+        _require(_is_obj(rule), rkey, "an object")
+        unknown = sorted(set(rule) - _GITHUB_RULE_KEYS)
+        _require(
+            not unknown, rkey,
+            f"free of unknown keys ({', '.join(unknown)}); allowed: {', '.join(sorted(_GITHUB_RULE_KEYS))}",
+        )
+        name = rule.get("name")
+        _require(
+            _is_str(name) and PLAYBOOK_NAME.fullmatch(name) is not None,
+            f"{rkey}.name",
+            "a rule name (lowercase letters, digits and dashes)",
+        )
+        _require(name not in seen, f"{rkey}.name", "unique within the list")
+        seen.add(name)
+        _require(
+            rule.get("type") in types or rule.get("type") == TYPE_IGNORE,
+            f"{rkey}.type",
+            "a key of dispatch.types or 'ignore'",
+        )
+        # Without `repos` a rule applies to every watched repository.
+        if "repos" in rule:
+            repos = rule["repos"]
+            _require(
+                isinstance(repos, list) and bool(repos) and all(_is_slug(r) for r in repos),
+                f"{rkey}.repos",
+                "a non-empty list of owner/name slugs",
+            )
+        if "kind" in rule:
+            _require(rule["kind"] in _GITHUB_KINDS, f"{rkey}.kind", f"one of {', '.join(_GITHUB_KINDS)}")
+        if "state" in rule:
+            _require(rule["state"] in ("open", "closed"), f"{rkey}.state", "one of open, closed")
+        for list_key in ("labels", "assignee", "author", "review_requested"):
+            if list_key in rule:
+                _require(
+                    _is_str_list(rule[list_key]) and bool(rule[list_key]) and all(rule[list_key]),
+                    f"{rkey}.{list_key}",
+                    "a non-empty list of non-empty strings",
+                )
+        for flag in ("draft", "failing_checks"):
+            if flag in rule:
+                _require(_is_bool(rule[flag]), f"{rkey}.{flag}", "a boolean")
+        for pr_only in ("draft", "review_requested", "failing_checks"):
+            _require(
+                not (pr_only in rule and rule.get("kind") == "issue"),
+                f"{rkey}.{pr_only}",
+                "unset when kind is issue: it applies to pull requests only",
+            )
+
+
+def _check_github(name: str, section: Any, types: Mapping) -> None:
+    prefix = f"sources.{name}"
+    _check_section(section, _GITHUB_SCHEMA, f"dispatch.{prefix}")
+    _check_schedule(section.get("schedule"), f"{prefix}.schedule")
+    projects = section.get("projects")
+    _require(_is_obj(projects), f"{prefix}.projects", "an object")
+    for slug, entry in projects.items():
+        _require(_is_slug(slug), f"{prefix}.projects.{slug}", "keyed by owner/name repository slugs")
+        _check_project(slug, entry, source=name)
+    _check_github_rules(section.get("rules"), prefix, types)
+
+
+def _check_sources(section: Any, types: Mapping) -> None:
     _require(_is_obj(section), "sources", "an object")
     if "asana" in section:
         _check_asana(section["asana"])
@@ -642,6 +761,8 @@ def _check_sources(section: Any) -> None:
             _check_slack(name, merged)
         elif kind == "maildir":
             _check_maildir(name, merged)
+        elif kind == "github":
+            _check_github(name, merged, types)
 
 
 def _check_email(section: Any) -> None:
@@ -672,6 +793,8 @@ def _check_notifiers(section: Any) -> None:
         _check_section(section["log"], _LOG_SCHEMA, "dispatch.notifiers.log")
     if "macos" in section:
         _check_section(section["macos"], _MACOS_SCHEMA, "dispatch.notifiers.macos")
+    if "linux" in section:
+        _check_section(section["linux"], _LINUX_SCHEMA, "dispatch.notifiers.linux")
     if "email" in section:
         _check_email(section["email"])
 
@@ -833,6 +956,47 @@ def _check_overrides(overrides: Any) -> None:
             )
 
 
+def _check_quota(section: Any) -> None:
+    key = "routing.quota"
+    _require(_is_obj(section), key, "an object")
+    _require(_is_bool(section.get("enabled")), f"{key}.enabled", "a boolean")
+    for name in ("max_age_minutes", "reset_soon_minutes", "record_min_interval_seconds"):
+        _require(_is_non_negative_number(section.get(name)), f"{key}.{name}", "a number >= 0")
+    for name in ("weight", "exhausted_factor", "reset_soon_factor"):
+        _require(
+            _is_number(section.get(name)) and 0 <= section[name] <= 1,
+            f"{key}.{name}",
+            "a number from 0 to 1",
+        )
+    percent = section.get("min_remaining_percent")
+    _require(_is_number(percent) and 0 <= percent <= 100, f"{key}.min_remaining_percent", "a number from 0 to 100")
+    directory = section.get("snapshot_dir")
+    _require(directory is None or _is_str(directory), f"{key}.snapshot_dir", "a string or null")
+    clients = section.get("clients")
+    _require(_is_obj(clients), f"{key}.clients", "an object")
+    for name, entry in clients.items():
+        ckey = f"{key}.clients.{name}"
+        _require(_is_obj(entry), ckey, "an object")
+        reader = entry.get("reader")
+        _require(reader in _QUOTA_READERS, f"{ckey}.reader", f"one of {', '.join(_QUOTA_READERS)}")
+        if reader != "codex_sessions":
+            continue
+        _require(_is_nonempty_str(entry.get("sessions_dir")), f"{ckey}.sessions_dir", "a non-empty string")
+        for field, minimum in (("max_days", 1), ("max_files", 1), ("max_tail_bytes", 1024)):
+            _require(
+                _is_int(entry.get(field)) and entry[field] >= minimum,
+                f"{ckey}.{field}",
+                f"an integer >= {minimum}",
+            )
+
+
+def _check_window_cleanup(section: Any) -> None:
+    _require(_is_obj(section), "window_cleanup", "an object")
+    _require(_is_bool(section.get("enabled")), "window_cleanup.enabled", "a boolean")
+    for name in ("idle_minutes", "max_per_run"):
+        _require(_is_int(section.get(name)) and section[name] >= 1, f"window_cleanup.{name}", "an integer >= 1")
+
+
 def _check_routing(section: Any) -> None:
     _require(_is_obj(section), "routing", "an object")
     _require(_is_bool(section.get("enabled")), "routing.enabled", "a boolean")
@@ -842,6 +1006,8 @@ def _check_routing(section: Any) -> None:
         _check_routing_client(name, entry)
     _check_complexity(section.get("complexity"))
     _check_overrides(section.get("overrides"))
+    if "quota" in section:
+        _check_quota(section["quota"])
 
 
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
@@ -957,13 +1123,14 @@ def validate(section: Any) -> None:
     _check_section(section, _TOP_SCHEMA, "dispatch")
     _check_notify_on(section["notify_on"])
     _check_worktree_cleanup(section.get("worktree_cleanup"))
+    _check_window_cleanup(section.get("window_cleanup"))
     _check_working_hours(section.get("working_hours"))
     _check_label(section.get("label"))
     _check_handoff_channel(section["handoff_channel"])
     _check_defaults(section.get("defaults"))
     _check_types(section.get("types"))
     _check_rules(section.get("rules"), section["types"])
-    _check_sources(section.get("sources"))
+    _check_sources(section.get("sources"), section["types"])
     _check_notifiers(section.get("notifiers"))
     _check_timer(section.get("timer"))
     _check_dispatcher(section.get("dispatcher"))
@@ -1118,6 +1285,10 @@ def incident_dir(dispatch_cfg: Mapping) -> Path:
 
 def scanner_dir(dispatch_cfg: Mapping) -> Path:
     return _configured_or(dispatch_cfg["scanner"].get("dir"), "dispatch-scanner")
+
+
+def quota_dir(dispatch_cfg: Mapping) -> Path:
+    return _configured_or(dispatch_cfg["routing"]["quota"]["snapshot_dir"], "quota")
 
 
 def scan_lock_path() -> Path:

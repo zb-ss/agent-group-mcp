@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import plistlib
+import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -148,3 +150,107 @@ def test_always_off_keeps_the_calendar_files(cfg, tmp_path):
     cfg["dispatch"]["timer"]["always"] = False
     assert _plan(cfg, tmp_path, "linux").files[1].content == base
     assert b"OnUnitActiveSec" not in base
+
+
+def test_systemd_folder_follows_an_absolute_xdg_config_home(cfg, tmp_path):
+    xdg = tmp_path / "xdg"
+    env = {**ENV, "XDG_CONFIG_HOME": str(xdg)}
+    for kwargs in ({}, {"uninstall": True}):
+        plan = timer.plan(cfg, bin_path=BIN, platform="linux", home=tmp_path, env=env, **kwargs)
+        assert [f.path.parent for f in plan.files] == [xdg / "systemd" / "user"] * 2
+
+
+@pytest.mark.parametrize("xdg", [None, "", "relative/dir"])
+def test_systemd_folder_falls_back_to_home(cfg, tmp_path, xdg):
+    env = dict(ENV) if xdg is None else {**ENV, "XDG_CONFIG_HOME": xdg}
+    install = timer.plan(cfg, bin_path=BIN, platform="linux", home=tmp_path, env=env)
+    remove = timer.plan(cfg, bin_path=BIN, platform="linux", home=tmp_path, env=env, uninstall=True)
+    expected = tmp_path / ".config" / "systemd" / "user"
+    assert all(f.path.parent == expected for f in install.files)
+    assert [f.path for f in remove.files] == [f.path for f in install.files]
+
+
+def test_exec_start_escapes_dollar_and_percent(cfg, tmp_path):
+    cfg["dispatch"]["timer"]["command"] = ["{agent_bus_bin}", "run", "$HOME", "50%"]
+    service = _plan(cfg, tmp_path, "linux").files[0].content.decode()
+    assert "ExecStart=/usr/local/bin/agent-bus run '$$HOME' 50%%" in service
+    assert "$$$" not in service and "%%%" not in service
+
+
+def test_login_shell_command_is_one_quoted_argument(cfg, tmp_path):
+    cfg["dispatch"]["timer"]["command"] = [
+        "/bin/bash",
+        "-lc",
+        "exec {agent_bus_bin} dispatch run",
+    ]
+    service = timer.plan(
+        cfg, bin_path="/opt/example/bin/agent-bus", platform="linux", home=tmp_path, env=ENV
+    ).files[0].content.decode()
+    assert "ExecStart=/bin/bash -lc 'exec /opt/example/bin/agent-bus dispatch run'" in service
+
+
+def test_linger_note_only_on_systemd_install(cfg, tmp_path):
+    install = _plan(cfg, tmp_path, "linux")
+    assert len(install.notes) == 1 and "loginctl enable-linger" in install.notes[0]
+    assert _plan(cfg, tmp_path, "linux", uninstall=True).notes == ()
+    assert _plan(cfg, tmp_path, "darwin").notes == ()
+
+
+def test_service_holds_no_env_file_reference_or_secret(cfg, tmp_path):
+    env_file = tmp_path / "dispatch.env"
+    env_file.write_text("EXAMPLE_TOKEN=plainly-fake-value\n")
+    cfg["dispatch"]["env_file"] = str(env_file)
+    service = _plan(cfg, tmp_path, "linux").files[0].content.decode()
+    assert "EnvironmentFile" not in service
+    assert "plainly-fake-value" not in service
+
+
+needs_systemd_analyze = pytest.mark.skipif(
+    not (sys.platform.startswith("linux") and shutil.which("systemd-analyze")),
+    reason="needs Linux with systemd-analyze",
+)
+
+
+def _analyze(*args):
+    return subprocess.run(
+        ["systemd-analyze", *args], capture_output=True, text=True, timeout=60, check=False
+    )
+
+
+@needs_systemd_analyze
+def test_systemd_analyze_accepts_calendar_and_timespan(cfg, tmp_path):
+    cfg["dispatch"]["timer"]["always"] = False
+    unit = _plan(cfg, tmp_path, "linux").files[1].content.decode()
+    expressions = [l.split("=", 1)[1] for l in unit.splitlines() if l.startswith("OnCalendar=")]
+    assert expressions
+    for expression in expressions[:: max(1, len(expressions) // 8)] + expressions[-1:]:
+        done = _analyze("calendar", expression)
+        assert done.returncode == 0, (expression, done.stderr)
+    cfg["dispatch"]["timer"].update(always=True, interval_minutes=5)
+    unit = _plan(cfg, tmp_path, "linux").files[1].content.decode()
+    spans = [l.split("=", 1)[1] for l in unit.splitlines() if l.startswith("OnUnitActiveSec=")]
+    assert spans
+    for span in spans:
+        done = _analyze("timespan", span)
+        assert done.returncode == 0, (span, done.stderr)
+
+
+@needs_systemd_analyze
+def test_systemd_analyze_verify_reports_no_parse_error(cfg, tmp_path):
+    cfg["dispatch"]["timer"]["always"] = True
+    plan = timer.plan(cfg, bin_path=sys.executable, platform="linux", home=tmp_path, env=ENV)
+    paths = []
+    for item in plan.files:
+        path = tmp_path / item.path.name
+        path.write_bytes(item.content)
+        paths.append(str(path))
+    done = _analyze("verify", *paths)
+    directives = ("ExecStart", "Environment", "StandardOutput", "StandardError", "Type",
+                  "OnActiveSec", "OnUnitActiveSec", "OnCalendar", "Persistent", "WantedBy")
+    bad = [
+        line
+        for line in (done.stdout + done.stderr).splitlines()
+        if any(d in line for d in directives)
+        and any(w in line.lower() for w in ("parse", "invalid", "unknown key", "failed to"))
+    ]
+    assert not bad, bad

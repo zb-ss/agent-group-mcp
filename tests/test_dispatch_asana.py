@@ -189,6 +189,32 @@ def test_missing_token_names_variable_only():
         src.fetch(today=TODAY)
 
 
+# A CR or LF in the token would make urllib raise a ValueError that quotes the
+# header value; the source must refuse such a token before any request.
+@pytest.mark.parametrize("bad", ["abc\r\nX-Injected: 1", "abc\ndef", "abc def", "abc\tdef",
+                                 "abc\x00", "abc\x7f", "caf\u00e9"])
+def test_malformed_token_names_variable_only_and_sends_nothing(bad):
+    http = FakeHttp({})
+    src = AsanaSource(cfg(), env={"FAKE_TOKEN_VAR": bad}, http_get=http)
+    with pytest.raises(SourceError) as info:
+        src.fetch(today=TODAY)
+    assert str(info.value) == (
+        "asana: environment variable FAKE_TOKEN_VAR holds an invalid token "
+        "(whitespace or control characters)"
+    )
+    assert "abc" not in str(info.value) and http.calls == []
+
+
+def test_malformed_token_never_reaches_urllib(monkeypatch):
+    def opener():
+        raise AssertionError("no request may be built")
+
+    monkeypatch.setattr(source, "_build_opener", opener)
+    src = AsanaSource(cfg(), env={"FAKE_TOKEN_VAR": "abc\r\nX-Injected: 1"})
+    with pytest.raises(SourceError, match="FAKE_TOKEN_VAR holds an invalid token"):
+        src.fetch(today=TODAY)
+
+
 def test_http_failure_propagates_without_token():
     http = FakeHttp({"/users/me": SourceError("HTTP 401 from asana.example.com")})
     src = AsanaSource(cfg(), env={"FAKE_TOKEN_VAR": TOKEN}, http_get=http)

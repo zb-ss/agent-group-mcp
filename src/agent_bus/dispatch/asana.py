@@ -81,10 +81,7 @@ class AsanaSource:
     # -- fetch ----------------------------------------------------------
 
     def fetch(self, *, today: date) -> list[Task]:
-        token_env = self._cfg["token_env"]
-        token = self._env.get(token_env)
-        if not token:
-            raise SourceError(f"asana: environment variable {token_env} is not set")
+        token = source.read_token(self._cfg, self._env, "asana: ")
         self._headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",

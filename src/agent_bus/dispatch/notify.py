@@ -1,12 +1,17 @@
 """Notifiers: thin messages (session, state, title, link, session links) to
-log, macOS, email. The log line and the email carry the session links; the
-macOS banner stays one line. The email is multipart: plain text plus HTML with
-clickable, escaped anchors."""
+log, macOS, Linux desktop, email. The log line and the email carry the session
+links; the desktop banners stay one line. The email is multipart: plain text
+plus HTML with clickable, escaped anchors.
+
+Desktop notifiers are best-effort: a banner that fails is reported as a warning
+and never leaves an alert pending, so a machine without a working notification
+daemon does not retry (and fail) every alert on every run."""
 
 from __future__ import annotations
 
 import html
 import os
+import shutil
 import smtplib
 import ssl
 import subprocess
@@ -72,6 +77,7 @@ class LogNotifier:
 
 class MacosNotifier:
     name = "macos"
+    desktop = True
 
     def __init__(
         self, cfg: Mapping, *, run: commands.Runner, platform: str = sys.platform
@@ -104,6 +110,78 @@ class MacosNotifier:
             raise NotifyError(f"osascript failed: {type(exc).__name__}") from exc
         if result.returncode != 0:
             raise NotifyError(f"osascript exited with {result.returncode}")
+
+
+# A graphical session a notification daemon can show a banner on. The session
+# bus address alone proves nothing: lingering user units and SSH logins export
+# it on machines that have no daemon to answer.
+LINUX_SESSION_ENV = ("DISPLAY", "WAYLAND_DISPLAY")
+# The only variables notify-send takes from the merged mapping (the process
+# environment plus dispatch.env_file): it needs the session's display and bus,
+# never the tokens and passwords that file holds.
+LINUX_HELPER_ENV = LINUX_SESSION_ENV + ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR")
+
+
+class LinuxNotifier:
+    name = "linux"
+    desktop = True
+
+    def __init__(
+        self,
+        cfg: Mapping,
+        *,
+        run: commands.Runner,
+        platform: str = sys.platform,
+        which: Callable[[str], str | None] = shutil.which,
+        env: Mapping[str, str] | None = None,
+        base_env: Mapping[str, str] | None = None,
+    ):
+        self._cfg = cfg
+        self._run = run
+        self._platform = platform
+        self._which = which
+        self._env = os.environ if env is None else env
+        self._base_env = os.environ if base_env is None else base_env
+
+    @property
+    def enabled(self) -> bool:
+        # A headless machine (no binary, or no display for a notification
+        # daemon to answer on) stays quiet instead of failing every alert.
+        return (
+            bool(self._cfg["enabled"])
+            and self._platform.startswith("linux")
+            and self._which(self._cfg["notify_send_bin"]) is not None
+            and any(self._env.get(name) for name in LINUX_SESSION_ENV)
+        )
+
+    def send(self, notification: Notification) -> None:
+        if not self.enabled:
+            return
+        # The untrusted title sits only in the summary (a body can be rendered
+        # as markup); "--" keeps any text from being parsed as an option.
+        argv = [
+            self._cfg["notify_send_bin"],
+            "--app-name", self._cfg["title"],
+            "--",
+            f"{notification.state}: {notification.title}",
+            notification.session or "",
+        ]
+        try:
+            result = self._run(
+                argv, timeout=self._cfg["timeout_seconds"], env=self._helper_env()
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise NotifyError(f"notify-send failed: {type(exc).__name__}") from exc
+        if result.returncode != 0:
+            raise NotifyError(f"notify-send exited with {result.returncode}")
+
+    def _helper_env(self) -> dict[str, str]:
+        """The process environment, with the session variables taken only from
+        the mapping `enabled` checked, so the display it saw is the one used
+        and no other env-file value reaches the helper."""
+        env = {k: v for k, v in self._base_env.items() if k not in LINUX_HELPER_ENV}
+        env.update({k: self._env[k] for k in LINUX_HELPER_ENV if self._env.get(k)})
+        return env
 
 
 def connect_smtp(security: str, host: str, port: int, timeout: float) -> Any:
@@ -220,19 +298,31 @@ def build(
     return [
         LogNotifier(log_path),
         MacosNotifier(notifiers_cfg["macos"], run=run, platform=platform),
+        LinuxNotifier(notifiers_cfg["linux"], run=run, platform=platform, env=env),
         EmailNotifier(notifiers_cfg["email"], env=env, smtp_factory=smtp_factory),
     ]
 
 
+def _warn_stderr(line: str) -> None:
+    sys.stderr.write(f"agent-bus: warning: {line}\n")
+
+
 def deliver(
-    notifiers: Sequence[Notifier], notification: Notification, *, max_chars: int
+    notifiers: Sequence[Notifier],
+    notification: Notification,
+    *,
+    max_chars: int,
+    warn: Callable[[str], None] = _warn_stderr,
 ) -> tuple[bool, list[str]]:
-    """Send to every notifier. Returns (delivered, errors): delivered is True
-    when at least one enabled alerting notifier succeeded (the log is a record,
-    not an alert), so a caller can leave the notification pending for the next
-    run when no alert got through. With no alerting notifier enabled at all
-    there is nothing to retry, so it counts as delivered. Errors carry the
-    exception type only, never a secret."""
+    """Send to every notifier. Returns (delivered, errors).
+
+    Desktop notifiers (macOS, Linux) are best-effort: a failure is passed to
+    `warn` once and is neither an error nor a reason to retry. delivered is
+    False only when a non-desktop alerting notifier (email) was enabled and
+    none of those succeeded, so the caller leaves the notification pending for
+    the next run. With no such notifier enabled there is nothing to retry, so
+    it counts as delivered (the log is a record, not an alert). Errors and
+    warnings carry the exception type only, never a secret or the title."""
     safe = Notification(
         session=notification.session,
         state=notification.state,
@@ -241,15 +331,18 @@ def deliver(
         links=_safe_links(notification.links),
     )
     errors: list[str] = []
-    alerting = [n for n in notifiers if _alerts(n)]
-    delivered = not alerting
+    required = [n for n in notifiers if _alerts(n) and not _is_desktop(n)]
+    delivered = not required
     for notifier in notifiers:
         try:
             notifier.send(safe)
         except (NotifyError, OSError) as exc:
-            errors.append(f"{notifier.name}: {exc}")
+            if _is_desktop(notifier):
+                warn(f"{notifier.name}: {exc}")
+            else:
+                errors.append(f"{notifier.name}: {exc}")
             continue
-        delivered = delivered or _alerts(notifier)
+        delivered = delivered or notifier in required
     return delivered, errors
 
 
@@ -268,6 +361,10 @@ def _safe_links(pairs: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]
 def _alerts(notifier: Notifier) -> bool:
     """True for an enabled notifier that actually reaches the owner."""
     return bool(getattr(notifier, "enabled", True)) and bool(getattr(notifier, "alerts", True))
+
+
+def _is_desktop(notifier: Notifier) -> bool:
+    return bool(getattr(notifier, "desktop", False))
 
 
 def send_all(

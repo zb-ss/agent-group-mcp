@@ -578,3 +578,125 @@ def test_schedule_due_interval_and_tolerance():
     assert _due(schedule, stamp(1000), now=now) is True
     assert _due(schedule, "garbage", now=now) is True
     assert _due(schedule, None, now=now) is True
+
+
+# ------------------------------ M4 keys ---------------------------------------
+
+NEW_BAD_VALUES = [
+    ({"window_cleanup": {"enabled": "yes"}}, "dispatch.window_cleanup.enabled"),
+    ({"window_cleanup": {"idle_minutes": 0}}, "dispatch.window_cleanup.idle_minutes"),
+    ({"window_cleanup": {"max_per_run": 1.5}}, "dispatch.window_cleanup.max_per_run"),
+    ({"notifiers": {"linux": {"enabled": 1}}}, "dispatch.notifiers.linux.enabled"),
+    ({"notifiers": {"linux": {"notify_send_bin": ""}}}, "dispatch.notifiers.linux.notify_send_bin"),
+    ({"notifiers": {"linux": {"timeout_seconds": "x"}}}, "dispatch.notifiers.linux.timeout_seconds"),
+    ({"routing": {"quota": {"enabled": "on"}}}, "dispatch.routing.quota.enabled"),
+    ({"routing": {"quota": {"weight": 1.5}}}, "dispatch.routing.quota.weight"),
+    ({"routing": {"quota": {"exhausted_factor": -0.1}}}, "dispatch.routing.quota.exhausted_factor"),
+    ({"routing": {"quota": {"min_remaining_percent": 101}}}, "dispatch.routing.quota.min_remaining_percent"),
+    ({"routing": {"quota": {"max_age_minutes": -1}}}, "dispatch.routing.quota.max_age_minutes"),
+    ({"routing": {"quota": {"snapshot_dir": 3}}}, "dispatch.routing.quota.snapshot_dir"),
+    ({"routing": {"quota": {"clients": {"claude": {"reader": "http"}}}}}, "dispatch.routing.quota.clients.claude.reader"),
+    ({"routing": {"quota": {"clients": {"codex": {"max_tail_bytes": 10}}}}}, "dispatch.routing.quota.clients.codex.max_tail_bytes"),
+    ({"routing": {"quota": {"clients": {"codex": {"max_files": 0}}}}}, "dispatch.routing.quota.clients.codex.max_files"),
+    ({"sources": {"github": {"base_url": "http://api.example.com"}}}, "dispatch.sources.github.base_url"),
+    ({"sources": {"github": {"web_base_url": "ftp://x"}}}, "dispatch.sources.github.web_base_url"),
+    ({"sources": {"github": {"token_env": "not a name"}}}, "dispatch.sources.github.token_env"),
+    ({"sources": {"github": {"page_size": 101}}}, "dispatch.sources.github.page_size"),
+    ({"sources": {"github": {"max_pages": 0}}}, "dispatch.sources.github.max_pages"),
+    ({"sources": {"github": {"max_calls_per_run": 0}}}, "dispatch.sources.github.max_calls_per_run"),
+    ({"sources": {"github": {"max_untrusted_alerts_per_run": -1}}}, "dispatch.sources.github.max_untrusted_alerts_per_run"),
+    ({"sources": {"github": {"max_untrusted_alerts_per_run": True}}}, "dispatch.sources.github.max_untrusted_alerts_per_run"),
+    ({"sources": {"github": {"state": "merged"}}}, "dispatch.sources.github.state"),
+    ({"sources": {"github": {"updated_within_days": -1}}}, "dispatch.sources.github.updated_within_days"),
+    ({"sources": {"github": {"comment_lookback_days": 1.5}}}, "dispatch.sources.github.comment_lookback_days"),
+    ({"sources": {"github": {"owner_login": 5}}}, "dispatch.sources.github.owner_login"),
+    ({"sources": {"github": {"trusted_authors": ["a b"]}}}, "dispatch.sources.github.trusted_authors"),
+    ({"sources": {"github": {"failing_conclusions": [""]}}}, "dispatch.sources.github.failing_conclusions"),
+    ({"sources": {"github": {"schedule": {"interval_minutes": 0, "hours": "always"}}}}, "dispatch.sources.github.schedule.interval_minutes"),
+    ({"sources": {"github": {"projects": {"no-slash": "r"}}}}, "dispatch.sources.github.projects.no-slash"),
+    ({"sources": {"github": {"projects": {"owner/..": "r"}}}}, "dispatch.sources.github.projects.owner/.."),
+    ({"sources": {"github": {"projects": {"../name": "r"}}}}, "dispatch.sources.github.projects.../name"),
+    ({"sources": {"github": {"projects": {"example-owner/example-project": {"repo": ""}}}}}, "sources.github.projects.example-owner/example-project.repo"),
+]
+
+
+@pytest.mark.parametrize("override, key", NEW_BAD_VALUES)
+def test_new_bad_values_name_their_key(bus_paths, override, key):
+    with pytest.raises(config.ConfigError, match=key.replace(".", r"\.")):
+        config.validate_user({"dispatch": override})
+
+
+def test_notify_type_needs_no_playbook_but_spawn_does(bus_paths):
+    config.validate_user({"dispatch": {"types": {"heads-up": {"action": "notify", "playbook": None}}}})
+    config.validate_user({"dispatch": {"types": {"heads-up": {"action": "ignore"}}}})
+    with pytest.raises(config.ConfigError, match="types.heads-up.playbook"):
+        config.validate_user({"dispatch": {"types": {"heads-up": {"action": "spawn"}}}})
+    with pytest.raises(config.ConfigError, match="types.heads-up.playbook"):
+        config.validate_user({"dispatch": {"types": {"heads-up": {"action": "notify", "playbook": "A/b"}}}})
+
+
+def _github(**rule):
+    base = {"name": "r1", "type": "notice", "repos": ["example-owner/example-project"]}
+    return {"dispatch": {"sources": {"github": {"rules": [{**base, **rule}]}}}}
+
+
+def test_github_rules_valid(bus_paths):
+    merged = config.validate_user(_github(
+        kind="pull_request", state="open", labels=["bug"], assignee=["a"], author=["b"],
+        draft=False, review_requested=["c"], failing_checks=True,
+    ))
+    assert merged["dispatch"]["sources"]["github"]["rules"][0]["name"] == "r1"
+    config.validate_user(_github(type="ignore"))
+
+
+@pytest.mark.parametrize("rule, key", [
+    ({"nope": 1}, r"rules\[0\]"),
+    ({"name": "Bad Name"}, r"rules\[0\]\.name"),
+    ({"type": "missing"}, r"rules\[0\]\.type"),
+    ({"repos": []}, r"rules\[0\]\.repos"),
+    ({"repos": ["no-slash"]}, r"rules\[0\]\.repos"),
+    ({"repos": ["owner/.."]}, r"rules\[0\]\.repos"),
+    ({"kind": "discussion"}, r"rules\[0\]\.kind"),
+    ({"state": "all"}, r"rules\[0\]\.state"),
+    ({"labels": []}, r"rules\[0\]\.labels"),
+    ({"author": [""]}, r"rules\[0\]\.author"),
+    ({"draft": "no"}, r"rules\[0\]\.draft"),
+    ({"kind": "issue", "draft": True}, r"rules\[0\]\.draft"),
+    ({"kind": "issue", "review_requested": ["a"]}, r"rules\[0\]\.review_requested"),
+    ({"kind": "issue", "failing_checks": True}, r"rules\[0\]\.failing_checks"),
+])
+def test_github_rule_errors(bus_paths, rule, key):
+    with pytest.raises(config.ConfigError, match=key):
+        config.validate_user(_github(**rule))
+
+
+def test_github_rule_names_must_be_unique(bus_paths):
+    rule = {"name": "same", "type": "notice", "repos": ["example-owner/example-project"]}
+    user = {"dispatch": {"sources": {"github": {"rules": [rule, dict(rule)]}}}}
+    with pytest.raises(config.ConfigError, match=r"rules\[1\]\.name"):
+        config.validate_user(user)
+
+
+def test_quota_dir_defaults_beside_the_db(bus_paths):
+    cfg = config.defaults()["dispatch"]
+    assert settings.quota_dir(cfg) == bus_paths["db"].parent / "quota"
+    cfg["routing"]["quota"]["snapshot_dir"] = "/somewhere/q"
+    assert settings.quota_dir(cfg) == Path("/somewhere/q")
+
+
+def test_task_new_fields_default_to_inert():
+    from agent_bus.dispatch.model import Task
+
+    task = Task("s", "1", "t", "u", None, None, None)
+    assert task.type_hint is None and task.spawn_allowed is True
+
+
+def test_github_rule_without_repos_applies_everywhere_and_is_valid(bus_paths):
+    rule = {"name": "all-repos", "type": "notice"}
+    merged = config.validate_user({"dispatch": {"sources": {"github": {"rules": [rule]}}}})
+    assert "repos" not in merged["dispatch"]["sources"]["github"]["rules"][0]
+
+
+def test_github_untrusted_alert_cap_default_and_zero(bus_paths):
+    assert config.defaults()["dispatch"]["sources"]["github"]["max_untrusted_alerts_per_run"] == 3
+    config.validate_user({"dispatch": {"sources": {"github": {"max_untrusted_alerts_per_run": 0}}}})

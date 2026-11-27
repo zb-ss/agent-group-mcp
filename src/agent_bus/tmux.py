@@ -3,8 +3,10 @@ window. Every call goes through a `Runner` so tests never run a real tmux."""
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
@@ -58,6 +60,88 @@ def window_ids(
     return ids
 
 
+@dataclass(frozen=True)
+class WindowInfo:
+    id: str
+    panes: int
+    active: bool
+    session_attached: bool
+
+
+def windows(
+    session: str, window: str, *, tmux_bin: str, timeout: float, run: Runner = run_command
+) -> list[WindowInfo]:
+    """The windows of `session` named exactly `window`, with what a caller
+    needs to judge whether closing one could disturb a person."""
+    fmt = "\t".join(
+        ["#{window_id}", "#{window_name}", "#{window_panes}", "#{window_active}",
+         "#{session_attached}"]
+    )
+    done = _run(
+        [tmux_bin, "list-windows", "-t", f"={session}", "-F", fmt], timeout=timeout, run=run
+    )
+    if done.returncode != 0:
+        detail = (done.stderr or "").strip() or f"exit {done.returncode}"
+        raise TmuxError(f"tmux list-windows failed: {detail}")
+    found = []
+    for line in (done.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 5 or parts[1] != window:
+            continue
+        try:
+            panes = int(parts[2])
+            attached = int(parts[4]) > 0
+        except ValueError as exc:
+            raise TmuxError("tmux list-windows returned unreadable counts") from exc
+        found.append(WindowInfo(parts[0], panes, parts[3] == "1", attached))
+    return found
+
+
+def capture_pane(
+    window_id: str, *, lines: int, escapes: bool, tmux_bin: str, timeout: float,
+    run: Runner = run_command,
+) -> str:
+    """The last `lines` non-blank-trailing lines of the window's pane (read
+    only). tmux returns the whole visible pane plus `lines` of history, and
+    the rows below a prompt are blank padding, so the blank tail is dropped
+    and only the last `lines` lines are kept: a pattern then matches the
+    prompt area, not output higher up the screen."""
+    count = int(lines)
+    argv = [tmux_bin, "capture-pane", "-p", "-t", window_id, "-S", f"-{count}"]
+    if escapes:
+        argv.append("-e")
+    done = _run(argv, timeout=timeout, run=run)
+    if done.returncode != 0:
+        detail = (done.stderr or "").strip() or f"exit {done.returncode}"
+        raise TmuxError(f"tmux capture-pane failed: {detail}")
+    return _tail(done.stdout or "", count)
+
+
+_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _is_blank(line: str) -> bool:
+    # With -e an empty row can still carry a reset sequence.
+    return not _ESCAPE.sub("", line).strip()
+
+
+def _tail(text: str, count: int) -> str:
+    rows = text.splitlines()
+    while rows and _is_blank(rows[-1]):
+        rows.pop()
+    kept = rows[-count:] if count > 0 else []
+    return "\n".join(kept) + "\n" if kept else ""
+
+
+def kill_window(
+    window_id: str, *, tmux_bin: str, timeout: float, run: Runner = run_command
+) -> None:
+    done = _run([tmux_bin, "kill-window", "-t", window_id], timeout=timeout, run=run)
+    if done.returncode != 0:
+        detail = (done.stderr or "").strip() or f"exit {done.returncode}"
+        raise TmuxError(f"tmux kill-window failed: {detail}")
+
+
 def kill_windows(
     session: str, window: str, *, tmux_bin: str, timeout: float, run: Runner = run_command
 ) -> int:
@@ -106,7 +190,7 @@ _COMM_LIMIT = 15
 
 def _require_client_running(
     target: str, client: str, *, tmux_bin: str, timeout: float, run: Runner,
-    env: Mapping[str, str] | None,
+    env: Mapping[str, str] | None, process_name: str | None = None,
 ) -> None:
     """A first prompt must never reach a login shell: tracker text in it would
     run. The window's command is `<client>; <after_exit>`, run by a shell
@@ -114,8 +198,10 @@ def _require_client_running(
     the whole life of the client. Any child of the pane's shell is no proof (a
     helper of the login shell is one too): require a direct child whose process
     name is the client binary's. Once the client has exited the after_exit
-    shell replaces the wrapper (same pid) and has no such child."""
-    name = Path(client).name[:_COMM_LIMIT]
+    shell replaces the wrapper (same pid) and has no such child. A client that
+    runs under another process name sets `process_name`; the check itself
+    cannot be skipped."""
+    name = (process_name or Path(client).name)[:_COMM_LIMIT]
     if not name:
         raise TmuxError(f"window {target}: no client name to recognise its process by")
     probe = _run(
@@ -141,6 +227,7 @@ def paste_file(
     timeout: float,
     run: Runner = run_command,
     env: Mapping[str, str] | None = None,
+    process_name: str | None = None,
 ) -> None:
     """Type the contents of `file` into the window `target` (a window id from
     `launch`), then press Enter. tmux reads the file itself, so the text never
@@ -151,7 +238,8 @@ def paste_file(
     if not target:
         raise TmuxError("no window id to paste into")
     check = lambda: _require_client_running(  # noqa: E731
-        target, client, tmux_bin=tmux_bin, timeout=timeout, run=run, env=env)
+        target, client, tmux_bin=tmux_bin, timeout=timeout, run=run, env=env,
+        process_name=process_name)
     check()
     buffer = f"agent-bus-{target.lstrip('@')}"
     steps = (

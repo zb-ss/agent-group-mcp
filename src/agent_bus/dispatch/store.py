@@ -106,6 +106,7 @@ EVENT_SCAN = "scan"
 EVENT_DRAFT = "draft"
 EVENT_SEND = "send"
 EVENT_INCIDENT = "incident"
+EVENT_WINDOW_CLOSED = "window_closed"
 
 DRAFT_PENDING = "pending"
 DRAFT_SENDING = "sending"

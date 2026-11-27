@@ -7,6 +7,7 @@ redirects, retry one HTTP 429 and raise errors that name only the host.
 
 from __future__ import annotations
 
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -31,6 +32,27 @@ HttpSend = Callable[[str, "bytes | None", Mapping[str, str], float], HttpRespons
 
 class SourceError(Exception):
     """A source could not deliver tasks. Messages never carry secrets."""
+
+
+# A bearer token is printable ASCII without spaces. Anything else (a CR or LF
+# above all) would be refused by urllib with the header value in the message.
+_TOKEN = re.compile(r"[\x21-\x7e]+")
+
+
+def read_token(cfg: Mapping, env: Mapping[str, str], prefix: str = "") -> str:
+    """The token from the environment variable named by `cfg["token_env"]`.
+    Errors name the variable only, never its value; `prefix` (such as
+    "github: ") starts every error message."""
+    token_env = cfg["token_env"]
+    token = env.get(token_env)
+    if not token:
+        raise SourceError(f"{prefix}environment variable {token_env} is not set")
+    if _TOKEN.fullmatch(token) is None:
+        raise SourceError(
+            f"{prefix}environment variable {token_env} holds an invalid token "
+            "(whitespace or control characters)"
+        )
+    return token
 
 
 def _host(url: str) -> str:

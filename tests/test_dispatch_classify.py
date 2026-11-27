@@ -152,3 +152,37 @@ def test_label_shell_metacharacters():
 def test_label_must_start_with_letter():
     with pytest.raises(identity.InvalidNameError):
         build_label(make_task(), "x", {"template": "{gid_suffix}", "gid_suffix_length": 8})
+
+
+# ------------------------------ source type hint -----------------------------
+
+
+def make_hinted(hint="refinement", section=None, comment=None):
+    memberships = (Membership("example-owner/example-project", "x", section),)
+    return Task("github", "12", "A title", "https://example.test/12", None, None,
+                comment, memberships, type_hint=hint)
+
+
+def test_hint_is_returned_when_no_rule_matches():
+    assert run(make_hinted("notice")) == "notice"
+    assert run(make_hinted("notice"), make_record(types=("refinement",))) == "notice"
+
+
+def test_hint_is_ignored_once_handled():
+    assert run(make_hinted("notice"), make_record(types=("notice",))) == "ignore"
+
+
+def test_follow_up_rule_wins_for_a_handled_hinted_task_with_a_new_comment():
+    record = make_record(types=("refinement",), last_comment=T1)
+    assert run(make_hinted("refinement", comment=T2), record) == "follow-up"
+
+
+def test_hinted_task_without_a_section_is_not_matched_by_a_section_rule():
+    rules = [{"type": "implementation", "section": ["(?i).*"]}]
+    assert run(make_hinted("notice", section=None), rules=rules) == "notice"
+
+
+def test_task_without_a_hint_is_unchanged():
+    task = Task("asana", GID, "t", "u", None, None, None, ())
+    assert run(task) == "ignore"
+    assert run(task, make_record()) == "ignore"

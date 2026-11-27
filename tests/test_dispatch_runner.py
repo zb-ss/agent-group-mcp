@@ -1629,3 +1629,484 @@ def test_retention_comes_from_config(tmp_path, storage):
                         result="ignored", url=None, now=format_now(NOW - timedelta(days=365)))
     h.go()
     assert h.store.has_item("slack", "year")
+
+
+# ------------------------------ GitHub-shaped tasks -------------------------
+
+SLUG = "example-owner/example-project"
+
+
+def _gh_task(number="12", hint="refinement", allowed=True, comment=None, title="Add a flag"):
+    return Task(
+        source="github", task_id=number, title=title,
+        url=f"https://github.example.test/{SLUG}/issues/{number}",
+        due_on=None, modified_at=COMMENT_1, newest_comment_at=comment,
+        memberships=(Membership(SLUG, SLUG, None),),
+        type_hint=hint, spawn_allowed=allowed,
+    )
+
+
+class GhSource(FakeSource):
+    name = "github"
+
+    def __init__(self, tasks=(), errors=()):
+        super().__init__(tasks)
+        self.errors = list(errors)
+
+
+def _gh(tmp_path, storage, tasks=(), **source_kw):
+    h = Harness(tmp_path, storage, [])
+    h.source = GhSource(tasks, **source_kw)
+    h.cfg["dispatch"]["sources"]["github"]["projects"] = {
+        SLUG: {"repo": REPO, "worktree": "origin/main", "fetch": True}
+    }
+    return h
+
+
+def _gh_record(h, number="12"):
+    return h.store.get("github", number)
+
+
+def test_github_notice_type_is_notify_only(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task(hint="notice")])
+    assert [d.result for d in h.go().decisions] == ["notified"]
+    assert h.spawn.requests == []
+
+
+def test_github_spawn_type_uses_the_playbook_and_the_project_override(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task()])
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    plain = h.spawn.prompts[0]
+    other = _gh(tmp_path / "o", storage, [_gh_task()])
+    other.cfg["dispatch"]["sources"]["github"]["projects"][SLUG]["playbooks"] = {
+        "refinement": "implementation"
+    }
+    assert [d.result for d in other.go().decisions] == ["spawned"]
+    assert other.spawn.prompts[0] != plain
+
+
+def test_github_item_is_delegated_to_a_live_dispatcher(tmp_path, storage):
+    h = _with_dispatcher(_gh(tmp_path, storage, [_gh_task()]))
+    assert [(d.result, d.action) for d in h.go().decisions] == [("delegated", "triage")]
+    assert h.spawn.requests == [] and len(h.send.calls) == 1
+    assert _gh_record(h).candidate_type == "refinement"
+
+
+def test_github_new_comment_on_a_handled_item_is_a_follow_up(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task(comment=COMMENT_1)])
+    h.go()
+    h.source.tasks = [_gh_task(comment=COMMENT_2)]
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    assert _gh_record(h).handled_types == ("refinement", "follow-up")
+
+
+@pytest.mark.parametrize("triage", [True, False])
+@pytest.mark.parametrize("stored", [None, "start"])
+def test_untrusted_author_never_spawns_resumes_or_messages(tmp_path, storage, triage, stored):
+    h = _gh(tmp_path, storage, [_gh_task(allowed=False)])
+    h.cfg["dispatch"]["triage"]["enabled"] = triage
+    _with_dispatcher(h)
+    if stored:
+        h.store.observe(h.source.tasks[0], project_id=SLUG, now=STAMP)
+        h.store.update("github", "12", decision=stored, decision_at=STAMP)
+    report = h.go()
+    assert [(d.result, d.action) for d in report.decisions] == [("notified", "notify")]
+    assert h.spawn.requests == [] and h.resume.requests == [] and h.send.calls == []
+
+
+def test_untrusted_follow_up_does_not_resume(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task(comment=COMMENT_1)])
+    h.go()
+    h.source.tasks = [_gh_task(allowed=False, comment=COMMENT_2)]
+    h.go()
+    assert len(h.spawn.requests) == 1 and h.resume.requests == [] and h.send.calls == []
+
+
+def test_untrusted_unmapped_item_is_dropped(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task(allowed=False)])
+    h.cfg["dispatch"]["sources"]["github"]["projects"] = {}
+    h.cfg["dispatch"]["sources"]["github"]["unmapped_repos"] = ["*"]
+    h.go()
+    assert h.spawn.requests == [] and h.send.calls == [] and h.notifier.sent == []
+
+
+def test_github_repo_pattern_still_downgrades(tmp_path, storage, known_repo_gh):
+    h = _gh(tmp_path, storage, [_gh_task()])
+    h.cfg["dispatch"]["types"]["refinement"].update(repos=["git.example.test/other-org/*"])
+    assert [d.result for d in h.go().decisions] == ["notified"]
+    assert h.spawn.requests == []
+
+
+@pytest.fixture
+def known_repo_gh(monkeypatch):
+    monkeypatch.setattr(
+        repo_identity, "resolve",
+        lambda name, **kw: repo_identity.LocalRepo(Path("/x"), "git.example.test/example-org/repo-a", name),
+    )
+
+
+def test_source_errors_attribute_lands_in_the_report(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task(hint="notice")], errors=["github: example-owner/gone: HTTP 404"])
+    report = h.go()
+    assert "github: example-owner/gone: HTTP 404" in report.errors
+    assert [d.result for d in report.decisions] == ["notified"]
+
+
+def test_build_sources_builds_a_github_source():
+    cfg = config.defaults()["dispatch"]
+    cfg["sources"]["github"]["enabled"] = True
+    cfg["sources"]["github"]["projects"] = {SLUG: {"repo": REPO}}
+    (source,) = runner.build_sources(cfg, env={})
+    assert source.name == "github"
+
+
+def test_github_dry_run_writes_nothing(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task(), _gh_task(number="13", hint="notice")])
+    report = h.go(dry_run=True)
+    assert [d.result for d in report.decisions] == ["would_spawn", "would_notify"]
+    assert not h.store.path.exists()
+    assert h.spawn.requests == [] and h.notifier.sent == []
+
+
+# ---------------------------- window auto-close -----------------------------
+
+
+class WindowTmux:
+    """A fake tmux for the window sweep: one idle window named after the label."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, *, timeout, env=None, cwd=None):
+        self.calls.append(list(argv))
+        if argv[1] == "list-windows":
+            return subprocess.CompletedProcess(argv, 0, "@7\tone\t1\t0\t0\n", "")
+        if argv[1] == "capture-pane":
+            return subprocess.CompletedProcess(argv, 0, "> \n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def _done_row(name, spawned=True):
+    done_at = (NOW - timedelta(hours=9)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return dataclasses.replace(
+        _row(name, "done", live=True, spawned=spawned),
+        state_at=done_at, tmux_session="agents", tmux_window="one",
+    )
+
+
+def _window_harness(tmp_path, storage, *, enabled):
+    h = Harness(tmp_path, storage, [_task()])
+    h.cfg["dispatch"]["window_cleanup"]["enabled"] = enabled
+    h.cfg["spawn"]["clients"]["claude"]["idle_prompt"] = {
+        "pattern": r"^> $", "tail_lines": 5, "escapes": False,
+    }
+    h.tmux = WindowTmux()
+    other = h.git
+
+    def run(argv, *, timeout, env=None, cwd=None):
+        fake = h.tmux if argv[0] == h.cfg["spawn"]["tmux_bin"] else other
+        return fake(argv, timeout=timeout, env=env)
+
+    h.git = run
+    return h
+
+
+def test_window_cleanup_is_off_by_default_and_makes_no_tmux_call(tmp_path, storage):
+    h = _window_harness(tmp_path, storage, enabled=False)
+    h.go()
+    h.rows = [_done_row(_record(h).session_name)]
+    report = h.go()
+    assert report.windows == [] and h.tmux.calls == []
+
+
+def test_window_cleanup_closes_a_done_dispatch_session_and_logs_it(tmp_path, storage):
+    h = _window_harness(tmp_path, storage, enabled=True)
+    h.go()
+    session = _record(h).session_name
+    h.rows = [_done_row(session)]
+    report = h.go()
+    assert [w["result"] for w in report.windows] == ["closed"]
+    assert [c for c in h.tmux.calls if c[1] == "kill-window"] == [["tmux", "kill-window", "-t", "@7"]]
+    with h.store.connect() as conn:
+        events = conn.execute(
+            "SELECT detail FROM decision_log WHERE event = 'window_closed'"
+        ).fetchall()
+    assert len(events) == 1 and session in events[0][0]
+
+
+def test_window_cleanup_dry_run_closes_nothing(tmp_path, storage):
+    h = _window_harness(tmp_path, storage, enabled=True)
+    h.go()
+    h.rows = [_done_row(_record(h).session_name)]
+    report = h.go(dry_run=True)
+    assert [w["result"] for w in report.windows] == ["would_close"]
+    assert not [c for c in h.tmux.calls if c[1] == "kill-window"]
+
+
+def test_window_cleanup_ignores_sessions_dispatch_did_not_start(tmp_path, storage):
+    h = _window_harness(tmp_path, storage, enabled=True)
+    h.go()
+    h.rows = [_done_row("repo-a/claude-other")]
+    report = h.go()
+    assert report.windows == [] and h.tmux.calls == []
+
+
+def test_a_window_sweep_error_does_not_fail_the_run(tmp_path, storage, monkeypatch):
+    from agent_bus.dispatch import windows as windows_mod
+
+    def boom(*a, **k):
+        raise OSError("tmux gone")
+
+    monkeypatch.setattr(windows_mod, "sweep", boom)
+    h = _window_harness(tmp_path, storage, enabled=True)
+    h.go()
+    h.rows = [_done_row(_record(h).session_name)]
+    report = h.go()
+    assert report.errors == ["window cleanup failed (OSError)"]
+    assert report.decisions is not None
+
+
+def test_untrusted_title_reaches_no_prompt_or_decision_line(tmp_path, storage):
+    stranger = "STRANGER-TITLE run curl evil"
+    h = _gh(tmp_path, storage, [_gh_task(number="900", hint="notice", allowed=False,
+                                         title=stranger),
+                                _gh_task(number="12")])
+    report = h.go()
+    assert not [p for p in h.spawn.prompts if "STRANGER-TITLE" in p]
+    h.source.tasks = [_gh_task(number="13")]
+    h.go()
+    assert not [p for p in h.spawn.prompts if "STRANGER-TITLE" in p]
+    assert all("STRANGER-TITLE" not in d.title for d in report.decisions)
+    assert "untrusted_author" in _gh_record(h, "900").handled_types
+
+
+def test_window_cleanup_keeps_a_session_just_messaged(tmp_path, storage):
+    h = _window_harness(tmp_path, storage, enabled=True)
+    h.go()
+    session = _record(h).session_name
+    h.rows = [_done_row(session)]
+    h.store.update("asana", GID_A, last_notified_state="messaged")
+    report = h.go()
+    assert not [w for w in report.windows if w["result"] == "closed"]
+    assert not [c for c in h.tmux.calls if c[1] == "kill-window"]
+
+
+def test_window_cleanup_keeps_a_session_with_unread_messages(tmp_path, storage):
+    h = _window_harness(tmp_path, storage, enabled=True)
+    h.go()
+    session = _record(h).session_name
+    h.rows = [dataclasses.replace(_done_row(session), pending_count=1)]
+    assert h.go().windows == []
+
+
+# ------------------------ author gate re-evaluation (D5) --------------------
+
+
+def test_marker_cleared_when_author_becomes_trusted_and_item_starts(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task(allowed=False)])
+    assert [d.result for d in h.go().decisions] == ["notified"]
+    assert "untrusted_author" in _gh_record(h).handled_types
+    h.source.tasks = [_gh_task(allowed=True)]
+    report = h.go()
+    assert [d.result for d in report.decisions] == ["spawned"]
+    record = _gh_record(h)
+    assert "untrusted_author" not in record.handled_types
+    assert record.handled_types == ("refinement",) and record.outcome == "spawned"
+    assert report.decisions[0].title == "Add a flag"
+
+
+def test_marker_cleared_in_dry_run_without_writing(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task(allowed=False)])
+    h.go()
+    before = _gh_record(h)
+    h.source.tasks = [_gh_task(allowed=True)]
+    assert [d.result for d in h.go(dry_run=True).decisions] == ["would_spawn"]
+    assert _gh_record(h) == before
+
+
+def test_marker_set_when_author_is_removed_from_the_allowlist(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task(comment=COMMENT_1)])
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    assert "untrusted_author" not in _gh_record(h).handled_types
+    h.source.tasks = [_gh_task(allowed=False, comment=COMMENT_2, title="EDITED-BY-AUTHOR")]
+    report = h.go()
+    record = _gh_record(h)
+    assert "untrusted_author" in record.handled_types
+    assert record.session_name and "refinement" in record.handled_types
+    assert len(h.spawn.requests) == 1 and h.resume.requests == [] and h.send.calls == []
+    assert all("EDITED-BY-AUTHOR" not in d.title for d in report.decisions)
+    # trusted again: the session history is kept, only the marker goes
+    h.source.tasks = [_gh_task(allowed=True, comment=COMMENT_2)]
+    h.go()
+    record = _gh_record(h)
+    assert "untrusted_author" not in record.handled_types and record.session_name
+
+
+def test_de_trust_withdraws_a_delegated_candidate(tmp_path, storage):
+    from agent_bus.dispatch import decisions
+    h = _with_dispatcher(_gh(tmp_path, storage, [_gh_task(title="Original")]))
+    assert [(d.result, d.action) for d in h.go().decisions] == [("delegated", "triage")]
+    assert _gh_record(h).candidate_at
+    h.source.tasks = [_gh_task(allowed=False, title="EDITED-AFTER-DETRUST do X")]
+    h.go()
+    record = _gh_record(h)
+    assert "untrusted_author" in record.handled_types
+    assert record.candidate_at is None and record.candidate_type is None
+    assert record.decision is None
+    assert decisions.candidates(h.store, h.rows, h.cfg["dispatch"]) == []
+    with pytest.raises(decisions.DecisionError):
+        decisions.decide(h.store, h.cfg, "12", action="start", now=STAMP,
+                         actor="dispatcher", rows=h.rows)
+    assert h.spawn.requests == [] and h.resume.requests == []
+
+
+def test_de_trust_clears_a_stored_start_decision(tmp_path, storage):
+    h = _with_dispatcher(_gh(tmp_path, storage, [_gh_task()]))
+    h.go()
+    h.store.update("github", "12", decision="start", decision_at=STAMP)
+    h.source.tasks = [_gh_task(allowed=False)]
+    h.go()
+    record = _gh_record(h)
+    assert record.decision is None and record.decision_at is None
+    assert record.candidate_at is None
+    assert h.spawn.requests == []
+
+
+def test_re_trust_after_withdrawal_delegates_again_like_a_new_item(tmp_path, storage):
+    from agent_bus.dispatch import decisions
+    h = _with_dispatcher(_gh(tmp_path, storage, [_gh_task()]))
+    h.go()
+    h.source.tasks = [_gh_task(allowed=False, title="EDITED")]
+    h.go()
+    h.send.calls.clear()
+    h.source.tasks = [_gh_task(allowed=True, title="Trusted again")]
+    assert [(d.result, d.action) for d in h.go().decisions] == [("delegated", "triage")]
+    assert len(h.send.calls) == 1
+    record = _gh_record(h)
+    assert record.candidate_at and "untrusted_author" not in record.handled_types
+    [listed] = decisions.candidates(h.store, h.rows, h.cfg["dispatch"])
+    assert listed["untrusted"]["title"] == "Trusted again"
+
+
+def test_candidates_and_decide_refuse_an_untrusted_record(tmp_path, storage):
+    from agent_bus.dispatch import decisions
+    h = _gh(tmp_path, storage, [_gh_task()])
+    h.store.observe(h.source.tasks[0], project_id=SLUG, now=STAMP)
+    h.store.update("github", "12", candidate_at=STAMP, candidate_type="refinement",
+                   handled_types=("untrusted_author",))
+    assert decisions.candidates(h.store, h.rows, h.cfg["dispatch"]) == []
+    with pytest.raises(decisions.DecisionError, match="trusted_authors"):
+        decisions.decide(h.store, h.cfg, "12", action="skip", now=STAMP,
+                         actor="dispatcher")
+    assert _gh_record(h).decision is None
+
+
+def test_handled_comment_is_not_replayed_after_de_trust_and_re_trust(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task(comment=COMMENT_1)])
+    assert [d.result for d in h.go().decisions] == ["spawned"]
+    session = _gh_record(h).session_name
+    h.rows = [_row(session, "waiting", live=True)]
+    # de-trusted: the source gives no comment stamp and it falls to a notice rule
+    h.source.tasks = [_gh_task(allowed=False, hint="notice", comment=None)]
+    assert [d.result for d in h.go().decisions] == ["notified"]
+    assert _gh_record(h).last_comment_handled_at == COMMENT_1
+    h.source.tasks = [_gh_task(allowed=True, comment=COMMENT_1)]
+    assert [d.result for d in h.go().decisions] == ["ignored"]
+    assert h.send.calls == [] and h.resume.requests == []
+    assert len(h.spawn.requests) == 1
+
+
+# ------------------------ placeholder with a session (D6) -------------------
+
+
+def test_de_trusted_item_with_a_session_shows_the_placeholder_in_prompts(tmp_path, storage):
+    h = _gh(tmp_path, storage, [_gh_task(number="12", title="Original title")])
+    h.go()
+    assert _gh_record(h, "12").session_name
+    h.source.tasks = [_gh_task(number="12", allowed=False, hint="notice",
+                               title="EDITED-STRANGER-TITLE")]
+    h.go()
+    h.source.tasks = [_gh_task(number="13")]
+    h.go()
+    prompt = h.spawn.prompts[-1]
+    assert "EDITED-STRANGER-TITLE" not in prompt
+    assert "(untrusted author)" in prompt
+
+
+# ------------------------ untrusted alert cap (D4) --------------------------
+
+
+def _strangers(count, start=100):
+    return [_gh_task(number=str(n), hint="notice", allowed=False, title=f"STRANGER-{n}")
+            for n in range(start, start + count)]
+
+
+def test_untrusted_alerts_are_capped_with_one_summary(tmp_path, storage):
+    h = _gh(tmp_path, storage, _strangers(5) + [_gh_task(number="12", hint="notice")])
+    h.cfg["dispatch"]["sources"]["github"]["max_untrusted_alerts_per_run"] = 2
+    report = h.go()
+    states = h.notifier.states
+    assert states.count("notice (notify-only)") == 3  # 2 strangers + the trusted item
+    assert states[-1] == "untrusted-author alerts held back"
+    summary = h.notifier.sent[-1]
+    assert "3 more" in summary.title and "STRANGER" not in summary.title
+    held = [d for d in report.decisions if d.reason and "held back" in d.reason]
+    assert len(held) == 3 and all(d.result == "notified" for d in held)
+    # every stranger item is recorded, so no later run alerts it again
+    assert all(_gh_record(h, str(n)).outcome == "notified" for n in range(100, 105))
+    h.notifier.sent.clear()
+    h.go()
+    assert h.notifier.sent == []
+
+
+def test_untrusted_alert_cap_zero_sends_only_the_summary(tmp_path, storage):
+    h = _gh(tmp_path, storage, _strangers(2))
+    h.cfg["dispatch"]["sources"]["github"]["max_untrusted_alerts_per_run"] = 0
+    h.go()
+    assert h.notifier.states == ["untrusted-author alerts held back"]
+    assert "2 more" in h.notifier.sent[0].title
+
+
+def test_untrusted_alerts_under_the_cap_send_no_summary(tmp_path, storage):
+    h = _gh(tmp_path, storage, _strangers(2))
+    h.go()  # default cap 3
+    assert h.notifier.states == ["notice (notify-only)"] * 2
+
+
+def test_held_alerts_not_counted_in_dry_run(tmp_path, storage):
+    h = _gh(tmp_path, storage, _strangers(5))
+    h.cfg["dispatch"]["sources"]["github"]["max_untrusted_alerts_per_run"] = 0
+    report = h.go(dry_run=True)
+    assert h.notifier.sent == [] and {d.result for d in report.decisions} == {"would_notify"}
+
+
+# ----------------------- stale done after a message (D7) --------------------
+
+
+def test_messaged_session_dead_after_old_done_alerts_ended_not_done(h):
+    h.go()
+    session = _record(h).session_name
+    h.rows = [_row(session, "done", live=True)]
+    h.go()
+    assert h.notifier.states[-1:] == ["done"]
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    assert [d.result for d in h.go().decisions] == ["messaged"]
+    h.notifier.sent.clear()
+    # it never answered: the row still holds the old `done`, and it is gone
+    h.rows = [dataclasses.replace(h.rows[0], live=False)]
+    h.go()
+    assert "done" not in h.notifier.states
+    assert h.notifier.states[:1] == ["ended without done"]
+
+
+def test_messaged_session_that_answered_done_then_exited_alerts_done(h):
+    h.go()
+    session = _record(h).session_name
+    h.rows = [_row(session, "waiting", live=True)]
+    h.source.tasks = [_task(comment=COMMENT_2)]
+    assert [d.result for d in h.go().decisions] == ["messaged"]
+    h.notifier.sent.clear()
+    h.rows = [dataclasses.replace(h.rows[0], state="done", live=False,
+                                  state_at="2099-01-01T00:00:00.000000Z")]
+    h.go()
+    assert h.notifier.states == ["done"]
